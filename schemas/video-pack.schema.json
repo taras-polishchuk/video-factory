@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://video-factory.local/schemas/video-pack.schema.json",
+  "title": "VideoPack",
+  "description": "Versioned, content-hashed artifact for one video in a campaign. Shared between Control Plane and any Render Plane adapter.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "pack_id",
+    "campaign_id",
+    "video_id",
+    "language",
+    "target_duration_seconds",
+    "render_profile",
+    "concept",
+    "approved_script",
+    "voice",
+    "captions",
+    "scenes",
+    "render_capabilities",
+    "budget",
+    "created_at",
+    "content_hash"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "pack_id": { "type": "string", "pattern": "^vp_[a-f0-9]{16}$" },
+    "campaign_id": { "type": "string", "pattern": "^cmp_[a-f0-9]{12}$" },
+    "video_id": { "type": "string", "pattern": "^vid_[a-f0-9]{12}$" },
+    "language": {
+      "type": "string",
+      "description": "BCP-47 language tag. Examples: en-US, uk-UA, de-DE.",
+      "pattern": "^[a-z]{2,3}(-[A-Z]{2})?$"
+    },
+    "target_duration_seconds": {
+      "type": "integer",
+      "minimum": 4,
+      "maximum": 600
+    },
+    "platforms": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["tiktok", "reels", "shorts", "youtube_shorts", "linkedin", "x", "web"]
+      },
+      "description": "Target platforms. Drives aspect ratio defaults if not overridden."
+    },
+    "aspect_ratios": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["9:16", "16:9", "1:1", "4:5"] }
+    },
+    "concept": {
+      "type": "object",
+      "required": ["title", "logline", "tone", "audience"],
+      "properties": {
+        "title": { "type": "string" },
+        "logline": { "type": "string" },
+        "tone": { "type": "string" },
+        "audience": { "type": "string" },
+        "cta": { "type": "string" },
+        "negative_rules": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "research": {
+      "type": "object",
+      "description": "Source-attributed claims. Each claim must be verified or marked unresolved.",
+      "properties": {
+        "claims": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["text", "source_title", "source_url"],
+            "properties": {
+              "text": { "type": "string" },
+              "source_title": { "type": "string" },
+              "source_url": { "type": "string", "format": "uri" },
+              "accessed_at": { "type": "string", "format": "date-time" },
+              "snippet": { "type": "string" },
+              "confidence": { "type": "string", "enum": ["verified", "unresolved"] }
+            }
+          }
+        }
+      }
+    },
+    "approved_script": {
+      "type": "object",
+      "required": ["full_text"],
+      "properties": {
+        "full_text": { "type": "string" },
+        "approved_by": { "type": "string" },
+        "approved_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "voice": {
+      "type": "object",
+      "required": ["provider", "voice_id", "ssml_or_text"],
+      "properties": {
+        "provider": { "type": "string" },
+        "voice_id": { "type": "string" },
+        "ssml_or_text": { "type": "string" },
+        "actual_vo_asset": {
+          "type": "object",
+          "properties": {
+            "ref": { "type": "string" },
+            "checksum": { "type": "string" },
+            "duration_seconds": { "type": "number" }
+          }
+        }
+      }
+    },
+    "captions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start_seconds", "end_seconds", "text"],
+        "properties": {
+          "start_seconds": { "type": "number" },
+          "end_seconds": { "type": "number" },
+          "text": { "type": "string" }
+        }
+      }
+    },
+    "scenes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["scene_id", "order", "target_duration_seconds", "visual_intent"],
+        "properties": {
+          "scene_id": { "type": "string", "pattern": "^sc_[a-z0-9_]+$" },
+          "order": { "type": "integer", "minimum": 1 },
+          "target_duration_seconds": { "type": "number", "minimum": 0.5 },
+          "visual_intent": { "type": "string" },
+          "motion_prompt": { "type": "string" },
+          "start_frame": {
+            "type": "object",
+            "properties": {
+              "ref": { "type": "string" },
+              "checksum": { "type": "string" }
+            }
+          },
+          "end_frame": {
+            "type": "object",
+            "properties": {
+              "ref": { "type": "string" },
+              "checksum": { "type": "string" }
+            }
+          },
+          "continuity_notes": { "type": "string" }
+        }
+      }
+    },
+    "render_profile": {
+      "type": "string",
+      "enum": [
+        "mock",
+        "heygen_direct",
+        "comfy_cloud",
+        "comfy_gpu_worker",
+        "comfy_heygen_partner"
+      ]
+    },
+    "render_capabilities": {
+      "type": "object",
+      "required": ["output_kind"],
+      "properties": {
+        "output_kind": {
+          "type": "string",
+          "enum": ["whole_video", "avatar_video", "scene_clips", "translation", "tts"]
+        },
+        "max_takes_per_scene": { "type": "integer", "minimum": 1, "default": 1 },
+        "aspect_ratio_capabilities": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["9:16", "16:9", "1:1", "4:5"] }
+        },
+        "provider_model_version": { "type": "string" },
+        "workflow_ref": { "type": "string" }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "required": ["max_cost_per_video_usd", "approval_required"],
+      "properties": {
+        "max_cost_per_video_usd": { "type": "number", "minimum": 0 },
+        "max_cost_per_batch_usd": { "type": "number", "minimum": 0 },
+        "approval_required": { "type": "boolean" }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "content_hash": {
+      "type": "string",
+      "description": "SHA-256 hex of canonical JSON of all fields except pack_id and content_hash."
+    }
+  },
+  "additionalProperties": false
+}

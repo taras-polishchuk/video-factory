@@ -1,0 +1,88 @@
+{
+  "schema_version": "1.0.0",
+  "pack_id": "vp_0123456789abcdef",
+  "campaign_id": "cmp_demo0000001",
+  "video_id": "vid_demo0000001",
+  "language": "en-US",
+  "target_duration_seconds": 30,
+  "platforms": ["reels", "tiktok"],
+  "aspect_ratios": ["9:16"],
+  "concept": {
+    "title": "Why your coffee tastes better at altitude",
+    "logline": "A short explainer about extraction and water boiling point.",
+    "tone": "curious, calm, factual",
+    "audience": "curious home baristas aged 25-45",
+    "cta": "Try it next morning. Link in bio.",
+    "negative_rules": [
+      "Do not claim medical or health effects of caffeine.",
+      "Do not disparage any brand of equipment."
+    ]
+  },
+  "research": {
+    "claims": [
+      {
+        "text": "Water boils at lower temperatures at high altitude.",
+        "source_title": "NIST Chemistry WebBook",
+        "source_url": "https://webbook.nist.gov/chemistry/",
+        "accessed_at": "2026-09-30T10:00:00Z",
+        "snippet": "Boiling point varies with atmospheric pressure.",
+        "confidence": "verified"
+      }
+    ]
+  },
+  "approved_script": {
+    "full_text": "Coffee tastes different up here, and there is one reason. Water boils at a lower temperature, so your brew runs slightly cooler. Try a finer grind, the same ratio, and you taste the difference.",
+    "approved_by": "demo-approver",
+    "approved_at": "2026-09-30T10:05:00Z"
+  },
+  "voice": {
+    "provider": "mock",
+    "voice_id": "mock_en_neutral",
+    "ssml_or_text": "Coffee tastes different up here, and there is one reason. Water boils at a lower temperature, so your brew runs slightly cooler. Try a finer grind, the same ratio, and you taste the difference."
+  },
+  "captions": [
+    {"start_seconds": 0.0, "end_seconds": 2.5, "text": "Coffee tastes different up here."},
+    {"start_seconds": 2.5, "end_seconds": 6.0, "text": "And there is one reason."},
+    {"start_seconds": 6.0, "end_seconds": 12.0, "text": "Water boils at a lower temperature, so your brew runs slightly cooler."},
+    {"start_seconds": 12.0, "end_seconds": 18.0, "text": "Try a finer grind, the same ratio,"},
+    {"start_seconds": 18.0, "end_seconds": 21.0, "text": "and you taste the difference."}
+  ],
+  "scenes": [
+    {
+      "scene_id": "sc_hook",
+      "order": 1,
+      "target_duration_seconds": 6,
+      "visual_intent": "Mountain morning, hand holding mug, slow push-in.",
+      "motion_prompt": "cinematic, soft light, shallow depth of field, gentle push-in"
+    },
+    {
+      "scene_id": "sc_explain",
+      "order": 2,
+      "target_duration_seconds": 12,
+      "visual_intent": "Overhead shot of pour-over, kettle thermometer graphic overlay.",
+      "motion_prompt": "overhead dolly, steam visible, calm pacing"
+    },
+    {
+      "scene_id": "sc_cta",
+      "order": 3,
+      "target_duration_seconds": 9,
+      "visual_intent": "Cup close-up, brand mark subtly visible, CTA card overlay.",
+      "motion_prompt": "macro, locked-off, warm color grade"
+    }
+  ],
+  "render_profile": "mock",
+  "render_capabilities": {
+    "output_kind": "scene_clips",
+    "max_takes_per_scene": 1,
+    "aspect_ratio_capabilities": ["9:16", "16:9", "1:1"],
+    "provider_model_version": "mock-v1",
+    "workflow_ref": "workflows/scene-clip-mock.json"
+  },
+  "budget": {
+    "max_cost_per_video_usd": 5,
+    "max_cost_per_batch_usd": 50,
+    "approval_required": false
+  },
+  "created_at": "2026-09-30T10:00:00Z",
+  "content_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+}

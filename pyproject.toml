@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-factory"
+version = "0.1.0"
+description = "Production-oriented Video Factory: Control Plane + swappable Render Plane for branded short-form video."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Taras Polishchuk" }]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "jsonschema>=4.0",
+    # httpx is used by live provider adapters; lazily imported so a
+    # missing install does not break the offline path.
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+postprocess = [
+    # FFmpeg is the documented postprocessor. The python wrapper is
+    # optional; the assembler prefers the system binary when present.
+    "Pillow>=10",
+]
+
+[project.scripts]
+video-factory = "cli.video_factory:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["control_plane*", "render_plane*", "assembly*", "cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"

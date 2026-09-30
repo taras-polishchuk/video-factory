@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "format": "comfyui_api",
+  "description": "Mock ComfyUI workflow used in offline mode. Graph is structurally valid API-format JSON; node IDs are mock-only and not derived from any live ComfyUI export.",
+  "nodes": [
+    {
+      "id": "1",
+      "type": "MockImageSource",
+      "inputs": {"image": "scene_frame_<scene_id>"},
+      "outputs": ["IMAGE"]
+    },
+    {
+      "id": "2",
+      "type": "MockMotionAdapter",
+      "inputs": {"motion_prompt": "<motion_prompt>", "frames": 60},
+      "outputs": ["CONDITIONING"]
+    },
+    {
+      "id": "3",
+      "type": "MockVideoSynth",
+      "inputs": {"image": ["1", 0], "conditioning": ["2", 0], "fps": 30},
+      "outputs": ["VIDEO"]
+    }
+  ],
+  "links": [
+    [1, "1", 0, "3", 0],
+    [2, "2", 0, "3", 1]
+  ]
+}
