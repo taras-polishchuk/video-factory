@@ -1,5 +1,12 @@
 # Video Factory — Control Room (V0)
 
+> GitHub: [taras-polishchuk/video-factory](https://github.com/taras-polishchuk/video-factory)
+>
+> Releases: [v0.1.0](https://github.com/taras-polishchuk/video-factory/releases/tag/v0.1.0)
+>
+> Roadmap: see [docs/ROADMAP.md](docs/ROADMAP.md) and the open
+> [issues](https://github.com/taras-polishchuk/video-factory/issues).
+
 Multi-company video production control plane over the existing Python
 core. This V0 adds:
 
