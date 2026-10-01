@@ -2,20 +2,29 @@
   import { api } from '$lib/api.js';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
+
   let companies = $state([]);
-  let company = $derived(companies.find(c => c.company_id === $page.data.companyId) || companies[0]);
+  let company = $derived(companies.find(c => c.company_id === localStorage.getItem("vf.company_id")) || companies[0]);
   let bibles = $state([]);
   let active = $state(null);
   let form = $state({
     name: '', audience: '', positioning: '', tone: 'neutral',
-    primary: '#0d9488', background: '#0f172a', text: '#ffffff', accent: '#f59e0b',
+    primary: '#6ee86e', background: '#151515', text: '#f5f5f5', accent: '#ffd84d',
     cta: '', approved_script: '', prohibited: ''
   });
   let saveError = $state('');
   let saving = $state(false);
+  let loaded = $state(false);
 
   async function load() {
     companies = await api.listCompanies();
+    // Promote first id to idem fallback
+    if (companies.length && !localStorage.getItem("vf.company_id")) {
+      const id = companies[0].company_id;
+      localStorage.setItem('vf.company_id', id);
+      if (typeof localStorage !== 'undefined') localStorage.setItem('vf.company_id', id);
+    }
+    loaded = true;
   }
 
   $effect(() => {
@@ -65,81 +74,294 @@
 
 <svelte:head><title>Video Bible · Video Factory</title></svelte:head>
 
-<h1>Company Video Bible</h1>
-<p style="color: var(--text-dim); margin-top: 0;">Versioned brand + production rules. Each approved version is locked in for jobs that reference it.</p>
+<header class="page-header">
+  <div class="header-row">
+    <div>
+      <p class="eyebrow">Brand</p>
+      <h1>Video Bible</h1>
+      <p class="sub">Versioned brand + production rules. Every approved version is locked in for jobs that reference it; older drafts stay visible for diffing.</p>
+    </div>
+    {#if company}
+      <div class="header-meta">
+        <span class="vf-pill muted"><span class="dot"></span>{company.name}</span>
+      </div>
+    {/if}
+  </div>
+</header>
 
 {#if !company}
-  <div class="card">Select a workspace to manage its Bible.</div>
-{:else}
-  <div class="card">
-    <h2>{company.name}</h2>
-    <div style="color: var(--text-dim); margin-bottom: 16px;">{company.description || 'No description.'}</div>
-
-    {#if bibles.length === 0}
-      <p style="color: var(--text-dim);">No Bible yet. Fill the form below and save a draft.</p>
-    {:else}
-      <table>
-        <thead><tr><th>Version</th><th>Status</th><th>Created</th><th>Approved</th><th></th></tr></thead>
-        <tbody>
-          {#each bibles as b}
-            <tr style:background={active?.bible_id === b.bible_id ? 'var(--bg-elev-2)' : ''}>
-              <td>v{b.version}</td>
-              <td><span class="pill {b.status === 'approved' ? 'ok' : 'muted'}">{b.status}</span></td>
-              <td style="color: var(--text-dim);">{b.created_at}</td>
-              <td style="color: var(--text-dim);">{b.approved_at || '—'}</td>
-              <td>
-                <button class="ghost" onclick={() => active = b}>View</button>
-                {#if b.status === 'draft'}
-                  <button onclick={() => approve(b)}>Approve</button>
-                {/if}
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    {/if}
+  <div class="vf-card empty">
+    <p>Select a workspace to manage its Bible.</p>
   </div>
+{:else}
+  <section class="vf-card">
+    <header class="card-header">
+      <div>
+        <h2>Versions</h2>
+        <p class="muted">{bibles.length} version{bibles.length === 1 ? '' : 's'} on record.</p>
+      </div>
+    </header>
 
-  <div class="card">
-    <h2>{active ? `v${active.version} (${active.status})` : 'New draft'}</h2>
+    {#if !loaded}
+      <p class="muted">Loading…</p>
+    {:else if bibles.length === 0}
+      <div class="empty">
+        <p>No Bible yet.</p>
+        <p class="muted">Fill the form below and save a draft. Approve to lock it for jobs.</p>
+      </div>
+    {:else}
+      <div class="version-grid">
+        {#each bibles as b}
+          <button class="version hoverable" data-active={b.bible_id === active?.bible_id} onclick={() => active = b}>
+            <div class="version-head">
+              <span class="version-num">v{b.version}</span>
+              <span class="vf-pill {b.status === 'approved' ? 'ok' : 'muted'}"><span class="dot"></span>{b.status}</span>
+            </div>
+            <div class="version-meta">
+              <span class="muted">{b.created_at}</span>
+              {#if b.approved_at}<span class="muted">approved {b.approved_at}</span>{/if}
+            </div>
+            {#if b.bible_id === active?.bible_id}
+              <div class="version-active-bar"></div>
+            {/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
+  </section>
+
+  <section class="vf-card vf-card-glow">
+    <header class="card-header">
+      <div>
+        <h2>{active ? `Editing v${active.version} (${active.status})` : 'New draft'}</h2>
+        <p class="muted">Save creates a new draft. Approve to lock it for jobs.</p>
+      </div>
+    </header>
 
     {#if saveError}
-      <div class="card" style="border-color: var(--err); color: var(--err);">{saveError}</div>
+      <div class="alert error">{saveError}</div>
     {/if}
 
-    <div class="row">
-      <div class="col"><label>Brand name</label><input bind:value={form.name} placeholder={company.name} /></div>
-      <div class="col"><label>Audience</label><input bind:value={form.audience} placeholder="home baristas 25-45" /></div>
+    <div class="vf-row">
+      <div class="vf-col" style="flex: 2 1 320px;">
+        <label>Brand name</label>
+        <input bind:value={form.name} placeholder={company.name} />
+      </div>
+      <div class="vf-col">
+        <label>Audience</label>
+        <input bind:value={form.audience} placeholder="home baristas 25-45" />
+      </div>
     </div>
 
-    <div class="row">
-      <div class="col"><label>Positioning</label><input bind:value={form.positioning} /></div>
-      <div class="col"><label>Tone</label><input bind:value={form.tone} /></div>
+    <div class="vf-row">
+      <div class="vf-col">
+        <label>Positioning</label>
+        <input bind:value={form.positioning} />
+      </div>
+      <div class="vf-col">
+        <label>Tone</label>
+        <input bind:value={form.tone} />
+      </div>
     </div>
 
-    <div class="row">
-      <div class="col"><label>CTA</label><input bind:value={form.cta} /></div>
-      <div class="col"><label>Approved script (optional)</label><input bind:value={form.approved_script} /></div>
+    <div class="vf-row">
+      <div class="vf-col">
+        <label>CTA</label>
+        <input bind:value={form.cta} />
+      </div>
+      <div class="vf-col">
+        <label>Approved script (optional)</label>
+        <input bind:value={form.approved_script} />
+      </div>
     </div>
 
-    <label style="margin-top: 12px;">Prohibited phrases / imagery (one per line)</label>
-    <textarea bind:value={form.prohibited} rows="3"></textarea>
+    <label>Prohibited phrases / imagery (one per line)</label>
+    <textarea bind:value={form.prohibited} rows="3" placeholder="No medical claims&#10;No competitor logos"></textarea>
 
-    <h2 style="margin-top: 24px;">Brand colors</h2>
-    <div class="row">
-      <div class="col"><label>Primary</label><input bind:value={form.primary} /></div>
-      <div class="col"><label>Background</label><input bind:value={form.background} /></div>
-      <div class="col"><label>Text</label><input bind:value={form.text} /></div>
-      <div class="col"><label>Accent</label><input bind:value={form.accent} /></div>
+    <h3 class="section-h3">Brand colors</h3>
+    <div class="color-grid">
+      <div class="color-cell">
+        <input type="color" bind:value={form.primary} aria-label="primary color" />
+        <div>
+          <label>Primary</label>
+          <input type="text" bind:value={form.primary} class="hex" />
+        </div>
+      </div>
+      <div class="color-cell">
+        <input type="color" bind:value={form.background} aria-label="background color" />
+        <div>
+          <label>Background</label>
+          <input type="text" bind:value={form.background} class="hex" />
+        </div>
+      </div>
+      <div class="color-cell">
+        <input type="color" bind:value={form.text} aria-label="text color" />
+        <div>
+          <label>Text</label>
+          <input type="text" bind:value={form.text} class="hex" />
+        </div>
+      </div>
+      <div class="color-cell">
+        <input type="color" bind:value={form.accent} aria-label="accent color" />
+        <div>
+          <label>Accent</label>
+          <input type="text" bind:value={form.accent} class="hex" />
+        </div>
+      </div>
     </div>
 
-    <div style="margin-top: 24px; display: flex; gap: 12px; align-items: center;">
-      <button onclick={saveDraft} disabled={saving || !form.audience}>
-        {saving ? 'Saving…' : 'Save draft'}
+    <div class="actions">
+      <button class="vf-btn vf-btn-primary" onclick={saveDraft} disabled={saving || !form.audience}>
+        {saving ? 'Saving…' : active ? 'Save as new draft' : 'Save draft'}
       </button>
-      <span style="color: var(--text-dim); font-size: 12px;">
-        Save creates a new draft. Approve to lock it for jobs.
-      </span>
+      {#if active && active.status === 'draft'}
+        <button class="vf-btn" onclick={() => approve(active)}>Approve v{active.version}</button>
+      {/if}
     </div>
-  </div>
+  </section>
 {/if}
+
+<style>
+  .page-header { margin-bottom: var(--vf-sp-7); }
+  .header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: var(--vf-sp-5);
+    flex-wrap: wrap;
+  }
+  .eyebrow {
+    font-size: var(--vf-fs-cap-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--vf-text-secondary);
+    margin: 0 0 var(--vf-sp-2);
+  }
+  .sub { color: var(--vf-text-secondary); max-width: 640px; margin-top: var(--vf-sp-3); }
+
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--vf-sp-3);
+    margin-bottom: var(--vf-sp-5);
+  }
+  .muted { color: var(--vf-text-secondary); }
+
+  .empty {
+    text-align: center;
+    padding: var(--vf-sp-7);
+    color: var(--vf-text-secondary);
+  }
+
+  .version-grid {
+    display: grid;
+    gap: var(--vf-sp-3);
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+  .version {
+    position: relative;
+    text-align: left;
+    background: var(--vf-surface-2);
+    border: 1px solid var(--vf-border);
+    border-radius: var(--vf-radius-md);
+    padding: var(--vf-sp-4) var(--vf-sp-4) var(--vf-sp-4) calc(var(--vf-sp-4) + 8px);
+    cursor: pointer;
+    color: inherit;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--vf-sp-3);
+    transition:
+      transform var(--vf-dur) var(--vf-ease),
+      border-color var(--vf-dur) var(--vf-ease);
+    overflow: hidden;
+  }
+  .version.hoverable:hover { transform: translateY(-1px); border-color: var(--vf-border-default); }
+  .version[data-active="true"] {
+    border-color: var(--vf-butter-green);
+    background: var(--vf-surface-3);
+  }
+  .version-active-bar {
+    position: absolute;
+    left: 0;
+    top: var(--vf-sp-3);
+    bottom: var(--vf-sp-3);
+    width: 3px;
+    background: var(--vf-butter-green);
+    border-radius: 0 var(--vf-radius-pill) var(--vf-radius-pill) 0;
+  }
+  .version-head {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--vf-sp-2);
+    margin-bottom: var(--vf-sp-2);
+  }
+  .version-num {
+    font-family: var(--vf-font-mono);
+    font-weight: var(--vf-fw-medium);
+    font-size: var(--vf-fs-panels);
+    color: var(--vf-text-primary);
+  }
+  .version-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: var(--vf-fs-cap);
+  }
+
+  .section-h3 {
+    font-size: var(--vf-fs-titles);
+    margin: var(--vf-sp-7) 0 var(--vf-sp-4);
+    color: var(--vf-text-primary);
+  }
+
+  .color-grid {
+    display: grid;
+    gap: var(--vf-sp-3);
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  }
+  .color-cell {
+    display: flex;
+    align-items: center;
+    gap: var(--vf-sp-3);
+    padding: var(--vf-sp-3);
+    background: var(--vf-surface-2);
+    border: 1px solid var(--vf-border);
+    border-radius: var(--vf-radius-md);
+  }
+  .color-cell input[type='color'] {
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border: 1px solid var(--vf-border-default);
+    border-radius: var(--vf-radius-md);
+    cursor: pointer;
+  }
+  .color-cell > div { flex: 1; min-width: 0; }
+  .color-cell label { margin: 0 0 2px; }
+  .color-cell .hex {
+    font-family: var(--vf-font-mono);
+    font-size: var(--vf-fs-cap);
+    text-transform: uppercase;
+    padding: 6px 8px;
+  }
+
+  .alert.error {
+    background: var(--vf-error-surface);
+    color: var(--vf-error-text);
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    border-radius: var(--vf-radius-md);
+    padding: var(--vf-sp-3);
+    margin-bottom: var(--vf-sp-4);
+    font-size: var(--vf-fs-ui);
+  }
+
+  .actions {
+    display: flex;
+    gap: var(--vf-sp-3);
+    margin-top: var(--vf-sp-6);
+    flex-wrap: wrap;
+  }
+</style>
