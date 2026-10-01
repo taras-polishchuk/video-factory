@@ -1,0 +1,41 @@
+# Local demo stack. NOT for production. Both services bind to
+# 127.0.0.1 only. The UI uses Vite's dev proxy to forward /api to
+# the FastAPI service.
+
+services:
+  api:
+    image: python:3.12-slim
+    container_name: vf-api
+    working_dir: /app
+    command: >
+      sh -c "pip install --no-cache-dir 'jsonschema>=4.0' 'fastapi>=0.115' 'uvicorn>=0.30' 'python-multipart>=0.0.9' &&
+             python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8000"
+    environment:
+      PYTHONPATH: /app
+      MAX_COST_PER_VIDEO_USD: "5"
+      MAX_COST_PER_BATCH_USD: "20"
+      VIDEO_FACTORY_DB: /data/video_factory.db
+      VIDEO_FACTORY_STORAGE: /data/storage
+    volumes:
+      - ./:/app
+      - vf_data:/data
+    network_mode: "host"
+    # apt ffmpeg + fonts for drawtext
+    init: >
+      sh -c "apt-get update -qq && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*"
+
+  web:
+    image: node:20-bookworm
+    container_name: vf-web
+    working_dir: /app/web
+    command: >
+      sh -c "apt-get update -qq && apt-get install -y --no-install-recommends chromium fonts-liberation && rm -rf /var/lib/apt/lists/* &&
+             npm install && npm run dev -- --host 127.0.0.1 --port 5173"
+    environment:
+      VITE_API_TARGET: http://127.0.0.1:8000
+    volumes:
+      - ./:/app
+    network_mode: "host"
+
+volumes:
+  vf_data:

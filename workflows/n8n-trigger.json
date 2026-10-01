@@ -1,0 +1,156 @@
+{
+  "name": "Video Factory - trigger job",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vf-trigger",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook_in",
+      "name": "Webhook (Telegram / external)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "webhookId": "vf-trigger"
+    },
+    {
+      "parameters": {
+        "functionCode": "const items = $input.all();\nconst data = items[0].json;\nreturn [{ json: {\n  topic: data.topic || data.text || 'Untitled',\n  language: data.language || 'en-US',\n  duration_seconds: data.duration_seconds || 30,\n  platforms: data.platforms || ['tiktok'],\n  aspect_ratio: data.aspect_ratio || '9:16',\n  count: data.count || 1,\n  company_id: data.company_id,\n  bible_id: data.bible_id\n}}];"
+      },
+      "id": "fn_normalize",
+      "name": "Normalize payload",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [400, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.VIDEO_FACTORY_URL}}/api/v1/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {"name": "company_id", "value": "={{$json.company_id}}"},
+            {"name": "bible_id", "value": "={{$json.bible_id}}"},
+            {"name": "topic", "value": "={{$json.topic}}"},
+            {"name": "language", "value": "={{$json.language}}"},
+            {"name": "duration_seconds", "value": "={{$json.duration_seconds}}"},
+            {"name": "platforms", "value": "={{$json.platforms}}"},
+            {"name": "aspect_ratio", "value": "={{$json.aspect_ratio}}"},
+            {"name": "count", "value": "={{$json.count}}"},
+            {"name": "render_profile", "value": "mock"}
+          ]
+        },
+        "options": {"timeout": 30000}
+      },
+      "id": "http_create",
+      "name": "Create job (Video Factory API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [600, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$json[\"job_id\"]}}",
+              "operation": "exists",
+              "value2": "true"
+            }
+          ]
+        }
+      },
+      "id": "check_ok",
+      "name": "Has job_id?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [800, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.TELEGRAM_BOT_URL}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {"name": "chat_id", "value": "={{$env.OPERATOR_CHAT_ID}}"},
+            {"name": "text", "value": "={{'Job queued: ' + $json.job_id + ' — ' + $json.topic}}"}
+          ]
+        },
+        "options": {"timeout": 15000}
+      },
+      "id": "notify_ok",
+      "name": "Notify operator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1000, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.TELEGRAM_BOT_URL}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {"name": "chat_id", "value": "={{$env.OPERATOR_CHAT_ID}}"},
+            {"name": "text", "value": "={{'Job create failed: ' + $json.error}}"}
+          ]
+        },
+        "options": {"timeout": 15000}
+      },
+      "id": "notify_err",
+      "name": "Notify error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1000, 400]
+    }
+  ],
+  "connections": {
+    "Webhook (Telegram / external)": {
+      "main": [[{"node": "Normalize payload", "type": "main", "index": 0}]]
+    },
+    "Normalize payload": {
+      "main": [[{"node": "Create job (Video Factory API)", "type": "main", "index": 0}]]
+    },
+    "Create job (Video Factory API)": {
+      "main": [[{"node": "Has job_id?", "type": "main", "index": 0}]]
+    },
+    "Has job_id?": {
+      "main": [
+        [{"node": "Notify operator", "type": "main", "index": 0}],
+        [{"node": "Notify error", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {"name": "video-factory"}
+  ],
+  "meta": {
+    "description": "Telegram/external webhook -> Video Factory API. Validated JSON structure; runtime import not tested in this mission (no n8n instance available)."
+  }
+}

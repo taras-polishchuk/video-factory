@@ -1,6 +1,31 @@
+# Build / runtime artifacts
+node_modules/
+.svelte-kit/
+build/
+dist/
 __pycache__/
-*.pyc
-*.pyo
-artifacts/
 .pytest_cache/
-*.egg-info/
+*.pyc
+artifacts/
+storage/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+venv/
+.venv/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log

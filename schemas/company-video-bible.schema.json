@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Company Video Bible",
+  "description": "Brand + production rules for a single company. Used by the pipeline at job-creation time. No secrets.",
+  "type": "object",
+  "required": ["name", "audience"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Company or product name."
+    },
+    "positioning": {
+      "type": "string",
+      "description": "One-sentence positioning."
+    },
+    "audience": {
+      "type": "string"
+    },
+    "goals": {
+      "type": "string"
+    },
+    "cta": {
+      "type": "string"
+    },
+    "approved_script": {
+      "type": "string",
+      "description": "Default approved script used when a job does not override it."
+    },
+    "tone": {
+      "type": "string",
+      "description": "Voice tone, e.g. 'curious, calm, factual'."
+    },
+    "language": {
+      "type": "string"
+    },
+    "voice_id": {
+      "type": "string"
+    },
+    "colors": {
+      "type": "object",
+      "description": "Named HEX colors.",
+      "properties": {
+        "primary": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+        "background": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+        "text": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+        "accent": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"}
+      }
+    },
+    "fonts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"},
+          "file_ref": {"type": "string"}
+        }
+      }
+    },
+    "visual_style": {
+      "type": "object",
+      "properties": {
+        "framing": {"type": "string"},
+        "shot_patterns": {"type": "array", "items": {"type": "string"}},
+        "pacing": {"type": "string"},
+        "captions_style": {"type": "string"},
+        "logo_placement": {"type": "string"}
+      }
+    },
+    "examples": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ref"],
+        "properties": {
+          "ref": {"type": "string"},
+          "note": {"type": "string"}
+        }
+      }
+    },
+    "prohibited": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Phrases, imagery, claims, or clichés to avoid."
+    },
+    "platforms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"},
+          "default_aspect_ratio": {"type": "string"},
+          "default_duration_seconds": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "asset_refs": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Asset IDs registered against the company (logos, fonts, voice refs, examples)."
+    }
+  },
+  "additionalProperties": false
+}

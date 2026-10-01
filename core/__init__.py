@@ -1,0 +1,1 @@
+# Multi-company domain layer for Video Factory.
