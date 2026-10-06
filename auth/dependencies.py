@@ -32,6 +32,7 @@ session, which the attacker page cannot do.
 """
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -127,7 +128,8 @@ def get_current_user(request: Request) -> AuthContext:
     try:
         repo._conn().execute(
             "UPDATE sessions SET last_seen_at=?, expires_at=? WHERE session_id=?",
-            ("__now__", _expires_at_iso(), session_id),
+            (_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+             _expires_at_iso(), session_id),
         )
         repo._conn().commit()
     except Exception:

@@ -13,9 +13,21 @@ authentication events are not job-scoped.
 from __future__ import annotations
 
 import json
+import logging
+import sys
 import time
 import uuid
 from typing import Any, Dict, Optional
+
+_logger = logging.getLogger("auth.audit_log")
+if not _logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter(
+        "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s"
+    ))
+    _logger.addHandler(_h)
+    _logger.setLevel(logging.WARNING)
+    _logger.propagate = False
 
 
 def _now() -> str:
@@ -35,11 +47,15 @@ def append(repo, *, event: str, context: Optional[Dict[str, Any]] = None,
              workspace_id, _now()),
         )
         repo._conn().commit()
-    except Exception:
-        # Best effort. If the columns are not yet present we silently
-        # lose the row; the migration 004 ensures they exist in
-        # production.
-        pass
+    except Exception as e:
+        # Surface the failure to stderr instead of silently dropping
+        # the row. We do NOT raise — a missed audit row is better
+        # than a missed login — but the operator now sees the
+        # regression (most commonly: migration 004 not applied yet).
+        _logger.warning(
+            "audit_append dropped row event=%s user=%s workspace=%s err=%s: %s",
+            event, user_id, workspace_id, type(e).__name__, e,
+        )
 
 
 def list_for_workspace(repo, *, workspace_id: str, limit: int = 100) -> list[dict]:

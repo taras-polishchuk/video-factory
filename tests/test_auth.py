@@ -282,7 +282,11 @@ def test_logout_invalidates_session(auth_env):
     _signup(client, email="henry@example.com")
     sid_cookie = client.cookies.get("vf_session")
     assert sid_cookie
-    r = client.post("/auth/logout")
+    # /auth/logout requires X-CSRF-Token (state-changing endpoint,
+    # enforced per Wave 1 QA blocker #1).
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
+    r = client.post("/auth/logout",
+                     headers={"X-CSRF-Token": csrf})
     assert r.status_code == 200
     # Session row gone
     row = repo.get_session(sid_cookie)

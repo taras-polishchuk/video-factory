@@ -423,6 +423,44 @@ def create_app(*, repo: Optional[Repo] = None,
             response.headers["Set-Cookie"] = cookie
         return response
 
+    # Actor middleware: on every request, if a valid session cookie
+    # is present, stamp the JobRunner with the (user_id,
+    # workspace_id) of the current request so runner_audit rows
+    # written by background jobs/credentials carry the actor.
+    # Closes the "JobRunner.set_actor() is dead code" observation
+    # from the Wave 1 QA report.
+    @app.middleware("http")
+    async def _stamp_actor(request, call_next):
+        from auth.session import SESSION_COOKIE_NAME
+        from auth.session import verify_csrf_token  # noqa: F401  (module re-use)
+        try:
+            sid = request.cookies.get(SESSION_COOKIE_NAME, "").strip() or None
+            actor_user_id = None
+            actor_workspace_id = None
+            if sid:
+                row = repo._conn().execute(
+                    "SELECT s.user_id, m.workspace_id "
+                    "FROM sessions s "
+                    "LEFT JOIN memberships m ON m.user_id = s.user_id "
+                    "WHERE s.session_id=? "
+                    "ORDER BY m.created_at ASC LIMIT 1",
+                    (sid,),
+                ).fetchone()
+                if row:
+                    actor_user_id = row[0]
+                    actor_workspace_id = row[1]
+            runner.set_actor(
+                user_id=actor_user_id, workspace_id=actor_workspace_id,
+            )
+        except Exception:
+            # Never let actor-stamping break the request; the runner
+            # simply sees None and writes an unattributed audit row.
+            try:
+                runner.set_actor(user_id=None, workspace_id=None)
+            except Exception:
+                pass
+        return await call_next(request)
+
     # Expose repo + runner on app.state for auth.dependencies to read.
     app.state.repo = repo
     app.state.runner = runner

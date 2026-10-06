@@ -179,8 +179,7 @@ def build_router(repo: Repo) -> APIRouter:
         )
         audit_append(
             repo, event="auth.signup",
-            context={"email": email, "workspace_slug": slug,
-                      "verification_token": token},
+            context={"email": email, "workspace_slug": slug},
             user_id=user_id,
             workspace_id=_latest_workspace_id(repo._conn(), user_id),
         )
@@ -247,8 +246,13 @@ def build_router(repo: Repo) -> APIRouter:
             context={"email": email, "ip": ip},
             user_id=user["user_id"],
         )
+        # Look up the user's first workspace (oldest membership) so the
+        # client can immediately land on a workspace-scoped view.
+        first_ws = _first_workspace_for_user(repo._conn(), user["user_id"])
         return _set_session_cookie(
             request, session_id=session_id,
+            workspace_id=first_ws["workspace_id"] if first_ws else None,
+            workspace_slug=first_ws["slug"] if first_ws else None,
             user_id=user["user_id"], email=user["email"],
         )
 
@@ -257,6 +261,8 @@ def build_router(repo: Repo) -> APIRouter:
     @router.post("/logout")
     async def logout(request: Request, response: Response,
                       ctx: AuthContext = Depends(get_current_user)):
+        from auth.dependencies import require_csrf
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
         # Pull the cookie and delete that specific session.
         from auth.session import SESSION_COOKIE_NAME
         sid = request.cookies.get(SESSION_COOKIE_NAME)
@@ -294,8 +300,7 @@ def build_router(repo: Repo) -> APIRouter:
                 token_value = token
                 audit_append(
                     repo, event="auth.password_reset_requested",
-                    context={"email": email, "ip": ip,
-                              "reset_token": token},
+                    context={"email": email, "ip": ip},
                     user_id=user["user_id"],
                 )
             else:
@@ -471,9 +476,29 @@ def _latest_workspace_id(conn, user_id: str) -> str:
     return row[0] if row else ""
 
 
+def _first_workspace_for_user(conn, user_id: str) -> Optional[dict]:
+    """Return the user's OLDEST membership (workspace_id + slug).
+
+    Used by /auth/login to include `workspace_id` + `workspace_slug`
+    in the response body so the UI can land on a workspace-scoped
+    view without an extra /auth/me round trip.
+    """
+    cur = conn.execute(
+        "SELECT m.workspace_id, w.slug FROM memberships m "
+        "JOIN workspaces w ON w.workspace_id = m.workspace_id "
+        "WHERE m.user_id=? ORDER BY m.created_at ASC LIMIT 1",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {"workspace_id": row[0], "slug": row[1]}
+
+
 def _set_session_cookie(request: Request, *, session_id: str,
                           user_id: str, email: str,
                           workspace_id: Optional[str] = None,
+                          workspace_slug: Optional[str] = None,
                           extra: Optional[dict] = None) -> dict:
     body = {
         "user_id": user_id,
@@ -482,6 +507,8 @@ def _set_session_cookie(request: Request, *, session_id: str,
     }
     if workspace_id:
         body["workspace_id"] = workspace_id
+    if workspace_slug:
+        body["workspace_slug"] = workspace_slug
     if extra:
         body.update(extra)
     # We piggyback the Set-Cookie via the response state so that the
