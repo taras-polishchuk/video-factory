@@ -38,14 +38,14 @@ export const api = {
   approveBible: (id) => req('/bibles/' + id + '/approve', { method: 'POST' }),
   // assets
   listAssets: (companyId) => req('/companies/' + companyId + '/assets'),
-  uploadAsset: (companyId, kind, file) => {
+  uploadAsset: async (companyId, file, kind='misc') => {
     const fd = new FormData();
     fd.append('file', file);
     return fetch(BASE + '/companies/' + companyId + '/assets?kind=' + encodeURIComponent(kind),
       { method: 'POST', body: fd }).then(r => {
-        if (!r.ok) throw new Error(r.status + ' upload failed');
-        return r.json();
-      });
+      if (!r.ok) throw new Error(r.status + ' upload failed');
+      return r.json();
+    });
   },
   assetDownloadUrl: (id) => BASE + '/assets/' + id + '/download',
   // jobs
@@ -58,5 +58,21 @@ export const api = {
   outputDownloadUrl: (jobId, outId) => BASE + '/jobs/' + jobId + '/outputs/' + outId + '/download',
   // publishing
   publish: (jobId, body) => req('/jobs/' + jobId + '/publish', { method: 'POST', body }),
-  publishList: (jobId) => req('/jobs/' + jobId + '/publish')
+  publishList: (jobId) => req('/jobs/' + jobId + '/publish'),
+  // credentials (per-company encrypted vault)
+  listCredentials: (companyId) => req('/companies/' + companyId + '/credentials'),
+  putCredential: (companyId, provider, value, operator='') => {
+    const headers = {};
+    if (operator) headers['X-Operator'] = operator;
+    return req('/companies/' + companyId + '/credentials/' + provider, {
+      method: 'PUT', body: { value }, headers,
+    });
+  },
+  deleteCredential: (companyId, provider, operator='') => {
+    const headers = {};
+    if (operator) headers['X-Operator'] = operator;
+    return req('/companies/' + companyId + '/credentials/' + provider, {
+      method: 'DELETE', headers,
+    });
+  },
 };

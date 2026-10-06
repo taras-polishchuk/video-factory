@@ -22,6 +22,11 @@ dependencies = [
     # httpx is used by live provider adapters; lazily imported so a
     # missing install does not break the offline path.
     "httpx>=0.27",
+    # cryptography is used by the per-company credential vault
+    # (control_plane/secret_vault.py). Required for any deployment
+    # that accepts operator-supplied secrets via the web UI. Lazy
+    # import in offline-only mode.
+    "cryptography>=41",
 ]
 
 [project.optional-dependencies]

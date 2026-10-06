@@ -137,6 +137,23 @@ CREATE TABLE IF NOT EXISTS integrations (
     detail TEXT,
     updated_at TEXT NOT NULL
 );
+
+-- ── Per-company encrypted credentials (F-credential-vault) ─────────
+-- One row per (company_id, provider_name). The plaintext is never
+-- stored; only an encrypted blob. The repo exposes only masked
+-- surfaces to the API.
+CREATE TABLE IF NOT EXISTS credentials (
+    credential_id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    encrypted_blob BLOB NOT NULL,
+    fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    FOREIGN KEY (company_id) REFERENCES companies(company_id),
+    UNIQUE (company_id, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_credentials_company ON credentials(company_id);
 """
 
 
@@ -621,3 +638,123 @@ class Repo:
              "detail": r[3] or "", "updated_at": r[4]}
             for r in rows
         ]
+
+    # ── Credentials (F-credential-vault) ─────────────────────────
+
+    # Providers we will accept secrets for. Anything outside this set is
+    # rejected at the repo layer so a typo cannot silently store a blob.
+    CREDENTIAL_PROVIDERS = {
+        "heygen_direct", "comfy_cloud", "comfy_gpu_worker",
+        "comfy_heygen_partner", "publer",
+    }
+
+    def upsert_credential(self, *, company_id: str, provider: str,
+                            fingerprint_str: str, encrypted_blob: bytes,
+                            updated_by: str) -> dict:
+        """Store or replace the encrypted credential for (company, provider).
+
+        The plaintext never enters the repo: callers encrypt via
+        control_plane.secret_vault and pass the bytes. Returns the
+        masked surface (NEVER the plaintext).
+        """
+        if provider not in self.CREDENTIAL_PROVIDERS:
+            raise ValueError(f"unknown provider: {provider!r}")
+        self.get_company(company_id)  # 404 if missing
+        with self.tx() as c:
+            existing = c.execute(
+                "SELECT credential_id FROM credentials WHERE company_id=? AND provider=?",
+                (company_id, provider),
+            ).fetchone()
+            if existing:
+                c.execute(
+                    """UPDATE credentials
+                       SET encrypted_blob=?, fingerprint=?, updated_at=?, credential_id=?
+                       WHERE company_id=? AND provider=?""",
+                    (encrypted_blob, fingerprint_str, now_iso(), existing[0],
+                     company_id, provider),
+                )
+                cid = existing[0]
+            else:
+                cid = new_id("cred")
+                c.execute(
+                    """INSERT INTO credentials(credential_id, company_id, provider,
+                                              encrypted_blob, fingerprint,
+                                              updated_at, updated_by)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (cid, company_id, provider, encrypted_blob, fingerprint_str,
+                     now_iso(), updated_by),
+                )
+        return self.get_credential(company_id, provider)
+
+    def get_credential(self, company_id: str, provider: str) -> dict:
+        row = self._conn().execute(
+            "SELECT credential_id, company_id, provider, fingerprint, updated_at, updated_by "
+            "FROM credentials WHERE company_id=? AND provider=?",
+            (company_id, provider),
+        ).fetchone()
+        if not row:
+            raise NotFound(f"credential {provider!r} for company {company_id!r} not found")
+        return {
+            "credential_id": row[0],
+            "company_id": row[1],
+            "provider": row[2],
+            "has_value": True,
+            "fingerprint": row[3],
+            "updated_at": row[4],
+            "updated_by": row[5],
+        }
+
+    def list_credentials(self, company_id: str) -> list[dict]:
+        rows = self._conn().execute(
+            "SELECT credential_id, provider, fingerprint, updated_at, updated_by "
+            "FROM credentials WHERE company_id=? ORDER BY provider",
+            (company_id,),
+        ).fetchall()
+        return [
+            {
+                "credential_id": r[0],
+                "company_id": company_id,
+                "provider": r[1],
+                "has_value": True,
+                "fingerprint": r[2],
+                "updated_at": r[3],
+                "updated_by": r[4],
+            }
+            for r in rows
+        ]
+
+    def delete_credential(self, *, company_id: str, provider: str) -> None:
+        with self.tx() as c:
+            existing = c.execute(
+                "SELECT credential_id FROM credentials WHERE company_id=? AND provider=?",
+                (company_id, provider),
+            ).fetchone()
+            if not existing:
+                raise NotFound(f"credential {provider!r} for company {company_id!r} not found")
+            c.execute(
+                "DELETE FROM credentials WHERE company_id=? AND provider=?",
+                (company_id, provider),
+            )
+
+    def decrypt_credential(self, *, company_id: str, provider: str) -> str:
+        """Return the plaintext for (company, provider).
+
+        INTERNAL USE ONLY — never exposed through any API surface.
+        The render plane calls this at submit() time. Any caller that
+        surfaces the return through JSON is the leak.
+        """
+        from control_plane.secret_vault import decrypt as _decrypt, SecretReadError
+        row = self._conn().execute(
+            "SELECT encrypted_blob FROM credentials WHERE company_id=? AND provider=?",
+            (company_id, provider),
+        ).fetchone()
+        if not row:
+            raise NotFound(f"no credential for {company_id}@{provider}")
+        try:
+            return _decrypt(provider, row[0])
+        except SecretReadError as e:
+            raise SecretReadError(
+                f"credential for {company_id}@{provider} unreadable: {e}. "
+                f"Likely cause: VIDEO_FACTORY_SECRET_KEY changed since the secret was written. "
+                f"Operator must re-enter the secret."
+            ) from e

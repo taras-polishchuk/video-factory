@@ -36,13 +36,24 @@ from render_plane.provider import (
     SubmitResult,
     TeardownResult,
 )
+from render_plane.secret_provider import (
+    EnvOnlySecretProvider,
+    SecretProvider,
+    provider_name_to_env,
+)
 
 
 class HeyGenDirectAdapter:
     profile = "heygen_direct"
 
-    def __init__(self, *, api_key: Optional[str] = None) -> None:
-        self._api_key = api_key if api_key is not None else os.environ.get("HEYGEN_API_KEY")
+    def __init__(self, *, api_key: Optional[str] = None,
+                 company_id: Optional[str] = None,
+                 secret_provider: Optional[SecretProvider] = None) -> None:
+        # If the caller pre-supplies api_key (legacy test path), honor it.
+        # Otherwise resolve through the secret provider at submit() time.
+        self._explicit_api_key = api_key
+        self._company_id = company_id
+        self._secret_provider = secret_provider or EnvOnlySecretProvider()
 
     def capabilities(self) -> Capabilities:
         return Capabilities(
@@ -70,12 +81,22 @@ class HeyGenDirectAdapter:
             assumptions="HeyGen does not publish per-job pricing via API; verify in HeyGen dashboard.",
         )
 
+    def _resolve_api_key(self) -> Optional[str]:
+        if self._explicit_api_key is not None:
+            return self._explicit_api_key
+        return self._secret_provider.resolve(
+            company_id=self._company_id,
+            provider="heygen_direct",
+            env_var=provider_name_to_env("heygen_direct"),
+        )
+
     def submit(self, *, pack: dict, idempotency_key: str) -> SubmitResult:
         # Single gate — replaces the prior "build body then unconditional raise".
         # ensure_live_unlocked reads BOTH LIVE_PROVIDER_TESTS AND SMOKE_TEST_PASSED.
         ensure_live_unlocked("heygen_direct")
-        if not self._api_key:
-            raise ProviderError("HEYGEN_API_KEY not configured")
+        api_key = self._resolve_api_key()
+        if not api_key:
+            raise ProviderError("HEYGEN_API_KEY not configured (vault + env both empty)")
         # We deliberately do NOT import httpx here at module top so a
         # missing install does not break offline paths.
         try:
@@ -109,7 +130,7 @@ class HeyGenDirectAdapter:
         with httpx.Client(timeout=30) as client:
             resp = client.post(
                 "https://api.heygen.com/v2/video/generate",
-                headers={"X-Api-Key": self._api_key, "Idempotency-Key": idempotency_key},
+                headers={"X-Api-Key": self._resolve_api_key(), "Idempotency-Key": idempotency_key},
                 json=body,
             )
             resp.raise_for_status()
@@ -120,7 +141,8 @@ class HeyGenDirectAdapter:
         # Live path: behind ensure_live_unlocked + BudgetGuard.preflight.
         if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
             return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
-        if not self._api_key:
+        api_key = self._resolve_api_key()
+        if not api_key:
             return StatusResult(state=JobState.UNKNOWN, error="HEYGEN_API_KEY not configured")
         try:
             import httpx  # type: ignore
@@ -130,7 +152,7 @@ class HeyGenDirectAdapter:
             with httpx.Client(timeout=30) as client:
                 resp = client.get(
                     f"https://api.heygen.com/v2/video/{provider_job_id}",
-                    headers={"X-Api-Key": self._api_key},
+                    headers={"X-Api-Key": api_key},
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -153,7 +175,8 @@ class HeyGenDirectAdapter:
         # signed URL to LocalDiskStorage, verifies checksum, returns refs.
         if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
             return []
-        if not self._api_key:
+        api_key = self._resolve_api_key()
+        if not api_key:
             return []
         try:
             import httpx  # type: ignore
@@ -166,7 +189,7 @@ class HeyGenDirectAdapter:
                 # Step 1: get signed URL from HeyGen status
                 resp = client.get(
                     f"https://api.heygen.com/v2/video/{provider_job_id}",
-                    headers={"X-Api-Key": self._api_key},
+                    headers={"X-Api-Key": api_key},
                 )
                 resp.raise_for_status()
                 video_url = resp.json().get("data", {}).get("video_url")

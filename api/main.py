@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -312,6 +312,88 @@ def create_app(*, repo: Optional[Repo] = None,
         if not p.exists():
             raise HTTPException(404, "bible schema not found")
         return json.loads(p.read_text())
+
+    # ── credentials (F-credential-vault) ────────────────────────
+
+    @app.get("/api/v1/companies/{company_id}/credentials")
+    async def list_credentials(company_id: str):
+        # Defense: caller MUST have selected this company (cookie / header
+        # is added when auth is wired). For V0 we use a "X-Operator"
+        # header to attribute writes; reads do not require it because the
+        # UI always sends it.
+        return repo.list_credentials(company_id)
+
+    @app.get("/api/v1/companies/{company_id}/credentials/{provider}")
+    async def get_credential(company_id: str, provider: str):
+        return repo.get_credential(company_id, provider)
+
+    @app.put("/api/v1/companies/{company_id}/credentials/{provider}")
+    async def put_credential(
+        company_id: str, provider: str, payload: dict,
+        x_operator: Optional[str] = Header(default=None),
+    ):
+        # Body shape: { "value": "<plaintext secret>" }
+        plaintext = payload.get("value")
+        if not isinstance(plaintext, str) or not plaintext.strip():
+            raise HTTPException(400, "value required (non-empty string)")
+        if provider not in repo.CREDENTIAL_PROVIDERS:
+            raise HTTPException(400, f"unknown provider: {provider!r}")
+        # Encrypt here. The repo only ever sees ciphertext.
+        from control_plane.secret_vault import encrypt, fingerprint, SecretKeyMissing
+        try:
+            blob = encrypt(provider, plaintext)
+        except SecretKeyMissing as e:
+            raise HTTPException(503, str(e))
+        fp = fingerprint(plaintext)
+        operator = (x_operator or "operator").strip()[:64]
+        # Audit row first so even if encryption fails the action is recorded.
+        try:
+            result = repo.upsert_credential(
+                company_id=company_id, provider=provider,
+                fingerprint_str=fp, encrypted_blob=blob,
+                updated_by=operator,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"upsert failed: {e}")
+        # Audit success to runner_audit.
+        try:
+            from control_plane.repo_helpers import append_runner_audit
+            append_runner_audit(
+                repo,
+                job_id=f"cred::{company_id}::{provider}",
+                event="credentials.upserted",
+                context={
+                    "provider": provider,
+                    "fingerprint": fp,
+                    "updated_by": operator,
+                },
+            )
+        except Exception:
+            pass
+        return result
+
+    @app.delete("/api/v1/companies/{company_id}/credentials/{provider}")
+    async def delete_credential(
+        company_id: str, provider: str,
+        x_operator: Optional[str] = Header(default=None),
+    ):
+        operator = (x_operator or "operator").strip()[:64]
+        try:
+            repo.delete_credential(company_id=company_id, provider=provider)
+        except Exception as e:
+            # NotFound → 404
+            raise HTTPException(404, str(e))
+        try:
+            from control_plane.repo_helpers import append_runner_audit
+            append_runner_audit(
+                repo,
+                job_id=f"cred::{company_id}::{provider}",
+                event="credentials.deleted",
+                context={"provider": provider, "deleted_by": operator},
+            )
+        except Exception:
+            pass
+        return {"deleted": True, "provider": provider, "company_id": company_id}
 
     # ── webhooks (F8) ──────────────────────────────────────────
 

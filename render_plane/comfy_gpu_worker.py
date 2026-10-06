@@ -41,6 +41,11 @@ from render_plane.provider import (
     SubmitResult,
     TeardownResult,
 )
+from render_plane.secret_provider import (
+    EnvOnlySecretProvider,
+    SecretProvider,
+    provider_name_to_env,
+)
 
 
 def _basic_auth_header(user: str, password: str) -> str:
@@ -58,13 +63,41 @@ class ComfyGPUWorkerAdapter:
         api_base: Optional[str] = None,
         auth_user: Optional[str] = None,
         auth_password: Optional[str] = None,
+        company_id: Optional[str] = None,
+        secret_provider: Optional[SecretProvider] = None,
     ) -> None:
-        self._api_base = api_base or os.environ.get("COMFY_GPU_API_BASE")
-        self._user = auth_user or os.environ.get("COMFY_GPU_USER")
-        self._password = auth_password or os.environ.get("COMFY_GPU_PASSWORD")
+        self._explicit_api_base = api_base
+        self._explicit_user = auth_user
+        self._explicit_password = auth_password
+        self._company_id = company_id
+        self._secret_provider = secret_provider or EnvOnlySecretProvider()
         self._allow_actions = os.environ.get("COMFY_GPU_ALLOW_ACTIONS", "true").lower() == "true"
         # State owned by the adapter — not committed to git.
         self._verified_outputs: Dict[str, bool] = {}
+
+    def _resolve_api_base(self) -> Optional[str]:
+        if self._explicit_api_base is not None:
+            return self._explicit_api_base
+        return self._secret_provider.resolve(
+            company_id=self._company_id, provider="comfy_gpu_worker",
+            env_var=provider_name_to_env("comfy_gpu_worker"),
+        )
+
+    def _resolve_user(self) -> Optional[str]:
+        if self._explicit_user is not None:
+            return self._explicit_user
+        return self._secret_provider.resolve(
+            company_id=self._company_id, provider="comfy_gpu_worker",
+            env_var="COMFY_GPU_USER",
+        )
+
+    def _resolve_password(self) -> Optional[str]:
+        if self._explicit_password is not None:
+            return self._explicit_password
+        return self._secret_provider.resolve(
+            company_id=self._company_id, provider="comfy_gpu_worker",
+            env_var="COMFY_GPU_PASSWORD",
+        )
 
     def capabilities(self) -> Capabilities:
         return Capabilities(
@@ -93,7 +126,7 @@ class ComfyGPUWorkerAdapter:
     def submit(self, *, pack: dict, idempotency_key: str) -> SubmitResult:
         # Single gate. ensure_live_unlocked reads BOTH LIVE_PROVIDER_TESTS AND SMOKE_TEST_PASSED.
         ensure_live_unlocked("comfy_gpu_worker")
-        if not self._api_base:
+        if not self._resolve_api_base():
             raise ProviderError("COMFY_GPU_API_BASE not configured")
         # Live path (behind ensure_live_unlocked + BudgetGuard.preflight):
         # 1. Resolve workflow JSON from pack.render_capabilities.workflow_ref
@@ -112,11 +145,11 @@ class ComfyGPUWorkerAdapter:
             "client_id": idempotency_key,
         }
         headers = {}
-        if self._user and self._password:
-            headers["Authorization"] = _basic_auth_header(self._user, self._password)
+        if self._resolve_user() and self._resolve_password():
+            headers["Authorization"] = _basic_auth_header(self._resolve_user(), self._resolve_password())
         with httpx.Client(timeout=60) as client:
             resp = client.post(
-                f"{self._api_base.rstrip('/')}/prompt",
+                f"{self._resolve_api_base().rstrip('/')}/prompt",
                 headers=headers,
                 json=prompt_body,
             )
@@ -125,7 +158,7 @@ class ComfyGPUWorkerAdapter:
             return SubmitResult(provider_job_id=data.get("prompt_id", ""))
 
     def status(self, *, provider_job_id: str) -> StatusResult:
-        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true" or not self._api_base:
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true" or not self._resolve_api_base():
             return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
         try:
             import httpx  # type: ignore
@@ -133,11 +166,11 @@ class ComfyGPUWorkerAdapter:
             return StatusResult(state=JobState.UNKNOWN, error="httpx not installed")
         try:
             headers = {}
-            if self._user and self._password:
-                headers["Authorization"] = _basic_auth_header(self._user, self._password)
+            if self._resolve_user() and self._resolve_password():
+                headers["Authorization"] = _basic_auth_header(self._resolve_user(), self._resolve_password())
             with httpx.Client(timeout=30) as client:
                 resp = client.get(
-                    f"{self._api_base.rstrip('/')}/history/{provider_job_id}",
+                    f"{self._resolve_api_base().rstrip('/')}/history/{provider_job_id}",
                     headers=headers,
                 )
                 resp.raise_for_status()
@@ -158,7 +191,7 @@ class ComfyGPUWorkerAdapter:
             return StatusResult(state=JobState.UNKNOWN, error=str(e))
 
     def fetch_outputs(self, *, provider_job_id: str) -> List[OutputAsset]:
-        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true" or not self._api_base:
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true" or not self._resolve_api_base():
             return []
         try:
             import httpx  # type: ignore
@@ -168,11 +201,11 @@ class ComfyGPUWorkerAdapter:
             from control_plane.storage import LocalDiskStorage
             storage = LocalDiskStorage()
             headers = {}
-            if self._user and self._password:
-                headers["Authorization"] = _basic_auth_header(self._user, self._password)
+            if self._resolve_user() and self._resolve_password():
+                headers["Authorization"] = _basic_auth_header(self._resolve_user(), self._resolve_password())
             with httpx.Client(timeout=60) as client:
                 resp = client.get(
-                    f"{self._api_base.rstrip('/')}/history/{provider_job_id}",
+                    f"{self._resolve_api_base().rstrip('/')}/history/{provider_job_id}",
                     headers=headers,
                 )
                 resp.raise_for_status()
@@ -186,7 +219,7 @@ class ComfyGPUWorkerAdapter:
                         out_type = out.get("type", "output")
                         if not filename:
                             continue
-                        url = f"{self._api_base.rstrip('/')}/view"
+                        url = f"{self._resolve_api_base().rstrip('/')}/view"
                         params = {
                             "filename": filename,
                             "subfolder": subfolder,
@@ -213,7 +246,7 @@ class ComfyGPUWorkerAdapter:
     def cancel(self, *, provider_job_id: str) -> TeardownResult:
         # ComfyUI has no /cancel endpoint. /queue clear is the documented
         # manual path; in live mode we attempt it when actions are allowed.
-        if not self._api_base or not self._allow_actions:
+        if not self._resolve_api_base() or not self._allow_actions:
             return TeardownResult(ok=False, detail="queue clear requires API base + COMFY_GPU_ALLOW_ACTIONS=true")
         if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
             return TeardownResult(ok=False, detail="live path not unlocked")
@@ -223,11 +256,11 @@ class ComfyGPUWorkerAdapter:
             return TeardownResult(ok=False, detail="httpx not installed")
         try:
             headers = {}
-            if self._user and self._password:
-                headers["Authorization"] = _basic_auth_header(self._user, self._password)
+            if self._resolve_user() and self._resolve_password():
+                headers["Authorization"] = _basic_auth_header(self._resolve_user(), self._resolve_password())
             with httpx.Client(timeout=15) as client:
                 resp = client.post(
-                    f"{self._api_base.rstrip('/')}/queue",
+                    f"{self._resolve_api_base().rstrip('/')}/queue",
                     headers=headers,
                     json={"clear": True},
                 )

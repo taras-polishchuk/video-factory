@@ -35,6 +35,11 @@ from render_plane.provider import (
     SubmitResult,
     TeardownResult,
 )
+from render_plane.secret_provider import (
+    EnvOnlySecretProvider,
+    SecretProvider,
+    provider_name_to_env,
+)
 
 
 class ComfyCloudAdapter:
@@ -45,9 +50,31 @@ class ComfyCloudAdapter:
         *,
         api_base: Optional[str] = None,
         api_key: Optional[str] = None,
+        company_id: Optional[str] = None,
+        secret_provider: Optional[SecretProvider] = None,
     ) -> None:
-        self._api_base = api_base or os.environ.get("COMFY_CLOUD_API_BASE")
-        self._api_key = api_key or os.environ.get("COMFY_CLOUD_API_KEY")
+        # Backward compat: callers may pass api_base/api_key directly
+        # (test path). Otherwise resolve at submit() time.
+        self._explicit_api_base = api_base
+        self._explicit_api_key = api_key
+        self._company_id = company_id
+        self._secret_provider = secret_provider or EnvOnlySecretProvider()
+
+    def _resolve_api_base(self) -> Optional[str]:
+        if self._explicit_api_base is not None:
+            return self._explicit_api_base
+        return self._secret_provider.resolve(
+            company_id=self._company_id, provider="comfy_cloud",
+            env_var="COMFY_CLOUD_API_BASE",
+        )
+
+    def _resolve_api_key(self) -> Optional[str]:
+        if self._explicit_api_key is not None:
+            return self._explicit_api_key
+        return self._secret_provider.resolve(
+            company_id=self._company_id, provider="comfy_cloud",
+            env_var=provider_name_to_env("comfy_cloud"),
+        )
 
     def capabilities(self) -> Capabilities:
         return Capabilities(
@@ -76,8 +103,10 @@ class ComfyCloudAdapter:
     def submit(self, *, pack: dict, idempotency_key: str) -> SubmitResult:
         # Single gate. ensure_live_unlocked reads BOTH LIVE_PROVIDER_TESTS AND SMOKE_TEST_PASSED.
         ensure_live_unlocked("comfy_cloud")
-        if not self._api_key or not self._api_base:
-            raise ProviderError("COMFY_CLOUD_API_BASE / COMFY_CLOUD_API_KEY not configured")
+        api_key = self._resolve_api_key()
+        api_base = self._resolve_api_base()
+        if not api_key or not api_base:
+            raise ProviderError("COMFY_CLOUD_API_BASE / COMFY_CLOUD_API_KEY not configured (vault + env both empty)")
         # Live path (behind ensure_live_unlocked + BudgetGuard.preflight):
         # 1. Resolve the API-format workflow JSON (pack['render_capabilities']['workflow_ref'])
         # 2. Substitute scene-level parameters from pack['scenes']
@@ -98,8 +127,8 @@ class ComfyCloudAdapter:
         }
         with httpx.Client(timeout=30) as client:
             resp = client.post(
-                f"{self._api_base.rstrip('/')}/workflows",
-                headers={"Authorization": f"Bearer {self._api_key}"},
+                f"{api_base.rstrip('/')}/workflows",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json=body,
             )
             resp.raise_for_status()
@@ -109,7 +138,9 @@ class ComfyCloudAdapter:
     def status(self, *, provider_job_id: str) -> StatusResult:
         if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
             return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
-        if not self._api_key or not self._api_base:
+        api_key = self._resolve_api_key()
+        api_base = self._resolve_api_base()
+        if not api_key or not api_base:
             return StatusResult(state=JobState.UNKNOWN, error="COMFY_CLOUD_API_BASE / COMFY_CLOUD_API_KEY not configured")
         try:
             import httpx  # type: ignore
@@ -118,8 +149,8 @@ class ComfyCloudAdapter:
         try:
             with httpx.Client(timeout=30) as client:
                 resp = client.get(
-                    f"{self._api_base.rstrip('/')}/workflows/{provider_job_id}",
-                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    f"{api_base.rstrip('/')}/workflows/{provider_job_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -140,7 +171,9 @@ class ComfyCloudAdapter:
     def fetch_outputs(self, *, provider_job_id: str) -> List[OutputAsset]:
         if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
             return []
-        if not self._api_key or not self._api_base:
+        api_key = self._resolve_api_key()
+        api_base = self._resolve_api_base()
+        if not api_key or not api_base:
             return []
         try:
             import httpx  # type: ignore
@@ -151,8 +184,8 @@ class ComfyCloudAdapter:
             storage = LocalDiskStorage()
             with httpx.Client(timeout=60) as client:
                 resp = client.get(
-                    f"{self._api_base.rstrip('/')}/workflows/{provider_job_id}/outputs",
-                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    f"{api_base.rstrip('/')}/workflows/{provider_job_id}/outputs",
+                    headers={"Authorization": f"Bearer {api_key}"},
                 )
                 resp.raise_for_status()
                 items = resp.json().get("outputs", [])
@@ -181,8 +214,12 @@ class ComfyCloudAdapter:
             return []
 
     def cancel(self, *, provider_job_id: str) -> TeardownResult:
-        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true" or not self._api_key or not self._api_base:
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
             return TeardownResult(ok=False, detail="live path not unlocked")
+        api_key = self._resolve_api_key()
+        api_base = self._resolve_api_base()
+        if not api_key or not api_base:
+            return TeardownResult(ok=False, detail="credentials not configured")
         try:
             import httpx  # type: ignore
         except ImportError:
@@ -190,8 +227,8 @@ class ComfyCloudAdapter:
         try:
             with httpx.Client(timeout=15) as client:
                 resp = client.delete(
-                    f"{self._api_base.rstrip('/')}/workflows/{provider_job_id}",
-                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    f"{api_base.rstrip('/')}/workflows/{provider_job_id}",
+                    headers={"Authorization": f"Bearer {api_key}"},
                 )
                 resp.raise_for_status()
                 return TeardownResult(ok=True, detail=f"deleted workflow {provider_job_id}")

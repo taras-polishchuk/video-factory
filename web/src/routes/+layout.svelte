@@ -47,7 +47,8 @@
     { href: '/assets', label: 'Assets' },
     { href: '/jobs', label: 'Jobs' },
     { href: '/create', label: 'Create' },
-    { href: '/integrations', label: 'Integrations' }
+    { href: '/integrations', label: 'Integrations' },
+    { href: '/credentials', label: 'Credentials' }
   ];
 </script>
 
