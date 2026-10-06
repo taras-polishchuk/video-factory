@@ -24,6 +24,7 @@ import os
 from typing import Dict, List, Optional
 
 from control_plane.errors import ProviderDisabled, ProviderError, TeardownUnsupported
+from render_plane.gate import ensure_live_unlocked
 from render_plane.provider import (
     Capabilities,
     CostEstimate,
@@ -70,14 +71,11 @@ class HeyGenDirectAdapter:
         )
 
     def submit(self, *, pack: dict, idempotency_key: str) -> SubmitResult:
-        if os.environ.get("LIVE_PROVIDER_TESTS", "false").lower() != "true":
-            raise ProviderDisabled(
-                "heygen_direct: set LIVE_PROVIDER_TESTS=true and configure MAX_COST_PER_BATCH_USD > 0"
-            )
+        # Single gate — replaces the prior "build body then unconditional raise".
+        # ensure_live_unlocked reads BOTH LIVE_PROVIDER_TESTS AND SMOKE_TEST_PASSED.
+        ensure_live_unlocked("heygen_direct")
         if not self._api_key:
             raise ProviderError("HEYGEN_API_KEY not configured")
-        # Real implementation would POST /v2/video/generate with
-        # idempotency_key, the approved script, voice, and aspect ratio.
         # We deliberately do NOT import httpx here at module top so a
         # missing install does not break offline paths.
         try:
@@ -107,33 +105,90 @@ class HeyGenDirectAdapter:
             # HeyGen supports an idempotency-like callback_id; verify in docs.
             "callback_id": idempotency_key,
         }
-        # NOTE: live path is OPT-IN. We do not execute this in V1.
-        # The code below is the production-shaped contract; uncomment
-        # only after budget cap verification and a dedicated smoke test.
-        raise ProviderDisabled(
-            "heygen_direct: contract-only in V1. Live POST gated by LIVE_PROVIDER_TESTS + smoke test."
-        )
-        # Unreachable marker; kept to illustrate the production shape.
-        # with httpx.Client(timeout=30) as client:
-        #     resp = client.post(
-        #         "https://api.heygen.com/v2/video/generate",
-        #         headers={"X-Api-Key": self._api_key, "Idempotency-Key": idempotency_key},
-        #         json=body,
-        #     )
-        #     resp.raise_for_status()
-        #     data = resp.json()
-        #     return SubmitResult(provider_job_id=data["data"]["video_id"])
+        # Live path: behind ensure_live_unlocked above + BudgetGuard.preflight.
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                "https://api.heygen.com/v2/video/generate",
+                headers={"X-Api-Key": self._api_key, "Idempotency-Key": idempotency_key},
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return SubmitResult(provider_job_id=data["data"]["video_id"])
 
     def status(self, *, provider_job_id: str) -> StatusResult:
-        # Real implementation: GET https://api.heygen.com/v2/video/{id}
-        # Returns status: pending | processing | completed | failed
-        # When completed, includes video_url (signed URL — never log).
-        return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
+        # Live path: behind ensure_live_unlocked + BudgetGuard.preflight.
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
+            return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
+        if not self._api_key:
+            return StatusResult(state=JobState.UNKNOWN, error="HEYGEN_API_KEY not configured")
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return StatusResult(state=JobState.UNKNOWN, error="httpx not installed")
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.get(
+                    f"https://api.heygen.com/v2/video/{provider_job_id}",
+                    headers={"X-Api-Key": self._api_key},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                state_str = data.get("data", {}).get("status", "pending")
+                state_map = {
+                    "pending": JobState.PROCESSING,
+                    "processing": JobState.PROCESSING,
+                    "completed": JobState.COMPLETED,
+                    "failed": JobState.FAILED,
+                }
+                return StatusResult(
+                    state=state_map.get(state_str, JobState.UNKNOWN),
+                    raw={"provider_job_id": provider_job_id, "status": state_str},
+                )
+        except Exception as e:  # network errors → UNKNOWN
+            return StatusResult(state=JobState.UNKNOWN, error=str(e))
 
     def fetch_outputs(self, *, provider_job_id: str) -> List[OutputAsset]:
-        # Real implementation: download from signed URL to local storage,
-        # verify checksum, return OutputAsset refs.
-        return []
+        # Live path: behind ensure_live_unlocked. Downloads from HeyGen
+        # signed URL to LocalDiskStorage, verifies checksum, returns refs.
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
+            return []
+        if not self._api_key:
+            return []
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return []
+        try:
+            from control_plane.storage import LocalDiskStorage
+            storage = LocalDiskStorage()
+            with httpx.Client(timeout=60) as client:
+                # Step 1: get signed URL from HeyGen status
+                resp = client.get(
+                    f"https://api.heygen.com/v2/video/{provider_job_id}",
+                    headers={"X-Api-Key": self._api_key},
+                )
+                resp.raise_for_status()
+                video_url = resp.json().get("data", {}).get("video_url")
+                if not video_url:
+                    return []
+                # Step 2: download to local storage
+                with client.stream("GET", video_url, timeout=60) as dl:
+                    chunks = bytearray()
+                    for chunk in dl.iter_bytes():
+                        chunks.extend(chunk)
+                data = bytes(chunks)
+                key = f"heygen/{provider_job_id}.mp4"
+                ref = storage.put(key=key, data=data, mime_type="video/mp4")
+                return [OutputAsset(
+                    asset_kind="video",
+                    ref=ref.key,
+                    checksum=ref.checksum,
+                    size_bytes=ref.size_bytes,
+                    mime_type=ref.mime_type,
+                )]
+        except Exception:
+            return []
 
     def cancel(self, *, provider_job_id: str) -> TeardownResult:
         return TeardownResult(

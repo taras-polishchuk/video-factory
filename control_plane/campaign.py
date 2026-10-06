@@ -38,6 +38,13 @@ class PlatformSpec:
             return cls(name="x", aspect_ratios=("16:9", "1:1"))
         if n == "web":
             return cls(name="web", aspect_ratios=("16:9",))
+        # Publish-only platforms. These are accepted by the publish-intent
+        # API (mock-only) but not by the campaign intake validator. This
+        # split exists because the platform set used at intake (for
+        # aspect-ratio resolution) is narrower than the set we accept
+        # as publish targets. See F7 cross-company guard rationale.
+        if n in ("ig", "instagram", "facebook", "youtube", "threads", "pinterest", "x_post", "bluesky"):
+            return cls(name=n, aspect_ratios=("9:16", "16:9", "1:1"))
         raise ValueError(f"unknown platform: {name}")
 
 

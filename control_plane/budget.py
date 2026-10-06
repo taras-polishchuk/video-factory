@@ -1,11 +1,42 @@
-"""Budget guard. Preflight cost estimation; refuses submit on exceed."""
+"""Budget guard. Preflight cost estimation; refuses submit on exceed.
+
+Hard preflight + record_spend. Used by Orchestrator + JobRunner before
+ANY submit to a live provider. The guard refuses on:
+
+  * unknown cost (estimate returns CostEstimate(unknown=True))
+  * per-video ceiling exceeded
+  * batch ceiling exceeded (cumulative across multiple submits)
+
+For the live path to be reachable at all, both `LIVE_PROVIDER_TESTS=true`
+AND `SMOKE_TEST_PASSED=true` must be set. Either flag missing keeps the
+adapter in lock-down. See `render_plane/gate.py` for the unified gate.
+"""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 from control_plane.errors import BudgetExceeded
+
+
+# Both flags must be set for a live provider adapter to permit submit().
+# SMOKE_TEST_PASSED is a one-way flip: the operator flips it after a
+# dedicated smoke test on a separate account confirmed the contract works.
+LIVE_OK_ENV = "SMOKE_TEST_PASSED"
+LIVE_OK_LIVE_FLAG = "LIVE_PROVIDER_TESTS"
+
+
+def live_path_unlocked() -> bool:
+    """True iff BOTH `LIVE_PROVIDER_TESTS=true` AND `SMOKE_TEST_PASSED=true`.
+
+    Read at submit() time. Cache module config (L-12). Either flag missing
+    → live path stays locked. Default false.
+    """
+    live = os.environ.get(LIVE_OK_LIVE_FLAG, "").lower() == "true"
+    smoke = os.environ.get(LIVE_OK_ENV, "").lower() == "true"
+    return live and smoke
 
 
 @dataclass(frozen=True)

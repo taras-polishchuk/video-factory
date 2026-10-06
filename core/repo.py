@@ -185,6 +185,10 @@ class Repo:
                 "INSERT OR IGNORE INTO integrations(name, enabled, mode, detail, updated_at) VALUES (?,?,?,?,?)",
                 (name, 0, "mock", "default mock mode", now_iso()),
             )
+        # F3: append runner_audit table for idempotency-mirror events.
+        from control_plane.repo_helpers import RUNNER_AUDIT_SCHEMA, bootstrap_runner_audit
+        c.executescript(RUNNER_AUDIT_SCHEMA)
+        bootstrap_runner_audit(self)
 
     def close(self) -> None:
         c = getattr(self._local, "conn", None)
@@ -202,13 +206,6 @@ class Repo:
             except Exception:
                 c.rollback()
                 raise
-
-    def _seed_integrations(self) -> None:
-        for name in ("heygen", "comfy_cloud", "comfy_gpu_worker", "n8n", "publer"):
-            self._conn().execute(
-                "INSERT OR IGNORE INTO integrations(name, enabled, mode, detail, updated_at) VALUES (?,?,?,?,?)",
-                (name, 0, "mock", "default mock mode", now_iso()),
-            )
 
     # ── Companies ─────────────────────────────────────────────
 
@@ -544,9 +541,26 @@ class Repo:
     def create_publish_intent(self, *, job_id: str, company_id: str,
                               action: str, platforms: list[str],
                               caption: str = "", scheduled_for: Optional[str] = None) -> dict:
-        self.get_job(job_id)
+        # F7: cross-company guard. A publish intent must reference a job
+        # that actually belongs to the calling company. Without this
+        # check, any caller could file a publish intent for another
+        # tenant's job — they would see the intent detail and could
+        # potentially pivot to live publishing once enabled.
+        job = self.get_job(job_id)
+        if job["company_id"] != company_id:
+            raise Forbidden(
+                f"job {job_id} belongs to company {job['company_id']!r}; "
+                f"cannot publish on behalf of {company_id!r}"
+            )
         if action not in ("draft", "schedule", "publish"):
             raise ValueError(f"invalid action {action}")
+        # Validate that platforms are recognized by the intake validator.
+        try:
+            from control_plane.campaign import PlatformSpec
+            for p in platforms:
+                PlatformSpec.from_name(p)
+        except ValueError as e:
+            raise ValueError(str(e)) from e
         intent_id = new_id("pub")
         with self.tx() as c:
             c.execute(

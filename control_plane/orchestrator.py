@@ -29,7 +29,7 @@ from assembly.ffmpeg_assembler import (
     stitch_scene_clips,
 )
 from control_plane.audit import AuditLog, InMemoryAuditLog, AuditRecord, now_iso
-from control_plane.budget import BudgetGuard
+from control_plane.budget import BudgetDecision, BudgetGuard
 from control_plane.campaign import (
     CampaignRequest,
     IntakeReport,
@@ -76,6 +76,7 @@ class OrchestratorConfig:
     budget_per_video_usd: float = 0.0
     budget_per_batch_usd: float = 0.0
     enforce_budget: bool = True
+    audit: Optional[AuditLog] = None
 
 
 @dataclass
@@ -197,17 +198,73 @@ class Orchestrator:
         )
         receipt = self.idem.lookup(idem_key)
         provider_job_id: Optional[str] = None
+        # ── F1: real BudgetGuard preflight + record_spend wired here ──
+        # Closes audit §2.2/2.3: preflight was constructed but never called.
+        cost_estimate = self.renderer.estimate(pack=pack_dict)
+        budget_decision = self.budget.preflight(
+            estimated_cost_usd=cost_estimate.amount_usd,
+            scope="video",
+        )
+        self.audit.record(
+            AuditRecord(
+                timestamp=now_iso(),
+                event="budget.preflight",
+                actor="orchestrator",
+                campaign_id=pack.campaign_id,
+                video_id=pack.video_id,
+                context={
+                    "estimated_cost_usd": cost_estimate.amount_usd,
+                    "unknown": cost_estimate.unknown,
+                    "allowed": budget_decision.allowed,
+                    "reason": budget_decision.reason,
+                },
+            )
+        )
+        if self.config.enforce_budget and not budget_decision.allowed:
+            sm.transition(
+                State.FAILED,
+                actor="orchestrator",
+                reason="budget preflight refused",
+                context={"reason": budget_decision.reason},
+            )
+            raise BudgetExceeded(budget_decision.reason)
         if receipt is None:
             # If the renderer has a set_idempotency_store() method (MockRenderer),
             # hand it the orchestrator's store so the renderer sees the same
             # map if it inspects state internally.
             if hasattr(self.renderer, "set_idempotency_store"):
                 self.renderer.set_idempotency_store(self.idem)
-            submit = self.renderer.submit(pack=pack_dict, idempotency_key=idem_key)
+            try:
+                submit = self.renderer.submit(pack=pack_dict, idempotency_key=idem_key)
+            except ProviderDisabled as e:
+                sm.transition(
+                    State.FAILED,
+                    actor="orchestrator",
+                    reason="provider disabled",
+                    context={"error": str(e)},
+                )
+                raise
             provider_job_id = submit.provider_job_id
             self.idem.save(
                 idem_key,
                 _receipt_from_submit(submit, pack.campaign_id, pack.video_id),
+            )
+            # Record actual spend (mock = 0; live uses cost_estimate.amount_usd when known).
+            actual = cost_estimate.amount_usd if cost_estimate.amount_usd is not None else 0.0
+            self.budget.record_spend(actual)
+            self.audit.record(
+                AuditRecord(
+                    timestamp=now_iso(),
+                    event="submit.attempt",
+                    actor="orchestrator",
+                    campaign_id=pack.campaign_id,
+                    video_id=pack.video_id,
+                    provider_job_id=provider_job_id,
+                    context={
+                        "estimated_cost_usd": actual,
+                        "render_profile": pack.render_profile,
+                    },
+                )
             )
         else:
             provider_job_id = receipt.provider_job_id
@@ -283,8 +340,10 @@ class Orchestrator:
                 captions=[c.to_dict() for c in pack.captions],
             )
             if assembled is None:
-                # FFmpeg unavailable or failed — surface but don't fail the
-                # whole video, since each clip is already a valid mock asset.
+                # F4: FFmpeg unavailable OR stitch subprocess failed — surface but
+                # do not fail the run, since each clip is already a valid mock
+                # asset. The orchestrator records a structured skip so the
+                # operator can see the reason in the audit trail.
                 self.audit.record(
                     AuditRecord(
                         timestamp=now_iso(),
@@ -292,7 +351,24 @@ class Orchestrator:
                         actor="orchestrator",
                         campaign_id=pack.campaign_id,
                         video_id=pack.video_id,
-                        context={"reason": "ffmpeg unavailable or stitch failed"},
+                        context={"reason": "ffmpeg unavailable or stitch subprocess failed"},
+                    )
+                )
+            elif assembled.get("skipped"):
+                # F4: explicit mock-only skip. We surface the reason
+                # distinct from "ffmpeg missing" so the operator can
+                # tell apart "infra missing" from "input was mock".
+                self.audit.record(
+                    AuditRecord(
+                        timestamp=now_iso(),
+                        event="assembly.skipped",
+                        actor="orchestrator",
+                        campaign_id=pack.campaign_id,
+                        video_id=pack.video_id,
+                        context={
+                            "reason": assembled.get("reason", "skipped"),
+                            "qc": assembled.get("qc", {}),
+                        },
                     )
                 )
 

@@ -101,8 +101,14 @@ def create_app(*, repo: Optional[Repo] = None,
         name = (payload.get("name") or "").strip()
         if not slug or not name:
             raise HTTPException(400, "slug and name required")
-        return repo.create_company(slug=slug, name=name,
-                                    description=payload.get("description", ""))
+        try:
+            return repo.create_company(slug=slug, name=name,
+                                        description=payload.get("description", ""))
+        except Exception as e:
+            # Surface slug uniqueness as 409 instead of 500.
+            if "UNIQUE constraint failed" in str(e) and "slug" in str(e):
+                raise HTTPException(409, f"slug {slug!r} already exists")
+            raise
 
     @app.get("/api/v1/companies")
     async def list_companies():
@@ -306,6 +312,17 @@ def create_app(*, repo: Optional[Repo] = None,
         if not p.exists():
             raise HTTPException(404, "bible schema not found")
         return json.loads(p.read_text())
+
+    # ── webhooks (F8) ──────────────────────────────────────────
+
+    from api.webhooks_heygen import build_router as _heygen_webhook_router
+    from control_plane.audit import AuditLog as _AuditLogBase
+    _heygen_router = _heygen_webhook_router(
+        repo=repo,
+        runner=runner,
+        audit=runner.audit if isinstance(getattr(runner, "audit", None), _AuditLogBase) else None,
+    )
+    app.include_router(_heygen_router)
 
     return app
 

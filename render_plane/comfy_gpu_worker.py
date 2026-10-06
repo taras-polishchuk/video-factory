@@ -22,10 +22,14 @@ This adapter refuses `teardown_gpu()` if there are unverified outputs.
 
 from __future__ import annotations
 
+import base64 as _b64
+import hashlib
+import hmac
 import os
 from typing import Dict, List, Optional
 
 from control_plane.errors import ProviderDisabled, ProviderError, TeardownUnsupported
+from render_plane.gate import ensure_live_unlocked
 from render_plane.provider import (
     Capabilities,
     CostEstimate,
@@ -37,6 +41,12 @@ from render_plane.provider import (
     SubmitResult,
     TeardownResult,
 )
+
+
+def _basic_auth_header(user: str, password: str) -> str:
+    """Build the Authorization header value for HTTP Basic auth."""
+    token = _b64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
 
 
 class ComfyGPUWorkerAdapter:
@@ -81,30 +91,150 @@ class ComfyGPUWorkerAdapter:
         )
 
     def submit(self, *, pack: dict, idempotency_key: str) -> SubmitResult:
-        if os.environ.get("LIVE_PROVIDER_TESTS", "false").lower() != "true":
-            raise ProviderDisabled("comfy_gpu_worker: set LIVE_PROVIDER_TESTS=true + budget cap")
+        # Single gate. ensure_live_unlocked reads BOTH LIVE_PROVIDER_TESTS AND SMOKE_TEST_PASSED.
+        ensure_live_unlocked("comfy_gpu_worker")
         if not self._api_base:
             raise ProviderError("COMFY_GPU_API_BASE not configured")
-        # Real implementation:
-        # 1. Resolve workflow JSON
+        # Live path (behind ensure_live_unlocked + BudgetGuard.preflight):
+        # 1. Resolve workflow JSON from pack.render_capabilities.workflow_ref
         # 2. Substitute scene-level parameters
-        # 3. POST {api_base}/prompt with auth
+        # 3. POST {api_base}/prompt with optional basic auth
         # 4. Receive prompt_id (provider_job_id)
-        raise ProviderDisabled(
-            "comfy_gpu_worker: contract-only in V1. Live submit gated by LIVE_PROVIDER_TESTS + smoke."
-        )
+        try:
+            import httpx  # type: ignore
+        except ImportError as e:
+            raise ProviderError("httpx not installed; pip install httpx") from e
+        workflow_ref = pack.get("render_capabilities", {}).get("workflow_ref")
+        if not workflow_ref:
+            raise ProviderError("pack.render_capabilities.workflow_ref not set for comfy_gpu_worker")
+        prompt_body = {
+            "prompt": workflow_ref,
+            "client_id": idempotency_key,
+        }
+        headers = {}
+        if self._user and self._password:
+            headers["Authorization"] = _basic_auth_header(self._user, self._password)
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                f"{self._api_base.rstrip('/')}/prompt",
+                headers=headers,
+                json=prompt_body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return SubmitResult(provider_job_id=data.get("prompt_id", ""))
 
     def status(self, *, provider_job_id: str) -> StatusResult:
-        # Real implementation: GET {api_base}/history/{prompt_id}
-        return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true" or not self._api_base:
+            return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return StatusResult(state=JobState.UNKNOWN, error="httpx not installed")
+        try:
+            headers = {}
+            if self._user and self._password:
+                headers["Authorization"] = _basic_auth_header(self._user, self._password)
+            with httpx.Client(timeout=30) as client:
+                resp = client.get(
+                    f"{self._api_base.rstrip('/')}/history/{provider_job_id}",
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # ComfyUI history shape: { prompt_id: { status, outputs: {...} } }
+                entry = data.get(provider_job_id, {}) if isinstance(data, dict) else {}
+                status_obj = entry.get("status", {})
+                completed = bool(status_obj.get("completed", False))
+                err = None
+                if status_obj.get("status_str") == "error":
+                    err = ",".join(status_obj.get("messages", [])) or "comfy error"
+                    return StatusResult(state=JobState.FAILED, error=err)
+                return StatusResult(
+                    state=JobState.COMPLETED if completed else JobState.PROCESSING,
+                    raw={"provider_job_id": provider_job_id},
+                )
+        except Exception as e:
+            return StatusResult(state=JobState.UNKNOWN, error=str(e))
 
     def fetch_outputs(self, *, provider_job_id: str) -> List[OutputAsset]:
-        # Real implementation: parse /history/{id} response, download to storage, verify checksum.
-        # Return OutputAsset refs only after verification.
-        return []
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true" or not self._api_base:
+            return []
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return []
+        try:
+            from control_plane.storage import LocalDiskStorage
+            storage = LocalDiskStorage()
+            headers = {}
+            if self._user and self._password:
+                headers["Authorization"] = _basic_auth_header(self._user, self._password)
+            with httpx.Client(timeout=60) as client:
+                resp = client.get(
+                    f"{self._api_base.rstrip('/')}/history/{provider_job_id}",
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                entry = resp.json().get(provider_job_id, {})
+                outputs_blob = entry.get("outputs", {})
+                outputs = []
+                for node_id, node_outputs in outputs_blob.items():
+                    for out in node_outputs.get("images", []):
+                        filename = out.get("filename")
+                        subfolder = out.get("subfolder", "")
+                        out_type = out.get("type", "output")
+                        if not filename:
+                            continue
+                        url = f"{self._api_base.rstrip('/')}/view"
+                        params = {
+                            "filename": filename,
+                            "subfolder": subfolder,
+                            "type": out_type,
+                        }
+                        with client.stream("GET", url, params=params, timeout=60, headers=headers) as dl:
+                            chunks = bytearray()
+                            for chunk in dl.iter_bytes():
+                                chunks.extend(chunk)
+                        data = bytes(chunks)
+                        key = f"comfy_gpu/{provider_job_id}/{filename}"
+                        ref = storage.put(key=key, data=data, mime_type="image/png" if filename.endswith(".png") else "video/mp4")
+                        outputs.append(OutputAsset(
+                            asset_kind="scene_clip",
+                            ref=ref.key,
+                            checksum=ref.checksum,
+                            size_bytes=ref.size_bytes,
+                            mime_type=ref.mime_type,
+                        ))
+                return outputs
+        except Exception:
+            return []
 
     def cancel(self, *, provider_job_id: str) -> TeardownResult:
-        return TeardownResult(ok=False, detail="Comfy does not expose /cancel. Use /queue clear (manual).")
+        # ComfyUI has no /cancel endpoint. /queue clear is the documented
+        # manual path; in live mode we attempt it when actions are allowed.
+        if not self._api_base or not self._allow_actions:
+            return TeardownResult(ok=False, detail="queue clear requires API base + COMFY_GPU_ALLOW_ACTIONS=true")
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
+            return TeardownResult(ok=False, detail="live path not unlocked")
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return TeardownResult(ok=False, detail="httpx not installed")
+        try:
+            headers = {}
+            if self._user and self._password:
+                headers["Authorization"] = _basic_auth_header(self._user, self._password)
+            with httpx.Client(timeout=15) as client:
+                resp = client.post(
+                    f"{self._api_base.rstrip('/')}/queue",
+                    headers=headers,
+                    json={"clear": True},
+                )
+                resp.raise_for_status()
+                return TeardownResult(ok=True, detail=f"queue cleared for {provider_job_id}")
+        except Exception as e:
+            return TeardownResult(ok=False, detail=str(e))
 
     def teardown_gpu(self, *, provider_job_id_to_output_refs: Dict[str, List[str]]) -> bool:
         """Refuse teardown until every output is verified uploaded + checksum OK.

@@ -182,13 +182,25 @@ def stitch_scene_clips(
     """Stitch scene clips + optional audio + optional burned captions.
 
     Returns a small dict with output artifact info, or None if FFmpeg is
-    unavailable or fails.
+    unavailable or fails. When ALL inputs are mock fixtures (no real
+    container), this function refuses to claim stitched output — it
+    returns a structured `{"skipped": True, "reason": "mock_only"}`
+    dict so the orchestrator can record assembly.skip vs assembly.fail
+    distinctly.
+
+    The orchestrator decides whether to fail the run; this layer never
+    fabricates an MP4 from non-mock inputs.
     """
     if shutil.which(ffmpeg_binary) is None:
         return None
 
     if not clip_refs:
         return None
+
+    # Detect all-mock inputs so we do not claim a stitched MP4 from
+    # sentinel-header fixtures. The orchestrator treats this as
+    # assembly.skipped; it is not a hard failure.
+    all_mock = all(_is_mock_path(storage.path_for(ref) or "") for ref in clip_refs)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
@@ -204,6 +216,20 @@ def stitch_scene_clips(
             # Use absolute path with single-quote escaping.
             concat_lines.append(f"file '{p.as_posix()}'")
         concat_file.write_text("\n".join(concat_lines) + "\n")
+
+        if all_mock:
+            # Don't try to concat sentinel headers through ffmpeg; they
+            # will fail with a confusing error. Surface a clean skip.
+            return {
+                "output_ref": None,
+                "skipped": True,
+                "reason": "mock_only",
+                "qc": {
+                    "ok": True,
+                    "checks": {"all_inputs_mock": True},
+                    "notes": ["stitch refused: sentinel-marker mock fixtures are not real containers"],
+                },
+            }
 
         out_path = tmpdir / "stitched.mp4"
         cmd: List[str] = [
@@ -240,3 +266,10 @@ def stitch_scene_clips(
             "output_ref": ref.to_dict(),
             "qc": qc.to_dict(),
         }
+
+
+def _is_mock_path(path: str) -> bool:
+    """Convenience wrapper around is_mock_asset for a path."""
+    if not path:
+        return False
+    return is_mock_asset(path)

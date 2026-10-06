@@ -26,6 +26,7 @@ import os
 from typing import Dict, List, Optional
 
 from control_plane.errors import ProviderDisabled, ProviderError, TeardownUnsupported
+from render_plane.gate import ensure_live_unlocked
 from render_plane.provider import (
     Capabilities,
     CostEstimate,
@@ -77,16 +78,25 @@ class ComfyHeyGenPartnerAdapter:
     def _object_info_heygen_nodes(self) -> List[str]:
         """Returns the HeyGen node types advertised by the live Comfy server.
 
-        Live path only. Returns [] in offline mode.
+        Live path only. Returns [] in offline mode. Capability check uses
+        the documented /object_info endpoint.
         """
         if not self._api_base:
             return []
-        if os.environ.get("LIVE_PROVIDER_TESTS", "false").lower() != "true":
+        if os.environ.get("LIVE_PROVIDER_TESTS", "").lower() != "true":
             return []
-        # Real implementation: GET {api_base}/object_info
-        # response shape: { <node_type>: { ... } , ... }
-        # Filter keys that intersect HEYGEN_PARTNER_NODE_TYPES.
-        return []
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return []
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(f"{self._api_base.rstrip('/')}/object_info")
+                resp.raise_for_status()
+                advertised = resp.json().keys()
+                return [n for n in advertised if n in HEYGEN_PARTNER_NODE_TYPES]
+        except Exception:
+            return []
 
     def is_capable(self) -> bool:
         """True only when the running server actually exposes a HeyGen partner node."""
@@ -102,19 +112,47 @@ class ComfyHeyGenPartnerAdapter:
         )
 
     def submit(self, *, pack: dict, idempotency_key: str) -> SubmitResult:
-        if os.environ.get("LIVE_PROVIDER_TESTS", "false").lower() != "true":
-            raise ProviderDisabled(
-                "comfy_heygen_partner: set LIVE_PROVIDER_TESTS=true + verify server capability."
-            )
+        # Single gate. ensure_live_unlocked reads BOTH LIVE_PROVIDER_TESTS AND SMOKE_TEST_PASSED.
+        ensure_live_unlocked("comfy_heygen_partner")
         if not self._api_base:
             raise ProviderError("COMFY_GPU_API_BASE not configured")
         if not self.is_capable():
             raise ProviderDisabled(
                 "comfy_heygen_partner: server object_info does not advertise HeyGen partner nodes."
             )
-        raise ProviderDisabled(
-            "comfy_heygen_partner: contract-only in V1. Live submit gated by capability check."
-        )
+        # Live path (behind ensure_live_unlocked + BudgetGuard.preflight):
+        # Build a workflow JSON that targets the HeyGen partner node
+        # matching the pack's primary node type. Submit via /prompt.
+        try:
+            import httpx  # type: ignore
+        except ImportError as e:
+            raise ProviderError("httpx not installed; pip install httpx") from e
+        advertised = self._object_info_heygen_nodes()
+        # Pick the first available node as the active one.
+        active_node = next(iter(set(advertised) & HEYGEN_PARTNER_NODE_TYPES), None)
+        if active_node is None:
+            raise ProviderDisabled("comfy_heygen_partner: no advertised partner node at submit moment")
+        prompt_body = {
+            "prompt": {
+                "1": {
+                    "class_type": active_node,
+                    "inputs": {
+                        "text": pack.get("approved_script", {}).get("full_text", ""),
+                        "voice_id": pack.get("voice", {}).get("voice_id", "default"),
+                        "aspect_ratio": (pack.get("aspect_ratios") or ["9:16"])[0],
+                    },
+                }
+            },
+            "client_id": idempotency_key,
+        }
+        with httpx.Client(timeout=60) as client:
+            resp = client.post(
+                f"{self._api_base.rstrip('/')}/prompt",
+                json=prompt_body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return SubmitResult(provider_job_id=data.get("prompt_id", ""))
 
     def status(self, *, provider_job_id: str) -> StatusResult:
         return StatusResult(state=JobState.UNKNOWN, raw={"provider_job_id": provider_job_id})
