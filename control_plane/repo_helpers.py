@@ -47,8 +47,18 @@ def append_runner_audit(
     job_id: str,
     event: str,
     context: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> None:
-    """Append one row to runner_audit. Best-effort; never raises."""
+    """Append one row to runner_audit. Best-effort; never raises.
+
+    Wave 1: optional `user_id` + `workspace_id` are accepted and
+    stored in `audit_log` (the cross-actor audit surface) so that
+    the operator can grep for actions by actor. The runner_audit
+    table itself stays job-scoped; we use audit_log for the actor
+    attribution so that auth events (which are not job-scoped)
+    can also be recorded.
+    """
     import time as _t
     import uuid as _u
     try:
@@ -65,5 +75,27 @@ def append_runner_audit(
                 _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
             ),
         )
+        # Mirror to audit_log with actor attribution. This is the
+        # cross-actor audit surface (W1 brief §3.1) and is also
+        # used by auth.audit_log for non-job events.
+        if user_id is not None or workspace_id is not None:
+            try:
+                conn.execute(
+                    "INSERT INTO audit_log(audit_id, event, context_json, "
+                    "user_id, workspace_id, created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        f"audlog_{_u.uuid4().hex[:12]}",
+                        event,
+                        json.dumps(context or {}),
+                        user_id,
+                        workspace_id,
+                        _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+                    ),
+                )
+            except Exception:
+                # audit_log might not have the columns if migrations
+                # 003/004 were skipped; never let this propagate.
+                pass
     except Exception:
         pass

@@ -406,6 +406,27 @@ def create_app(*, repo: Optional[Repo] = None,
     )
     app.include_router(_heygen_router)
 
+    # ── auth (Wave 1) ────────────────────────────────────────
+
+    from api.auth import build_router as _build_auth_router
+    _auth_router = _build_auth_router(repo)
+    app.include_router(_auth_router)
+
+    # Set-Cookie middleware: the auth router stashes the cookie
+    # value on request.state and the middleware writes it on the
+    # way out. This keeps the route signatures clean.
+    @app.middleware("http")
+    async def _emit_session_cookie(request, call_next):
+        response = await call_next(request)
+        cookie = getattr(request.state, "_vf_session_cookie", None)
+        if cookie:
+            response.headers["Set-Cookie"] = cookie
+        return response
+
+    # Expose repo + runner on app.state for auth.dependencies to read.
+    app.state.repo = repo
+    app.state.runner = runner
+
     return app
 
 

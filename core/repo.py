@@ -197,6 +197,11 @@ class Repo:
     def _bootstrap_schema(self):
         c = self._conn()
         c.executescript(SCHEMA)
+        # Wave 1: apply auth migrations idempotently.
+        from core.migrations import apply_migrations
+        apply_migrations(c)
+        # Extend audit_log with user_id + workspace_id if absent.
+        self._extend_audit_log_columns()
         for name in ("heygen", "comfy_cloud", "comfy_gpu_worker", "n8n", "publer"):
             c.execute(
                 "INSERT OR IGNORE INTO integrations(name, enabled, mode, detail, updated_at) VALUES (?,?,?,?,?)",
@@ -206,6 +211,21 @@ class Repo:
         from control_plane.repo_helpers import RUNNER_AUDIT_SCHEMA, bootstrap_runner_audit
         c.executescript(RUNNER_AUDIT_SCHEMA)
         bootstrap_runner_audit(self)
+
+    def _extend_audit_log_columns(self) -> None:
+        """Ensure audit_log has user_id + workspace_id columns (migration 004).
+
+        SQLite has no IF NOT EXISTS for ADD COLUMN prior to 3.35, so we
+        check via PRAGMA table_info and add missing columns manually.
+        Idempotent.
+        """
+        c = self._conn()
+        cols = {row[1] for row in c.execute("PRAGMA table_info(audit_log)").fetchall()}
+        if "user_id" not in cols:
+            c.execute("ALTER TABLE audit_log ADD COLUMN user_id TEXT")
+        if "workspace_id" not in cols:
+            c.execute("ALTER TABLE audit_log ADD COLUMN workspace_id TEXT")
+        c.commit()
 
     def close(self) -> None:
         c = getattr(self._local, "conn", None)
@@ -758,3 +778,324 @@ class Repo:
                 f"Likely cause: VIDEO_FACTORY_SECRET_KEY changed since the secret was written. "
                 f"Operator must re-enter the secret."
             ) from e
+
+    # ── Auth: users ───────────────────────────────────────────
+    # All methods here are added by Wave 1 (auth foundations).
+    # They live on Repo so the DB lock and per-thread connection
+    # handling stay centralized.
+
+    def create_user(self, *, email: str, password_hash: str) -> dict:
+        user_id = new_id("usr")
+        t = now_iso()
+        try:
+            with self.tx() as c:
+                c.execute(
+                    "INSERT INTO users(user_id, email, password_hash, status, "
+                    "email_verified, created_at) VALUES (?,?,?,?,?,?)",
+                    (user_id, email.lower(), password_hash, "active", 0, t),
+                )
+        except Exception as e:
+            if "UNIQUE constraint failed" in str(e):
+                raise ValueError(f"email {email!r} already exists") from e
+            raise
+        return self.get_user(user_id)
+
+    def get_user_by_email(self, email: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT user_id, email, password_hash, status, email_verified, "
+            "created_at, last_login_at FROM users WHERE email=?",
+            (email.lower(),),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "user_id": row[0],
+            "email": row[1],
+            "password_hash": row[2],
+            "status": row[3],
+            "email_verified": bool(row[4]),
+            "created_at": row[5],
+            "last_login_at": row[6],
+        }
+
+    def get_user(self, user_id: str) -> dict:
+        row = self._conn().execute(
+            "SELECT user_id, email, password_hash, status, email_verified, "
+            "created_at, last_login_at FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise NotFound(f"user {user_id} not found")
+        return {
+            "user_id": row[0],
+            "email": row[1],
+            "password_hash": row[2],
+            "status": row[3],
+            "email_verified": bool(row[4]),
+            "created_at": row[5],
+            "last_login_at": row[6],
+        }
+
+    def update_user_last_login(self, user_id: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE users SET last_login_at=? WHERE user_id=?",
+                (now_iso(), user_id),
+            )
+
+    def update_user_status(self, user_id: str, *, status: str) -> None:
+        if status not in ("active", "locked", "pending"):
+            raise ValueError(f"invalid user status: {status!r}")
+        with self.tx() as c:
+            c.execute(
+                "UPDATE users SET status=? WHERE user_id=?",
+                (status, user_id),
+            )
+
+    def mark_user_email_verified(self, user_id: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE users SET email_verified=1 WHERE user_id=?",
+                (user_id,),
+            )
+
+    # ── Auth: workspaces ──────────────────────────────────────
+
+    def create_workspace(self, *, slug: str, name: str, owner_user_id: str,
+                           plan: str = "free") -> dict:
+        workspace_id = new_id("wks")
+        t = now_iso()
+        if plan not in ("free", "pro", "enterprise"):
+            raise ValueError(f"invalid plan: {plan!r}")
+        try:
+            with self.tx() as c:
+                c.execute(
+                    "INSERT INTO workspaces(workspace_id, slug, name, "
+                    "owner_user_id, plan, status, live_enabled, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (workspace_id, slug.lower(), name, owner_user_id, plan,
+                     "active", 0, t),
+                )
+        except Exception as e:
+            if "UNIQUE constraint failed" in str(e) and "slug" in str(e):
+                raise ValueError(f"workspace slug {slug!r} already exists") from e
+            raise
+        return self.get_workspace(workspace_id)
+
+    def get_workspace(self, workspace_id: str) -> dict:
+        row = self._conn().execute(
+            "SELECT workspace_id, slug, name, owner_user_id, plan, status, "
+            "live_enabled, stripe_customer_id, stripe_subscription_id, "
+            "created_at FROM workspaces WHERE workspace_id=?",
+            (workspace_id,),
+        ).fetchone()
+        if not row:
+            raise NotFound(f"workspace {workspace_id} not found")
+        return self._row_workspace(row)
+
+    def get_workspace_by_slug(self, slug: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT workspace_id, slug, name, owner_user_id, plan, status, "
+            "live_enabled, stripe_customer_id, stripe_subscription_id, "
+            "created_at FROM workspaces WHERE slug=?",
+            (slug.lower(),),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_workspace(row)
+
+    def _row_workspace(self, row) -> dict:
+        return {
+            "workspace_id": row[0],
+            "slug": row[1],
+            "name": row[2],
+            "owner_user_id": row[3],
+            "plan": row[4],
+            "status": row[5],
+            "live_enabled": bool(row[6]),
+            "stripe_customer_id": row[7],
+            "stripe_subscription_id": row[8],
+            "created_at": row[9],
+        }
+
+    # ── Auth: memberships ─────────────────────────────────────
+
+    def add_membership(self, *, user_id: str, workspace_id: str,
+                         role: str) -> dict:
+        if role not in ("owner", "admin", "editor", "viewer"):
+            raise ValueError(f"invalid role: {role!r}")
+        # Verify both ends exist; cheaper than the FK error.
+        self.get_user(user_id)
+        self.get_workspace(workspace_id)
+        t = now_iso()
+        with self.tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO memberships(user_id, workspace_id, "
+                "role, created_at) VALUES (?,?,?,?)",
+                (user_id, workspace_id, role, t),
+            )
+        return {"user_id": user_id, "workspace_id": workspace_id,
+                "role": role, "created_at": t}
+
+    def list_memberships(self, user_id: str) -> list[dict]:
+        rows = self._conn().execute(
+            "SELECT user_id, workspace_id, role, created_at FROM memberships "
+            "WHERE user_id=?",
+            (user_id,),
+        ).fetchall()
+        return [
+            {"user_id": r[0], "workspace_id": r[1], "role": r[2],
+             "created_at": r[3]}
+            for r in rows
+        ]
+
+    # ── Auth: sessions ────────────────────────────────────────
+
+    def create_session(self, *, user_id: str, csrf_token: str,
+                        ip: Optional[str], user_agent: Optional[str],
+                        expires_at: str, session_id: Optional[str] = None) -> dict:
+        """Create a session row.
+
+        `session_id` is generated by the caller (using a
+        URL-safe token) and is what goes into the cookie. The
+        default `new_id("ses")` would be too short to be
+        unpredictable; callers MUST pass their own id. We allow
+        the default for tests only.
+        """
+        sid = session_id or new_id("ses")
+        t = now_iso()
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO sessions(session_id, user_id, csrf_token, ip, "
+                "user_agent, expires_at, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (sid, user_id, csrf_token, ip, user_agent,
+                 expires_at, t),
+            )
+        return {
+            "session_id": sid,
+            "user_id": user_id,
+            "csrf_token": csrf_token,
+            "ip": ip,
+            "user_agent": user_agent,
+            "expires_at": expires_at,
+            "created_at": t,
+        }
+
+    def get_session(self, session_id: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT session_id, user_id, csrf_token, ip, user_agent, "
+            "expires_at, created_at, last_seen_at FROM sessions "
+            "WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "session_id": row[0],
+            "user_id": row[1],
+            "csrf_token": row[2],
+            "ip": row[3],
+            "user_agent": row[4],
+            "expires_at": row[5],
+            "created_at": row[6],
+            "last_seen_at": row[7],
+        }
+
+    def delete_session(self, session_id: str) -> None:
+        with self.tx() as c:
+            c.execute("DELETE FROM sessions WHERE session_id=?",
+                      (session_id,))
+
+    def delete_sessions_for_user(self, user_id: str) -> int:
+        """Force-logout: remove every session for a user. Returns count."""
+        with self.tx() as c:
+            cur = c.execute(
+                "DELETE FROM sessions WHERE user_id=?", (user_id,),
+            )
+            return cur.rowcount
+
+    def gc_expired_sessions(self) -> int:
+        with self.tx() as c:
+            cur = c.execute(
+                "DELETE FROM sessions WHERE expires_at < ?", (now_iso(),),
+            )
+            return cur.rowcount
+
+    # ── Auth: email verifications / password resets ───────────
+
+    def create_email_verification(self, *, user_id: str, token: str,
+                                    expires_at: str) -> dict:
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO email_verifications(token, user_id, expires_at, "
+                "created_at) VALUES (?,?,?,?)",
+                (token, user_id, expires_at, now_iso()),
+            )
+        return {"token": token, "user_id": user_id, "expires_at": expires_at,
+                "consumed_at": None, "created_at": now_iso()}
+
+    def get_email_verification(self, token: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT token, user_id, expires_at, consumed_at, created_at "
+            "FROM email_verifications WHERE token=?",
+            (token,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"token": row[0], "user_id": row[1], "expires_at": row[2],
+                "consumed_at": row[3], "created_at": row[4]}
+
+    def consume_email_verification(self, token: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE email_verifications SET consumed_at=? WHERE token=?",
+                (now_iso(), token),
+            )
+
+    def create_password_reset(self, *, user_id: str, token: str,
+                                expires_at: str) -> dict:
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO password_resets(token, user_id, expires_at, "
+                "created_at) VALUES (?,?,?,?)",
+                (token, user_id, expires_at, now_iso()),
+            )
+        return {"token": token, "user_id": user_id, "expires_at": expires_at,
+                "consumed_at": None, "created_at": now_iso()}
+
+    def get_password_reset(self, token: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT token, user_id, expires_at, consumed_at, created_at "
+            "FROM password_resets WHERE token=?",
+            (token,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"token": row[0], "user_id": row[1], "expires_at": row[2],
+                "consumed_at": row[3], "created_at": row[4]}
+
+    def consume_password_reset(self, token: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE password_resets SET consumed_at=? WHERE token=?",
+                (now_iso(), token),
+            )
+
+    # ── Auth: aliases for the multi-tenant transition ─────────
+
+    def workspace_id_for_company(self, company_id: str) -> Optional[str]:
+        """Return the workspace_id for a company_id, if one exists.
+
+        Wave 2 will replace companies with workspaces outright; for
+        now this is a no-op lookup that returns None for legacy
+        companies that do not have a corresponding workspace. When
+        the migration in Wave 2 lands, we back-fill workspaces and
+        this method will then resolve.
+        """
+        row = self._conn().execute(
+            "SELECT workspace_id FROM workspaces WHERE owner_user_id IN "
+            "(SELECT user_id FROM users WHERE email=?)",
+            (f"legacy::{company_id}",),
+        ).fetchone()
+        return row[0] if row else None

@@ -150,12 +150,39 @@ class JobRunner:
         # backend persistence lives in Repo (job_stages + runner_audit).
         from control_plane.audit import InMemoryAuditLog
         self.audit = InMemoryAuditLog()
+        # Wave 1: actor attribution for runner_audit rows.
+        self._actor_user_id: Optional[str] = None
+        self._actor_workspace_id: Optional[str] = None
         # Durable idempotency: SQLite-backed so receipts survive restart.
         idem_db = self.storage_root / "idem.db"
         self._idem_store = DurableIdempotencyStore(str(idem_db))
         self._budget = BudgetEnforcer(
             max_cost_per_video_usd=budget_per_video_usd,
             max_cost_per_batch_usd=budget_per_batch_usd,
+        )
+
+    def set_actor(self, *, user_id: Optional[str] = None,
+                   workspace_id: Optional[str] = None) -> None:
+        """Stamp the runner with the current actor (per-request).
+
+        Authenticated endpoints call this before submit() so every
+        audit row written by the runner carries the actor. Pass
+        None to clear.
+        """
+        self._actor_user_id = user_id
+        self._actor_workspace_id = workspace_id
+
+    def audit_runner_event(self, *, event: str,
+                            context: Optional[dict] = None) -> None:
+        """Append a runner_audit row attributed to the current actor."""
+        from control_plane.repo_helpers import append_runner_audit
+        append_runner_audit(
+            self.repo,
+            job_id=context.get("job_id", "_system") if context else "_system",
+            event=event,
+            context=context,
+            user_id=self._actor_user_id,
+            workspace_id=self._actor_workspace_id,
         )
 
     def _idem_for(self, job_id: str) -> IdempotencyStore:
