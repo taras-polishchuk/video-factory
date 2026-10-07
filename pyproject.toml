@@ -32,6 +32,12 @@ dependencies = [
     # JWT verification helpers; we use them for every cryptographic
     # step instead of hand-rolling JWT/JWKS verification.
     "authlib>=1.3",
+    # stripe is the official Python SDK for the Stripe API.
+    # Wave 6a uses it for Checkout Session + Customer Portal
+    # session creation; Wave 6c will add webhook signature
+    # verification.  Pinned >=10 because earlier versions dropped
+    # Python 3.11 support.
+    "stripe>=10.0",
 ]
 
 [project.optional-dependencies]

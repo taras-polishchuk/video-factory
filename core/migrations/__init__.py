@@ -185,6 +185,16 @@ MIGRATIONS: List[Tuple[str, str, str]] = [
             ON oauth_identities(provider, provider_sub);
         """,
     ),
+    (
+        "008",
+        "workspaces.current_period_end INTEGER (Stripe subscription period end, unix)",
+        # Handled by _extend_workspaces_billing_columns() in
+        # core/repo.py: SQLite has no IF NOT EXISTS for ALTER TABLE
+        # ADD COLUMN prior to 3.35, so we run via a PRAGMA table_info
+        # check at bootstrap and apply the ALTER manually. The empty
+        # SQL here is intentional.
+        "SELECT 1;",
+    ),
 ]
 
 

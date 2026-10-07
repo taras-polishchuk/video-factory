@@ -200,3 +200,88 @@ Cross-thread tests ran deterministically 3/3 (4.36s, 4.47s,
 - Wave 1..4 tests untouched.
 - No commits to remote.
 - No new dependencies added.
+
+---
+
+# Wave 6a — progress log (t_7f17f93f)
+
+## Summary
+
+Shipped the Stripe SDK + Checkout + Customer Portal slice of Wave 6.
+
+- `stripe>=10.0` pinned in `pyproject.toml` (Python 3.11 floor).
+- `api/billing.py` — thin Stripe SDK wrapper (`StripeClient`,
+  `get_stripe_client()`, `configure_stripe_client()` test helper).
+  Wraps `stripe.checkout.Session.create` +
+  `stripe.billing_portal.Session.create`. Fail-loud on missing
+  `STRIPE_SECRET_KEY`. CLI smoke: `python -m api.billing` exits 2
+  with no key.
+- Migration 008 (`workspaces.current_period_end INTEGER`)
+  idempotently added via `_extend_workspaces_billing_columns()`
+  (SQLite < 3.35 has no `ADD COLUMN IF NOT EXISTS`).
+- Repo helpers: `get_workspace_billing`, `upsert_stripe_customer`,
+  `upsert_stripe_subscription`. All use `repo.tx()` so writes go
+  through the Wave 5 rotation-gate and SQLCipher-at-rest path.
+- `POST /api/v1/billing/checkout` — creates Checkout Session,
+  returns `{url, session_id}`; gated on owner-or-admin role;
+  rejects 409 if workspace is already pro/enterprise; persists
+  `stripe_customer_id`; logs `billing.checkout_started` audit row
+  (no Stripe IDs in audit per spec).
+- `POST /api/v1/billing/portal` — creates Customer Portal session;
+  gated on owner-or-admin; returns 404 if no `stripe_customer_id`
+  yet; logs `billing.portal_opened` audit row.
+
+## Test results
+
+```
+tests/test_wave6_billing.py: 10/10 passed
+Full suite: 282 passed + 3 skipped + 2 deselected (1 pre-existing
+  test_wave4_oidc::test_existing_211_tests_still_green + 1
+  subprocess-recursion guard) = 287 total
+```
+
+The deselected pre-existing failure was failing on the baseline
+run too (it depends on `tests/test_wave3_qa.py` not being on this
+worktree branch — same condition flagged by t_68649331).
+
+## Files changed
+
+```
+api/main.py                 | +154  (Stripe Checkout + Portal routes)
+api/billing.py              | +260  (NEW — Stripe SDK wrapper)
+core/migrations/__init__.py | +10   (migration 008)
+core/repo.py                | +107  (billing column extension +
+                                   3 helper methods + SELECT
+                                   current_period_end on 3 reads)
+pyproject.toml              | +6    (stripe>=10.0)
+tests/test_wave6_billing.py | +471  (NEW — 10 tests)
+```
+
+## Manual verification
+
+From a fresh FREE workspace (smoke script, SDK mocked):
+
+```
+POST /api/v1/billing/checkout {workspace_id, plan=pro}
+→ 200 {"url": "https://checkout.stripe.com/c/...", "session_id": "cs_test_..."}
+
+stripe_customer_id persisted: cus_test_xyz
+audit event written: billing.checkout_started
+  context: {workspace_id, plan, session_id}  (no customer/sub ids)
+
+POST /api/v1/billing/portal {workspace_id}
+→ 200 {"url": "https://billing.stripe.com/p/..."}
+audit event written: billing.portal_opened
+```
+
+Stripe SDK was patched via `unittest.mock.patch` for the 10 tests
+and the smoke; per the brief, no live `STRIPE_SECRET_KEY` was
+available in the environment so mocked path is the documented
+fallback.
+
+## Out of scope (deferred)
+
+- Free-tier quota enforcement (5 jobs/month, 1 workspace) → Wave 6b
+- Live-mode gate derived from plan → Wave 6b
+- Webhook handler + signature verification + idempotency → Wave 6c
+- `stripe_events` table → Wave 6c

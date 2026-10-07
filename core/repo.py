@@ -374,6 +374,10 @@ class Repo:
         apply_migrations(c)
         # Extend audit_log with user_id + workspace_id + actor if absent.
         self._extend_audit_log_columns()
+        # Wave 6a: ensure workspaces has the Stripe subscription
+        # period-end column. Idempotent — PRAGMA table_info check
+        # inside the helper skips ALTER if already present.
+        self._extend_workspaces_billing_columns()
         # Run the canonical schema again so anything that the
         # Wave-2 rename removed is recreated with workspace_id FKs.
         c.executescript(SCHEMA)
@@ -419,6 +423,28 @@ class Repo:
         if "actor" not in cols:
             c.execute("ALTER TABLE audit_log ADD COLUMN actor TEXT")
         c.commit()
+
+    def _extend_workspaces_billing_columns(self) -> None:
+        """Ensure workspaces has the Wave 6a billing columns.
+
+        SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+        before 3.35, so we check via `PRAGMA table_info` and ALTER
+        if missing.  Idempotent — safe to call on every bootstrap.
+
+        Adds:
+
+        - ``current_period_end INTEGER`` — unix timestamp of the
+          Stripe subscription's current period end. NULL means no
+          active subscription.
+        """
+        c = self._conn()
+        cols = {row[1].lower()
+                for row in c.execute("PRAGMA table_info(workspaces)").fetchall()}
+        if "current_period_end" not in cols:
+            c.execute(
+                "ALTER TABLE workspaces ADD COLUMN current_period_end INTEGER"
+            )
+            c.commit()
 
     def _apply_migration_005(self) -> None:
         """Idempotent Wave-2 migration: company_id -> workspace_id.
@@ -1029,7 +1055,8 @@ class Repo:
         row = self._conn().execute(
             "SELECT workspace_id, slug, name, description, plan, status, "
             "live_enabled, owner_user_id, stripe_customer_id, "
-            "stripe_subscription_id, created_at, updated_at "
+            "stripe_subscription_id, current_period_end, "
+            "created_at, updated_at "
             "FROM workspaces WHERE workspace_id=?",
             (workspace_id,),
         ).fetchone()
@@ -1041,7 +1068,8 @@ class Repo:
         row = self._conn().execute(
             "SELECT workspace_id, slug, name, description, plan, status, "
             "live_enabled, owner_user_id, stripe_customer_id, "
-            "stripe_subscription_id, created_at, updated_at "
+            "stripe_subscription_id, current_period_end, "
+            "created_at, updated_at "
             "FROM workspaces WHERE slug=?",
             (slug.lower(),),
         ).fetchone()
@@ -1053,7 +1081,8 @@ class Repo:
         rows = self._conn().execute(
             "SELECT workspace_id, slug, name, description, plan, status, "
             "live_enabled, owner_user_id, stripe_customer_id, "
-            "stripe_subscription_id, created_at, updated_at "
+            "stripe_subscription_id, current_period_end, "
+            "created_at, updated_at "
             "FROM workspaces ORDER BY created_at"
         ).fetchall()
         return [self._row_workspace_full(r) for r in rows]
@@ -1096,8 +1125,9 @@ class Repo:
             "owner_user_id": row[7],
             "stripe_customer_id": row[8],
             "stripe_subscription_id": row[9],
-            "created_at": row[10],
-            "updated_at": row[11],
+            "current_period_end": row[10],
+            "created_at": row[11],
+            "updated_at": row[12],
         }
 
     # Legacy alias: the old `_row_workspace` is still referenced by
@@ -1105,6 +1135,73 @@ class Repo:
     # that returns the same shape with the canonical workspace_id key.
     def _row_workspace(self, row) -> dict:
         return self._row_workspace_full(row)
+
+    # ── Wave 6a billing helpers ─────────────────────────────
+
+    def get_workspace_billing(self, workspace_id: str) -> dict:
+        """Return the Stripe billing state for a workspace.
+
+        Returns ``{}`` (NOT a NotFound) when no row matches — the
+        API layer uses this to decide whether to surface a
+        'no customer yet, click Upgrade' empty state.  Only the
+        three Stripe columns are returned; full workspace state is
+        available via ``get_workspace``.
+        """
+        row = self._conn().execute(
+            "SELECT stripe_customer_id, stripe_subscription_id, "
+            "current_period_end FROM workspaces WHERE workspace_id=?",
+            (workspace_id,),
+        ).fetchone()
+        if not row:
+            return {}
+        return {
+            "workspace_id": workspace_id,
+            "stripe_customer_id": row[0],
+            "stripe_subscription_id": row[1],
+            "current_period_end": row[2],
+        }
+
+    def upsert_stripe_customer(self, workspace_id: str,
+                                 customer_id: str) -> dict:
+        """Persist a Stripe customer id for a workspace.
+
+        Called immediately after the API creates the Customer
+        object (or after a successful Checkout Session whose
+        `customer` field was filled).  Returns the refreshed
+        workspace billing row.
+        """
+        if not customer_id:
+            raise ValueError("customer_id required")
+        with self.tx() as c:
+            existing = self.get_workspace(workspace_id)
+            c.execute(
+                "UPDATE workspaces SET stripe_customer_id=?, "
+                "updated_at=? WHERE workspace_id=?",
+                (customer_id, now_iso(), workspace_id),
+            )
+        _ = existing  # touched only to raise NotFound early on bad id
+        return self.get_workspace_billing(workspace_id)
+
+    def upsert_stripe_subscription(self, workspace_id: str,
+                                     subscription_id: str,
+                                     period_end: Optional[int]) -> dict:
+        """Persist a Stripe subscription id + current_period_end.
+
+        `period_end` is the unix timestamp from the Stripe
+        subscription object (``current_period_end`` field).  Stored
+        as INTEGER; NULL means no active subscription.
+        """
+        if not subscription_id:
+            raise ValueError("subscription_id required")
+        with self.tx() as c:
+            existing = self.get_workspace(workspace_id)
+            c.execute(
+                "UPDATE workspaces SET stripe_subscription_id=?, "
+                "current_period_end=?, updated_at=? WHERE workspace_id=?",
+                (subscription_id, period_end, now_iso(), workspace_id),
+            )
+        _ = existing
+        return self.get_workspace_billing(workspace_id)
 
     # ── Legacy compat: company_id <-> workspace_id aliases ─────
 

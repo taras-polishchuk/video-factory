@@ -335,6 +335,160 @@ def create_app(*, repo: Optional[Repo] = None,
         from auth.audit_log import list_for_workspace
         return list_for_workspace(repo, workspace_id=wid, limit=limit)
 
+    # ── Wave 6a: Stripe Checkout + Customer Portal ──────────
+    #
+    # Two endpoints that wrap the Stripe SDK (`api/billing.py`):
+    #
+    #   POST /api/v1/billing/checkout   -> create Checkout Session
+    #   POST /api/v1/billing/portal     -> create Customer Portal session
+    #
+    # Both endpoints require:
+    #
+    #   - an authenticated session (`get_current_user`),
+    #   - a valid CSRF token (`require_csrf`),
+    #   - owner-or-admin role in the workspace (`has_min_role`).
+    #
+    # Checkout is rejected if the workspace is already on a paid
+    # plan (no point sending the user to Stripe twice).  Portal
+    # is rejected with 404 if the workspace has no Stripe
+    # customer yet — there's literally no Stripe-side resource to
+    # portal into.
+    #
+    # The Stripe SDK is mocked in unit tests via
+    # `unittest.mock.patch('stripe.checkout.Session.create')`
+    # (and the portal sibling) — see tests/test_wave6_billing.py.
+
+    from api import billing as _billing
+    from auth.dependencies import (
+        AuthContext,
+        require_csrf,
+    )
+    from auth.roles import has_min_role
+
+    def _billing_base_url(request: Request) -> str:
+        """Return the operator-facing base URL for success/cancel
+        redirects.  Falls back to ``http://localhost`` in dev."""
+        return os.environ.get(
+            "VIDEO_FACTORY_PUBLIC_BASE_URL",
+            "http://localhost",
+        ).rstrip("/")
+
+    def _require_workspace_owner_or_admin(
+        ctx: AuthContext, workspace_id: str,
+    ) -> dict:
+        """Return the workspace row, or raise 403/404."""
+        m = repo.get_membership(ctx.user_id, workspace_id)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        if not has_min_role(m["role"], "admin"):
+            raise HTTPException(
+                403,
+                "billing endpoints require owner or admin role",
+            )
+        try:
+            return repo.get_workspace(workspace_id)
+        except Exception:
+            raise HTTPException(404, f"workspace {workspace_id} not found")
+
+    @app.post("/api/v1/billing/checkout")
+    async def billing_checkout(
+        request: Request,
+        payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        require_csrf(request,
+                      x_csrf_token=request.headers.get("X-CSRF-Token"))
+        workspace_id = (payload.get("workspace_id") or "").strip()
+        if not workspace_id:
+            raise HTTPException(400, "workspace_id required")
+        plan = (payload.get("plan") or "pro").strip()
+        ws = _require_workspace_owner_or_admin(ctx, workspace_id)
+        # Reject if already on a paid plan — no need to send the
+        # user to Stripe twice.  Wave 6b will route the user to
+        # the portal endpoint instead; for now we surface 409 so
+        # the UI can show "you're already pro".
+        if ws.get("plan") in ("pro", "enterprise"):
+            raise HTTPException(
+                409,
+                f"workspace already on plan={ws['plan']}; "
+                f"use the portal endpoint to manage billing",
+            )
+        # Persist a customer id if we don't have one yet, then
+        # pass it to the SDK so Stripe reuses the same customer
+        # across checkout + portal + future renewals.
+        existing_customer = (
+            repo.get_workspace_billing(workspace_id).get("stripe_customer_id")
+        )
+        client = _billing.get_stripe_client()
+        base = _billing_base_url(request)
+        result = client.create_checkout_session(
+            workspace_id=workspace_id,
+            plan=plan,
+            success_url=f"{base}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{base}/billing/cancel",
+            customer_id=existing_customer,
+        )
+        new_customer_id = result.get("customer_id") or existing_customer
+        if new_customer_id and new_customer_id != existing_customer:
+            repo.upsert_stripe_customer(workspace_id, new_customer_id)
+        # Audit without the Stripe IDs (per brief: no Stripe IDs
+        # in audit).  Record only workspace + user + plan + the
+        # returned Checkout Session id (cs_test_*) so the operator
+        # can correlate with Stripe-side logs.
+        repo.append_audit(
+            event="billing.checkout_started",
+            context={
+                "workspace_id": workspace_id,
+                "plan": plan,
+                "session_id": result.get("session_id"),
+            },
+            user_id=ctx.user_id,
+            workspace_id=workspace_id,
+            actor=ctx.email,
+        )
+        return {
+            "url": result.get("url"),
+            "session_id": result.get("session_id"),
+        }
+
+    @app.post("/api/v1/billing/portal")
+    async def billing_portal(
+        request: Request,
+        payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        require_csrf(request,
+                      x_csrf_token=request.headers.get("X-CSRF-Token"))
+        workspace_id = (payload.get("workspace_id") or "").strip()
+        if not workspace_id:
+            raise HTTPException(400, "workspace_id required")
+        _require_workspace_owner_or_admin(ctx, workspace_id)
+        billing_state = repo.get_workspace_billing(workspace_id)
+        customer_id = billing_state.get("stripe_customer_id")
+        if not customer_id:
+            raise HTTPException(
+                404,
+                "no Stripe customer for this workspace yet — "
+                "complete a Checkout first",
+            )
+        client = _billing.get_stripe_client()
+        base = _billing_base_url(request)
+        result = client.create_portal_session(
+            customer_id=customer_id,
+            return_url=f"{base}/billing",
+        )
+        repo.append_audit(
+            event="billing.portal_opened",
+            context={
+                "workspace_id": workspace_id,
+                "session_id": result.get("session_id"),
+            },
+            user_id=ctx.user_id,
+            workspace_id=workspace_id,
+            actor=ctx.email,
+        )
+        return {"url": result.get("url")}
+
     # ── Wave 5: master-key rotation (admin, owner only) ───────
     #
     # Two endpoints:
