@@ -1,26 +1,24 @@
 <script>
-  import { api } from '$lib/api.js';
-  import { onMount } from 'svelte';
-  import { page } from '$app/stores';
+  import { api } from '$lib/api-client.js';
 
-  let companies = $state([]);
-  let company = $derived(companies.find(c => c.company_id === localStorage.getItem("vf.company_id")) || companies[0]);
+  let { data } = $props();
+
+  // Active workspace comes from the layout's server-loaded data.
+  let company = $derived(data.activeWorkspace || null);
   let assets = $state([]);
   let uploading = $state(false);
   let err = $state('');
   let dragOver = $state(false);
 
   $effect(() => {
-    if (company) api.listAssets(company.company_id).then(a => assets = a);
+    if (company) api.listAssets(company.workspace_id).then(a => assets = a);
   });
-
-  onMount(async () => { companies = await api.listCompanies(); });
 
   async function doUpload(file) {
     if (!file || !company) return;
     uploading = true; err = '';
     try {
-      const a = await api.uploadAsset(company.company_id, 'asset', file);
+      const a = await api.uploadAsset(company.workspace_id, 'asset', file);
       assets = [a, ...assets];
     } catch (e) { err = e.message; }
     finally { uploading = false; }

@@ -1,20 +1,17 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api } from '$lib/api-client.js';
   import { onMount } from 'svelte';
 
+  let { data } = $props();
+
   let jobs = $state([]);
-  let companies = $state([]);
   let filter = $state({ company: '', state: '' });
   let loaded = $state(false);
 
   async function load() {
-    companies = await api.listCompanies();
-    if (companies.length && !filter.company) {
-      filter.company = companies[0].company_id;
-    }
-    jobs = filter.company
-      ? await api.listJobs(filter.company)
-      : await api.listJobs();
+    if (!data.activeWorkspace) return;
+    if (!filter.company) filter.company = data.activeWorkspace.workspace_id;
+    jobs = await api.listJobs(filter.company);
     loaded = true;
   }
   onMount(load);
@@ -51,8 +48,8 @@
   <div class="filter-cell">
     <span class="muted small">Company</span>
     <select bind:value={filter.company}>
-      <option value="">All companies</option>
-      {#each companies as c}<option value={c.company_id}>{c.name}</option>{/each}
+      <option value="">All workspaces</option>
+      {#each (data.workspaces || []) as c}<option value={c.workspace_id}>{c.name}</option>{/each}
     </select>
   </div>
   <div class="filter-cell">

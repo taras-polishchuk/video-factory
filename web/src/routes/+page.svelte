@@ -1,6 +1,8 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api } from '$lib/api-client.js';
   import { onMount } from 'svelte';
+
+  let { data } = $props();
 
   let stats = $state({ companies: 0, jobs: 0, running: 0, done: 0, failed: 0, integrations: 0 });
   let recent = $state([]);
@@ -8,12 +10,13 @@
   let loaded = $state(false);
 
   onMount(async () => {
-    const cs = await api.listCompanies();
-    const jobs = cs.length ? await api.listJobs(cs[0].company_id) : await api.listJobs();
+    if (!data.activeWorkspace) return;
+    const wid = data.activeWorkspace.workspace_id;
+    const jobs = await api.listJobs(wid);
     const ints = await api.integrations();
     integrations = ints;
     stats = {
-      companies: cs.length,
+      companies: (data.workspaces || []).length,
       jobs: jobs.length,
       running: jobs.filter(j => j.state === 'running' || j.state === 'queued').length,
       done: jobs.filter(j => j.state === 'done').length,

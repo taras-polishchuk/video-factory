@@ -1,5 +1,5 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api } from '$lib/api-client.js';
   import { onMount, onDestroy } from 'svelte';
   import { page } from '$app/stores';
 

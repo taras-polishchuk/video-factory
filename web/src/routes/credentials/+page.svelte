@@ -1,6 +1,8 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api } from '$lib/api-client.js';
   import { onMount } from 'svelte';
+
+  let { data } = $props();
 
   // Provider catalog. The set mirrors repo.CREDENTIAL_PROVIDERS on the
   // server side. Adding a new provider here must be paired with that
@@ -13,29 +15,22 @@
     { id: 'publer',                label: 'Publer (publishing)',      env: 'PUBLER_API_KEY' },
   ];
 
-  let company = $derived(null);
+  // Active workspace comes from the layout's server-loaded data.
+  // No client-side storage — the cookie identifies the user; the layout
+  // resolves the active workspace from the session.
+  let company = $derived(data.activeWorkspace || null);
   let items = $state([]);
   let editing = $state({});   // provider -> { value: '', saving: false, error: '' }
   let flash = $state({ kind: '', message: '' });
 
   onMount(async () => {
-    // The layout passes the active company down via localStorage +
-    // /api/v1/companies lookup. We re-resolve here for simplicity.
-    try {
-      const cs = await api.listCompanies();
-      const saved = typeof localStorage !== 'undefined' && localStorage.getItem('vf.company_id');
-      const found = saved && cs.find(c => c.company_id === saved);
-      company = (found || cs[0] || null);
-      if (company) await reload();
-    } catch (e) {
-      flash = { kind: 'error', message: e.message };
-    }
+    if (company) await reload();
   });
 
   async function reload() {
     if (!company) return;
     try {
-      items = await api.listCredentials(company.company_id);
+      items = await api.listCredentials(company.workspace_id);
     } catch (e) {
       flash = { kind: 'error', message: e.message };
     }
@@ -63,8 +58,7 @@
     }
     editing = { ...editing, [p]: { ...editing[p], saving: true, error: '' } };
     try {
-      const operator = (typeof localStorage !== 'undefined' && localStorage.getItem('vf.operator')) || 'operator';
-      await api.putCredential(company.company_id, p, v, operator);
+      await api.putCredential(company.workspace_id, p, v);
       cancelEditor(p);
       await reload();
       flash = { kind: 'ok', message: `${p} saved (fingerprint will update)` };
@@ -76,8 +70,7 @@
   async function deleteCredential(p) {
     if (!confirm(`Delete the saved credential for ${p}? This cannot be undone.`)) return;
     try {
-      const operator = (typeof localStorage !== 'undefined' && localStorage.getItem('vf.operator')) || 'operator';
-      await api.deleteCredential(company.company_id, p, operator);
+      await api.deleteCredential(company.workspace_id, p);
       await reload();
       flash = { kind: 'ok', message: `${p} deleted` };
     } catch (e) {

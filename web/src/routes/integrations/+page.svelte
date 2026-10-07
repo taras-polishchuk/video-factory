@@ -1,5 +1,5 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api } from '$lib/api-client.js';
   import { onMount } from 'svelte';
   let items = $state([]);
   onMount(() => api.integrations().then(set => items = set));

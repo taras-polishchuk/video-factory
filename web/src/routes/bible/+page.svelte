@@ -1,10 +1,11 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api } from '$lib/api-client.js';
   import { onMount } from 'svelte';
-  import { page } from '$app/stores';
 
-  let companies = $state([]);
-  let company = $derived(companies.find(c => c.company_id === localStorage.getItem("vf.company_id")) || companies[0]);
+  let { data } = $props();
+
+  // Active workspace comes from the layout's server-loaded data.
+  let company = $derived(data.activeWorkspace || null);
   let bibles = $state([]);
   let active = $state(null);
   let form = $state({
@@ -17,19 +18,12 @@
   let loaded = $state(false);
 
   async function load() {
-    companies = await api.listCompanies();
-    // Promote first id to idem fallback
-    if (companies.length && !localStorage.getItem("vf.company_id")) {
-      const id = companies[0].company_id;
-      localStorage.setItem('vf.company_id', id);
-      if (typeof localStorage !== 'undefined') localStorage.setItem('vf.company_id', id);
-    }
     loaded = true;
   }
 
   $effect(() => {
     if (company) {
-      api.listBibles(company.company_id).then(bs => {
+      api.listBibles(company.workspace_id).then(bs => {
         bibles = bs;
         active = bs[0] || null;
       });
@@ -58,7 +52,7 @@
         approved_script: form.approved_script,
         prohibited: form.prohibited.split('\n').map(s => s.trim()).filter(Boolean),
       };
-      const b = await api.createBible(company.company_id, payload);
+      const b = await api.createBible(company.workspace_id, payload);
       bibles = [b, ...bibles];
       active = b;
     } catch (e) { saveError = e.message; }

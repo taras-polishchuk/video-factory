@@ -1,11 +1,11 @@
 <script>
-  import { api } from '$lib/api.js';
-  import { onMount } from 'svelte';
+  import { api } from '$lib/api-client.js';
   import { goto } from '$app/navigation';
-  import { page } from '$app/stores';
 
-  let companies = $state([]);
-  let company = $derived(companies.find(c => c.company_id === localStorage.getItem("vf.company_id")) || companies[0]);
+  let { data } = $props();
+
+  // Active workspace comes from the layout's server-loaded data.
+  let company = $derived(data.activeWorkspace || null);
   let bibles = $state([]);
   let form = $state({
     topic: '', language: 'en-US', duration_seconds: 30,
@@ -17,13 +17,11 @@
   let submittingState = $state('idle'); // idle | submitting | queued | done
 
   $effect(() => {
-    if (company) api.listBibles(company.company_id).then(bs => {
+    if (company) api.listBibles(company.workspace_id).then(bs => {
       bibles = bs.filter(b => b.status === 'approved');
       if (bibles[0]) form.bible_id = bibles[0].bible_id;
     });
   });
-
-  onMount(async () => { companies = await api.listCompanies(); });
 
   async function submit() {
     if (!company || !form.bible_id) {
@@ -35,7 +33,7 @@
     submittingState = 'submitting';
     try {
       const j = await api.createJob({
-        company_id: company.company_id,
+        company_id: company.workspace_id,
         bible_id: form.bible_id,
         topic: form.topic,
         language: form.language,
