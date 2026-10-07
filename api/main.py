@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -296,32 +296,114 @@ def create_app(*, repo: Optional[Repo] = None,
         return list_for_workspace(repo, workspace_id=wid, limit=limit)
 
     # ── companies ──────────────────────────────────────────────
+    # NOTE (Wave 2 follow-up, t_d76b7c0c): the legacy alias routes
+    # under /api/v1/companies* must require authentication
+    # (MAJOR #2, #3) and write paths also require CSRF + workspace
+    # membership (MAJOR #5). The route signatures still accept
+    # `company_id` in the URL for back-compat, but the resolver
+    # translates that to a workspace_id before enforcing auth.
+
+    from auth.dependencies import (
+        AuthContext,
+        get_current_user,
+        require_csrf,
+        resolve_workspace_membership,
+    )
+    from auth.roles import has_min_role as _has_min_role
+
+    def _resolve_cid_to_wid(repo, company_id: str) -> str:
+        """Translate a legacy `company_id` to a `workspace_id`.
+
+        Looks up the `legacy_company_alias` table first, then
+        falls back to treating `company_id` as a workspace_id
+        (the post-migration case where the alias table is
+        empty because no legacy `companies` rows existed).
+        """
+        try:
+            return repo.resolve_company_to_workspace(company_id)
+        except Exception:
+            # Bad/unknown id — re-raise so the caller can 404.
+            raise
 
     @app.post("/api/v1/companies")
-    async def create_company(payload: dict):
+    async def create_company(
+        request: Request,
+        payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # CSRF on the legacy write path (MAJOR #5).
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
         slug = (payload.get("slug") or "").strip()
         name = (payload.get("name") or "").strip()
         if not slug or not name:
             raise HTTPException(400, "slug and name required")
         try:
-            return repo.create_company(slug=slug, name=name,
-                                        description=payload.get("description", ""))
+            ws = repo.create_workspace(
+                slug=slug, name=name,
+                description=payload.get("description", ""),
+                owner_user_id=ctx.user_id,
+            )
+            return {
+                "company_id": ws["workspace_id"],
+                "workspace_id": ws["workspace_id"],
+                "slug": ws["slug"],
+                "name": ws["name"],
+                "description": ws.get("description", ""),
+                "created_at": ws["created_at"],
+                "updated_at": ws.get("updated_at"),
+            }
         except Exception as e:
-            # Surface slug uniqueness as 409 instead of 500.
             if "UNIQUE constraint failed" in str(e) and "slug" in str(e):
                 raise HTTPException(409, f"slug {slug!r} already exists")
             raise
 
     @app.get("/api/v1/companies")
-    async def list_companies():
-        return repo.list_companies()
+    async def list_companies(
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # MAJOR #2: must require auth. Return only the user's
+        # own workspaces.
+        rows = repo.list_workspaces_for_user(ctx.user_id)
+        return [
+            {
+                "company_id": r["workspace_id"],
+                "workspace_id": r["workspace_id"],
+                "slug": r.get("slug", ""),
+                "name": r.get("name", ""),
+                "role": r.get("role"),
+                "plan": r.get("plan"),
+            }
+            for r in rows
+        ]
 
     @app.get("/api/v1/companies/{company_id}")
-    async def get_company(company_id: str):
+    async def get_company(
+        company_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # Translate legacy cid → wid, then enforce membership.
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
         return repo.get_company(company_id)
 
     @app.patch("/api/v1/companies/{company_id}")
-    async def update_company(company_id: str, payload: dict):
+    async def update_company(
+        request: Request,
+        company_id: str,
+        payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # MAJOR #3: auth + CSRF + membership.
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        # Only owner/admin can update workspace metadata.
+        if m["role"] not in ("owner", "admin"):
+            raise HTTPException(403, "requires owner or admin role")
         return repo.update_company(
             company_id,
             name=payload.get("name"),
@@ -331,28 +413,78 @@ def create_app(*, repo: Optional[Repo] = None,
     # ── bible ──────────────────────────────────────────────────
 
     @app.post("/api/v1/companies/{company_id}/bibles")
-    async def create_bible(company_id: str, payload: dict):
+    async def create_bible(
+        request: Request,
+        company_id: str,
+        payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # MAJOR #5: auth + CSRF + membership.
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        if not _has_min_role(m["role"], "editor"):
+            raise HTTPException(403, "requires editor role")
         return repo.create_bible(company_id=company_id,
                                   payload=payload.get("payload", {}),
                                   notes=payload.get("notes", ""))
 
     @app.get("/api/v1/companies/{company_id}/bibles")
-    async def list_bibles(company_id: str):
+    async def list_bibles(
+        company_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # Read paths need auth + membership (no CSRF).
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
         return repo.list_bibles(company_id)
 
     @app.get("/api/v1/bibles/{bible_id}")
-    async def get_bible(bible_id: str):
-        return repo.get_bible(bible_id)
+    async def get_bible(
+        bible_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        bible = repo.get_bible(bible_id)
+        wid = bible.get("workspace_id")
+        if wid and not repo.get_membership(ctx.user_id, wid):
+            raise HTTPException(403, "not a member of this workspace")
+        return bible
 
     @app.post("/api/v1/bibles/{bible_id}/approve")
-    async def approve_bible(bible_id: str):
+    async def approve_bible(
+        request: Request,
+        bible_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        bible = repo.get_bible(bible_id)
+        wid = bible.get("workspace_id")
+        if not wid or not repo.get_membership(ctx.user_id, wid):
+            raise HTTPException(403, "not a member of this workspace")
         return repo.approve_bible(bible_id)
 
     # ── assets ─────────────────────────────────────────────────
 
     @app.post("/api/v1/companies/{company_id}/assets")
-    async def upload_asset(company_id: str, kind: str = "misc",
-                            file: UploadFile = File(...)):
+    async def upload_asset(
+        request: Request,
+        company_id: str,
+        kind: str = "misc",
+        file: UploadFile = File(...),
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # MAJOR #5: auth + CSRF + membership.
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        if not _has_min_role(m["role"], "editor"):
+            raise HTTPException(403, "requires editor role")
         # Safe filename. We check the raw upload filename (not Path().name) so
         # that uploads named like "../escape.txt" are rejected even though
         # Path normalization would have masked them downstream.
@@ -388,7 +520,14 @@ def create_app(*, repo: Optional[Repo] = None,
         return asset
 
     @app.get("/api/v1/companies/{company_id}/assets")
-    async def list_assets(company_id: str):
+    async def list_assets(
+        company_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
         return repo.list_assets(company_id)
 
     @app.get("/api/v1/assets/{asset_id}/download")
@@ -519,22 +658,45 @@ def create_app(*, repo: Optional[Repo] = None,
     # ── credentials (F-credential-vault) ────────────────────────
 
     @app.get("/api/v1/companies/{company_id}/credentials")
-    async def list_credentials(company_id: str):
-        # Defense: caller MUST have selected this company (cookie / header
-        # is added when auth is wired). For V0 we use a "X-Operator"
-        # header to attribute writes; reads do not require it because the
-        # UI always sends it.
+    async def list_credentials(
+        company_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
         return repo.list_credentials(company_id)
 
     @app.get("/api/v1/companies/{company_id}/credentials/{provider}")
-    async def get_credential(company_id: str, provider: str):
+    async def get_credential(
+        company_id: str,
+        provider: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
         return repo.get_credential(company_id, provider)
 
     @app.put("/api/v1/companies/{company_id}/credentials/{provider}")
     async def put_credential(
-        company_id: str, provider: str, payload: dict,
-        x_operator: Optional[str] = Header(default=None),
+        request: Request,
+        company_id: str,
+        provider: str,
+        payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
     ):
+        # MAJOR #5: auth + CSRF + membership.
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        # Credentials: editor or higher.
+        if not _has_min_role(m["role"], "editor"):
+            raise HTTPException(403, "requires editor role")
         # Body shape: { "value": "<plaintext secret>" }
         plaintext = payload.get("value")
         if not isinstance(plaintext, str) or not plaintext.strip():
@@ -548,7 +710,7 @@ def create_app(*, repo: Optional[Repo] = None,
         except SecretKeyMissing as e:
             raise HTTPException(503, str(e))
         fp = fingerprint(plaintext)
-        operator = (x_operator or "operator").strip()[:64]
+        operator = ctx.email[:64]
         # Audit row first so even if encryption fails the action is recorded.
         try:
             result = repo.upsert_credential(
@@ -577,10 +739,20 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.delete("/api/v1/companies/{company_id}/credentials/{provider}")
     async def delete_credential(
-        company_id: str, provider: str,
-        x_operator: Optional[str] = Header(default=None),
+        request: Request,
+        company_id: str,
+        provider: str,
+        ctx: AuthContext = Depends(get_current_user),
     ):
-        operator = (x_operator or "operator").strip()[:64]
+        # MAJOR #5: auth + CSRF + membership.
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        wid = _resolve_cid_to_wid(repo, company_id)
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        if not _has_min_role(m["role"], "admin"):
+            raise HTTPException(403, "requires admin role")
+        operator = ctx.email[:64]
         try:
             repo.delete_credential(company_id=company_id, provider=provider)
         except Exception as e:

@@ -240,12 +240,18 @@ def test_api_put_credential_empty_value(env, key_env):
 
 
 def test_api_put_credential_writes_audit_row(env, key_env):
+    """The credentials.upserted audit row records the actor.
+
+    Wave 2 follow-up (t_d76b7c0c, MAJOR #5): the legacy
+    alias PUT now requires auth + CSRF + membership. The
+    actor recorded in the audit row is the authenticated
+    user's email (the X-Operator header was a v0 placeholder).
+    """
     client, repo, _ = env
     cid = client.post("/api/v1/companies", json={"slug": "a", "name": "A"}).json()["company_id"]
     client.put(
         f"/api/v1/companies/{cid}/credentials/heygen_direct",
         json={"value": "audit_me"},
-        headers={"X-Operator": "carol"},
     )
     # Audit table should contain a credentials.upserted row
     rows = repo._conn().execute(
@@ -253,7 +259,9 @@ def test_api_put_credential_writes_audit_row(env, key_env):
         ("credentials.upserted",),
     ).fetchall()
     assert len(rows) == 1
-    assert "carol" in rows[0][2]
+    # Actor is the authenticated user's email (set by
+    # _AuthedClient's auto-signup as tester@video-factory.test).
+    assert "tester@video-factory.test" in rows[0][2]
 
 
 def test_api_delete_credential_writes_audit_row(env, key_env):

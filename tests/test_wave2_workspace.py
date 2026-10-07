@@ -343,11 +343,27 @@ def test_legacy_company_endpoint_alias_still_works(tmp_path):
     """The legacy /api/v1/companies/{cid} endpoint keeps
     returning a body with a `company_id` field so the v0
     fixtures + UI keep working.
+
+    Per the Wave 2 follow-up (t_d76b7c0c, MAJOR #5), the
+    legacy alias write paths now require auth + CSRF. This
+    test was previously a black-box shape check that did
+    not exercise the auth gate; it must now sign up first
+    and send a valid CSRF token to be semantically
+    equivalent to the old call.
     """
     client, _repo, _ = _make_app(tmp_path)
+    # Sign up a user (creates an initial workspace + session).
+    su = client.post("/auth/signup", json={
+        "email": "legacytester@video-factory.test",
+        "password": "Password12345!",
+        "workspace_name": "Legacy Tester",
+    })
+    assert su.status_code == 200, su.text
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
     r = client.post("/api/v1/companies",
-                     json={"slug": "leg", "name": "Leg"})
-    assert r.status_code == 200
+                    json={"slug": "leg", "name": "Leg"},
+                    headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200, r.text
     cid = r.json()["company_id"]
     g = client.get(f"/api/v1/companies/{cid}")
     assert g.status_code == 200
@@ -695,17 +711,30 @@ def test_existing_94_tests_still_green(tmp_path):
     (health, company CRUD, bible, job submit).  The full
     140-test suite is the real check — pytest itself runs it
     and fails the build if any regress.
+
+    Wave 2 follow-up (t_d76b7c0c, MAJOR #5): legacy alias
+    write paths now require auth + CSRF. Sign up a user
+    and use the CSRF token on writes.
     """
     client, _repo, _ = _make_app(tmp_path)
+    su = client.post("/auth/signup", json={
+        "email": "regression@video-factory.test",
+        "password": "Password12345!",
+        "workspace_name": "Regression Co",
+    })
+    assert su.status_code == 200, su.text
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
     h = client.get("/health")
     assert h.status_code == 200
     r = client.post("/api/v1/companies",
-                     json={"slug": "s", "name": "S"})
-    assert r.status_code == 200
+                     json={"slug": "s", "name": "S"},
+                     headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200, r.text
     cid = r.json()["company_id"]
     b = client.post(f"/api/v1/companies/{cid}/bibles",
-                      json={"payload": {"name": "B"}})
-    assert b.status_code == 200
+                      json={"payload": {"name": "B"}},
+                      headers={"X-CSRF-Token": csrf})
+    assert b.status_code == 200, b.text
     # (No full job run here — it would require a runner. We
     # only assert the wire format is intact.)
 

@@ -89,6 +89,13 @@ def _session_active_workspace(repo, request: Request,
     Reads `sessions.active_workspace_id` (added in Wave 2).  If
     the column is missing or NULL, falls back to the user's
     oldest membership.
+
+    Defense-in-depth (Wave 2 follow-up, t_d76b7c0c, MAJOR #4):
+    after reading `sessions.active_workspace_id`, verify the
+    user is actually a member of that workspace. If not, the
+    session column was tampered with (or a stale binding
+    outlived a removed membership) — return None so the
+    resolver falls back to `list_workspaces_for_user`.
     """
     from auth.session import SESSION_COOKIE_NAME
     sid = request.cookies.get(SESSION_COOKIE_NAME)
@@ -109,8 +116,12 @@ def _session_active_workspace(repo, request: Request,
     ).fetchone()
     if not row or not row[0]:
         return None
+    wid = row[0]
+    # Re-verify membership before trusting the session column.
+    if not repo.get_membership(user_id, wid):
+        return None
     try:
-        return repo.get_workspace(row[0])
+        return repo.get_workspace(wid)
     except Exception:
         return None
 

@@ -250,19 +250,32 @@ class Repo:
 
     def _bootstrap_schema(self):
         c = self._conn()
-        # Apply the canonical schema (workspace_id).  This will
-        # create `workspaces` + everything tenant-scoped fresh, AND
-        # be a no-op for any pre-existing tables that already match.
+        # ── Wave 2 BLOCKER fix (t_d76b7c0c) ──
+        # The order of operations matters when the DB already
+        # has the legacy schema (a real prod DB carries
+        # `company_id` columns + a `companies` table from before
+        # Wave 2). The previous order ran SCHEMA's
+        # `CREATE INDEX ... ON workspace_id` BEFORE the
+        # company_id -> workspace_id rename, raising
+        # "no such column: workspace_id".
+        #
+        # The correct order is:
+        #   1. Apply the rename (005) so legacy columns
+        #      are now `workspace_id`.
+        #   2. Run SCHEMA so the indexes that reference
+        #      `workspace_id` find the column.
+        #   3. Apply remaining migrations (idempotent).
+        #   4. Extend audit_log.
+        #   5. Run SCHEMA once more (rebuilds indexes after
+        #      005's table-rebuild drops and recreates).
+        self._apply_migration_005()
         c.executescript(SCHEMA)
         # Wave 1: apply auth migrations idempotently.
         from core.migrations import apply_migrations
         apply_migrations(c)
         # Extend audit_log with user_id + workspace_id + actor if absent.
         self._extend_audit_log_columns()
-        # Wave 2: rename company_id -> workspace_id on legacy tables,
-        # backfill from companies -> workspaces, drop companies.
-        self._apply_migration_005()
-        # Run the canonical migration again so anything that the
+        # Run the canonical schema again so anything that the
         # Wave-2 rename removed is recreated with workspace_id FKs.
         c.executescript(SCHEMA)
         for name in ("heygen", "comfy_cloud", "comfy_gpu_worker", "n8n", "publer"):
@@ -327,7 +340,108 @@ class Repo:
            mapping is captured).
         """
         c = self._conn()
-        # 1. ensure the alias table exists.
+        # 0b. Idempotent: ensure legacy `workspaces` table has
+        # the columns the migration needs to insert into.
+        # Pre-Wave-2 workspaces tables may lack `description`
+        # and/or `updated_at`. The migration's INSERT statement
+        # references them. (Wave 2 BLOCKER fix — t_d76b7c0c.)
+        if self._table_exists("workspaces"):
+            ws_cols = self._table_columns("workspaces")
+            if "description" not in ws_cols:
+                c.execute("ALTER TABLE workspaces "
+                          "ADD COLUMN description TEXT")
+            if "updated_at" not in ws_cols:
+                c.execute("ALTER TABLE workspaces "
+                          "ADD COLUMN updated_at TEXT")
+        # 0c. Idempotent: ensure legacy `workspaces.owner_user_id`
+        # is nullable. Pre-Wave-2 `workspaces` declared it NOT
+        # NULL; the migration creates stub workspaces from
+        # `companies` rows that have no associated user. The
+        # new SCHEMA declares it nullable, so we relax the
+        # constraint here for legacy DBs. (Wave 2 BLOCKER fix.)
+        if self._table_exists("workspaces"):
+            ws_cols_info = c.execute(
+                "PRAGMA table_info(workspaces)"
+            ).fetchall()
+            owner_notnull = any(
+                r[1] == "owner_user_id" and r[3] == 1
+                for r in ws_cols_info
+            )
+            if owner_notnull:
+                # Standard table-rebuild pattern to relax NOT NULL.
+                rows = c.execute("SELECT * FROM workspaces").fetchall()
+                old_cols = [r[1] for r in ws_cols_info]
+                c.execute("ALTER TABLE workspaces "
+                          "RENAME TO workspaces__legacy")
+                c.execute(
+                    "CREATE TABLE workspaces ("
+                    "workspace_id TEXT PRIMARY KEY, "
+                    "slug TEXT UNIQUE NOT NULL, "
+                    "name TEXT NOT NULL, "
+                    "description TEXT, "
+                    "plan TEXT NOT NULL DEFAULT 'free' "
+                    "    CHECK (plan IN ('free', 'pro', 'enterprise')), "
+                    "status TEXT NOT NULL DEFAULT 'active' "
+                    "    CHECK (status IN ('active', 'suspended', "
+                    "                    'disabled', 'deleted')), "
+                    "live_enabled INTEGER NOT NULL DEFAULT 0, "
+                    "stripe_customer_id TEXT, "
+                    "stripe_subscription_id TEXT, "
+                    "owner_user_id TEXT, "
+                    "created_at TEXT NOT NULL, "
+                    "updated_at TEXT, "
+                    "FOREIGN KEY (owner_user_id) REFERENCES users(user_id))"
+                )
+                new_cols = [r[1] for r in c.execute(
+                    "PRAGMA table_info(workspaces)"
+                ).fetchall()]
+                placeholders = ",".join("?" for _ in new_cols)
+                insert_sql = (
+                    f"INSERT INTO workspaces "
+                    f"({','.join(new_cols)}) VALUES ({placeholders})"
+                )
+                new_idx = {c: i for i, c in enumerate(new_cols)}
+                legacy_idx = {c: i for i, c in enumerate(old_cols)}
+                for r in rows:
+                    new_row = [None] * len(new_cols)
+                    for col, idx in legacy_idx.items():
+                        if col in new_idx:
+                            new_row[new_idx[col]] = r[idx]
+                    c.execute(insert_sql, tuple(new_row))
+                c.execute("DROP TABLE workspaces__legacy")
+        # 0d. Idempotent: ensure a system user exists for stub
+        # workspaces migrated from `companies`. The new SCHEMA
+        # declares `owner_user_id` nullable, so we no longer
+        # need a non-null owner — but to keep audit trails
+        # useful we still create the system user.
+        sys_uid = new_id("usr")
+        try:
+            c.execute(
+                "INSERT INTO users(user_id, email, password_hash, "
+                "status, email_verified, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (sys_uid, "system@video-factory.internal",
+                 "!system-no-login", "active", 1, now_iso()),
+            )
+        except Exception:
+            # Already exists — fine.
+            pass
+        # 0e. Idempotent: ensure every legacy tenant-scoped table
+        # has a `workspace_id` column (added with default NULL).
+        # Step 2 below updates these to point at the new
+        # workspace rows; if the column doesn't exist yet the
+        # UPDATE silently fails inside its try/except. (Wave 2
+        # BLOCKER fix — t_d76b7c0c.)
+        for tbl in ("bible_versions", "assets", "jobs",
+                    "publish_intents", "credentials"):
+            if not self._table_exists(tbl):
+                continue
+            cols = self._table_columns(tbl)
+            if "workspace_id" not in cols and "company_id" in cols:
+                c.execute(
+                    f"ALTER TABLE {tbl} ADD COLUMN workspace_id TEXT"
+                )
+        # 0. ensure the alias table exists.
         c.execute(
             "CREATE TABLE IF NOT EXISTS legacy_company_alias ("
             "  legacy_company_id TEXT PRIMARY KEY,"
@@ -335,6 +449,55 @@ class Repo:
             "  created_at TEXT NOT NULL"
             ")"
         )
+        # 0a. Idempotent on legacy `login_attempts` tables that
+        # still have a `created_at` column (vault mission era).
+        # Migration 002 references `attempted_at`; rename the
+        # legacy column here so the SCHEMA + migration 002
+        # indexes succeed on a real prod DB. (Wave 2 BLOCKER
+        # fix — t_d76b7c0c.)
+        if self._table_exists("login_attempts"):
+            la_cols = self._table_columns("login_attempts")
+            if "created_at" in la_cols and "attempted_at" not in la_cols:
+                # Use the standard SQLite table-rebuild pattern
+                # to rename the column (SQLite < 3.35 has no
+                # RENAME COLUMN).
+                rows = c.execute("SELECT * FROM login_attempts").fetchall()
+                old_cols = [r[1] for r in c.execute(
+                    "PRAGMA table_info(login_attempts)"
+                ).fetchall()]
+                c.execute("ALTER TABLE login_attempts "
+                          "RENAME TO login_attempts__legacy")
+                c.execute(
+                    "CREATE TABLE login_attempts ("
+                    "attempt_id TEXT PRIMARY KEY, "
+                    "ip TEXT NOT NULL, "
+                    "email TEXT NOT NULL, "
+                    "succeeded INTEGER NOT NULL DEFAULT 0, "
+                    "attempted_at TEXT NOT NULL)"
+                )
+                new_cols = [r[1] for r in c.execute(
+                    "PRAGMA table_info(login_attempts)"
+                ).fetchall()]
+                placeholders = ",".join("?" for _ in new_cols)
+                insert_sql = (
+                    f"INSERT INTO login_attempts "
+                    f"({','.join(new_cols)}) VALUES ({placeholders})"
+                )
+                col_map = [
+                    "attempted_at" if col == "created_at" else col
+                    for col in old_cols
+                ]
+                new_idx = {c: i for i, c in enumerate(new_cols)}
+                legacy_idx = {c: i for i, c in enumerate(old_cols)}
+                for r in rows:
+                    new_row = [None] * len(new_cols)
+                    for col, idx in legacy_idx.items():
+                        target = col_map[idx]
+                        if target in new_idx:
+                            new_row[new_idx[target]] = r[idx]
+                    c.execute(insert_sql, tuple(new_row))
+                c.execute("DROP TABLE login_attempts__legacy")
+        # 1. (alias table already created above.)
         # 2. If companies exists, migrate each row -> workspace, store alias.
         if self._table_exists("companies"):
             cols = self._table_columns("companies")
@@ -399,6 +562,15 @@ class Repo:
                                 pass
         # 3. Drop `company_id` from each legacy table if present,
         #    ensure `workspace_id` is present.
+        # Disable foreign-key checks during the rebuild:
+        # after `ALTER TABLE x RENAME TO x__legacy`, any FK from
+        # another table that points at `x` now points at
+        # `x__legacy`. The new `x` table is created with fresh
+        # FKs but the other tables' FKs still bind to the
+        # legacy name. The DROP at the end of each iteration
+        # would fail on that. We disable FKs, do all the
+        # rebuilds, then re-enable + verify.
+        c.execute("PRAGMA foreign_keys=OFF")
         for tbl in ("bible_versions", "assets", "jobs",
                     "publish_intents", "credentials"):
             if not self._table_exists(tbl):
@@ -518,6 +690,13 @@ class Repo:
         # 4. Drop `companies` table at the end.
         if self._table_exists("companies"):
             c.execute("DROP TABLE companies")
+        # Re-enable foreign-key checks and verify integrity.
+        c.execute("PRAGMA foreign_keys=ON")
+        try:
+            c.execute("PRAGMA foreign_key_check")
+        except Exception as e:
+            import sys
+            print(f"005: foreign_key_check failed: {e}", file=sys.stderr)
         c.commit()
 
     def close(self) -> None:

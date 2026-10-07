@@ -13,6 +13,91 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+class _AuthedClient:
+    """A TestClient that signs up a user on first use and
+    automatically attaches the X-CSRF-Token header to every
+    state-changing request (POST / PUT / PATCH / DELETE).
+
+    Wave 2 follow-up (t_d76b7c0c): the legacy alias write
+    paths now require auth + CSRF + membership. Existing
+    tests in this file predate the fix; this wrapper
+    preserves their wire-level expectations (200 on POST,
+    no headers in the call site) while exercising the new
+    auth path.
+    """
+
+    _STATEFUL = ("post", "put", "patch", "delete")
+
+    def __init__(self, raw: TestClient):
+        self._raw = raw
+        self._csrf = None
+        self._signed_up = False
+
+    def _ensure_signed_up(self) -> None:
+        if self._signed_up:
+            return
+        r = self._raw.post(
+            "/auth/signup",
+            json={
+                "email": "tester@video-factory.test",
+                "password": "TestPass-1234!",
+                "workspace_name": "Test Co",
+            },
+        )
+        assert r.status_code == 200, (
+            f"authed_client: signup failed {r.status_code}: {r.text}"
+        )
+        self._signed_up = True
+
+    def _ensure_csrf(self) -> str:
+        if not self._csrf:
+            self._ensure_signed_up()
+            r = self._raw.get("/auth/csrf")
+            assert r.status_code == 200, (
+                f"authed_client: csrf fetch failed {r.status_code}: {r.text}"
+            )
+            self._csrf = r.json()["csrf_token"]
+        return self._csrf
+
+    def request(self, method, url, **kwargs):
+        headers = dict(kwargs.pop("headers", {}) or {})
+        if method.lower() in self._STATEFUL:
+            headers.setdefault("X-CSRF-Token", self._ensure_csrf())
+        return self._raw.request(method, url, headers=headers, **kwargs)
+
+    def get(self, url, **kwargs):
+        return self._raw.get(url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url, **kwargs):
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self.request("DELETE", url, **kwargs)
+
+    @property
+    def cookies(self):
+        return self._raw.cookies
+
+    @property
+    def app(self):
+        return self._raw.app
+
+    @property
+    def raw(self):
+        """Underlying un-authed TestClient.
+
+        Used by tests that need to assert the auth gate (i.e.
+        explicitly want a request with NO session cookie).
+        """
+        return self._raw
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     db = tmp_path / "vf.db"
@@ -21,6 +106,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("VIDEO_FACTORY_STORAGE", str(storage))
     monkeypatch.setenv("MAX_COST_PER_VIDEO_USD", "5")
     monkeypatch.setenv("MAX_COST_PER_BATCH_USD", "20")
+    # Auth endpoints 503 without VIDEO_FACTORY_SESSION_SECRET.
+    monkeypatch.setenv("VIDEO_FACTORY_SESSION_SECRET", "x" * 64)
     # Force reimport so env vars take effect on create_app defaults.
     from api.main import create_app
     from core.repo import Repo
@@ -36,7 +123,9 @@ def env(tmp_path, monkeypatch):
     )
     Singleton.set(runner)
     app = create_app(repo=repo, runner=runner, storage_root=str(storage), schema={})
-    yield TestClient(app), repo, storage
+    # Yield an auto-authed client so legacy tests that did not
+    # sign up still get a session + CSRF on write paths.
+    yield _AuthedClient(TestClient(app)), repo, storage
 
 
 def _wait_done(client, job_id, timeout_s=60):

@@ -598,10 +598,23 @@ def test_session_secret_change_invalidates_existing_sessions(tmp_path, monkeypat
 
 def test_legacy_companies_alias_resolves(tmp_path):
     """POST /api/v1/companies + GET /api/v1/companies/{cid} still
-    work and the GET returns the original cid (alias preserved)."""
+    work and the GET returns the original cid (alias preserved).
+
+    Wave 2 follow-up (t_d76b7c0c, MAJOR #5): the legacy alias
+    write paths now require auth + CSRF. Sign up first and
+    send a valid CSRF token.
+    """
     client, _, _ = _make_app(tmp_path)
+    su = client.post("/auth/signup", json={
+        "email": "wave1-alias@video-factory.test",
+        "password": "Password12345!",
+        "workspace_name": "Wave 1 Alias",
+    })
+    assert su.status_code == 200, su.text
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
     r = client.post("/api/v1/companies",
-                     json={"slug": "legacy-1", "name": "Legacy 1"})
+                     json={"slug": "legacy-1", "name": "Legacy 1"},
+                     headers={"X-CSRF-Token": csrf})
     assert r.status_code == 200, r.text
     cid = r.json()["company_id"]
     g = client.get(f"/api/v1/companies/{cid}")
@@ -615,14 +628,27 @@ def test_legacy_companies_alias_resolves(tmp_path):
 def test_pre_existing_endpoints_still_green(tmp_path):
     """Smoke that the existing 94-test surface is not broken:
     /healthz, /readyz, and the basic company create + get still
-    work post-auth."""
+    work post-auth.
+
+    Wave 2 follow-up (t_d76b7c0c, MAJOR #5): the legacy
+    alias write paths now require auth + CSRF. Sign up
+    first and send a valid CSRF token.
+    """
     client, _, _ = _make_app(tmp_path)
+    su = client.post("/auth/signup", json={
+        "email": "wave1-regression@video-factory.test",
+        "password": "Password12345!",
+        "workspace_name": "Wave 1 Regression",
+    })
+    assert su.status_code == 200, su.text
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
     h = client.get("/health")
     assert h.status_code == 200
     # Companies
     r = client.post("/api/v1/companies",
-                     json={"slug": "smoke", "name": "Smoke"})
-    assert r.status_code == 200
+                     json={"slug": "smoke", "name": "Smoke"},
+                     headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200, r.text
     cid = r.json()["company_id"]
     g = client.get(f"/api/v1/companies/{cid}")
     assert g.status_code == 200
