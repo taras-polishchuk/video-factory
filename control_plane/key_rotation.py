@@ -460,8 +460,17 @@ def _rotate_locked(*, repo, old_key: str, new_key: str,
     #      cleared only AFTER the swap, and the swap is only
     #      after we've snapshotted row counts under the lock,
     #      the entire critical section is monotonic.
+    #
+    # Wave 5 follow-up-2 (t_282da1ca): step 1 only cleared the
+    # *rotating thread's* per-thread conn.  Every other thread
+    # that had called `repo._conn()` before the swap still held
+    # a stale OLD-key connection.  Bumping `repo._epoch` here
+    # is what makes those threads close-and-reopen on their
+    # next `_conn()` access.  See the epoch docstring in
+    # `core.repo.Repo.__init__` for the full rationale.
     repo.db_key = new_key  # noqa: SLF001 — rotate owns the key flip
-    repo.close()  # noqa: SLF001 — drop stale per-thread conn
+    repo._epoch += 1  # noqa: SLF001 — invalidate every thread's stale conn
+    repo.close()  # noqa: SLF001 — drop stale per-thread conn (rotating thread)
 
     import time as _t
     with repo.tx(_skip_rotation_check=True) as c:

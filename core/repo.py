@@ -280,10 +280,45 @@ class Repo:
         # Open one connection per thread (sqlite3 is connection-thread-local).
         import threading as _t
         self._local = _t.local()
+        # ── Cross-thread epoch counter (Wave 5 follow-up-2) ──
+        # `Repo.close()` only clears the *calling thread's* thread-local
+        # connection.  After a master-key rotation, every thread that
+        # had previously called `repo._conn()` still holds a
+        # connection that was PRAGMA-key'd with the OLD key, even
+        # though `repo.db_key` has been updated and the cipher file on
+        # disk is the NEW one.  That stale connection either:
+        #   * raises RotationInProgress forever (because it reads
+        #     the pre-swap `key_rotation` row whose
+        #     `rotation_in_progress` is still 1 from its OWN conn's
+        #     perspective — the post-swap UPDATE used a different
+        #     conn on the rotating thread), OR
+        #   * silently encrypts writes with the OLD key into the
+        #     NEW-cipher file (unreadable to any NEW-key reader).
+        # Bumping `self._epoch` after the swap forces every thread's
+        # next `_conn()` access to close its stale conn and reopen
+        # with the current `self.db_key`.  Cheaper than walking
+        # `threading.enumerate()` to enumerate per-thread caches and
+        # avoids the need for a global connection registry.
+        self._epoch: int = 0
         self._bootstrap_schema()
 
     def _conn(self):
         c = getattr(self._local, "conn", None)
+        c_epoch = getattr(self._local, "conn_epoch", None)
+        # If the per-thread conn is from an earlier epoch (i.e. the
+        # Repo was rotated after this thread last opened its conn),
+        # discard it.  A fresh open with `self.db_key` is the only
+        # sqlcipher3-documented way to switch the page-encryption key
+        # on a connection — re-issuing PRAGMA key on an existing
+        # connection is not officially supported and behaves
+        # inconsistently across sqlcipher3 versions.
+        if c is not None and c_epoch != self._epoch:
+            try:
+                c.close()
+            except Exception:
+                pass
+            c = None
+            self._local.conn = None
         if c is None:
             import core.cipher_db as _cipher
             c = _cipher.connect(self.db_path, key=self.db_key)
@@ -309,6 +344,7 @@ class Repo:
                 ) from exc
             c.execute("PRAGMA foreign_keys=ON")
             self._local.conn = c
+            self._local.conn_epoch = self._epoch
         return c
 
     def _bootstrap_schema(self):
