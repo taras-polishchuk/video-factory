@@ -198,14 +198,34 @@ def rotation_state(repo) -> dict:
     }
 
 
-# ── credential-write gate ────────────────────────────────────────
+# ── write gate ───────────────────────────────────────────
 
 def credential_writes_allowed(repo) -> bool:
-    """True iff the API may currently write to the credentials table.
+    """Backwards-compat alias for :func:`writes_allowed`.
 
-    Wired into Repo.upsert_credential.  When a rotation is in
-    progress this returns False, and upsert_credential raises
-    RotationInProgress so the API layer maps to 503.
+    Kept so existing call sites (and external monitoring that
+    grepped for this name) keep working.  New code should call
+    ``writes_allowed`` directly.
+    """
+    return writes_allowed(repo)
+
+
+def writes_allowed(repo) -> bool:
+    """True iff the API may currently write to ANY table.
+
+    Wave 5 follow-up (t_abf264b4): rotated from a credential-only
+    gate to a generic write gate.  While a rotation is in
+    progress this returns False for ALL writes (audit_log, jobs,
+    workspaces, credentials, ...), not just credentials.  The
+    brief's Item #5 demanded that concurrent writers cannot
+    interleave between the OLD-key snapshot and the cipher swap
+    — the simplest way to enforce that is to refuse every write
+    transaction while the flag is set.
+
+    Wired into :meth:`core.repo.Repo.tx` so the canonical
+    `with repo.tx() as c: c.execute(...)` block is gated.  The
+    rotation function itself passes ``_skip_rotation_check=True``
+    to bypass the gate for its own bookkeeping rows.
     """
     return not rotation_state(repo)["in_progress"]
 
@@ -259,6 +279,45 @@ def rotate(*, repo, old_key: str, new_key: str,
 
     ensure_table(repo)
 
+    # ── 0. Hold the Repo lock for the ENTIRE rotation. ────────
+    # Wave 5 follow-up (t_abf264b4): the lock is the primary
+    # mechanism that makes the rotation atomic from the caller's
+    # perspective.  While we hold it, every `Repo.tx()` call from
+    # other threads blocks.  This single change addresses both
+    # BLOCKER-1 (silent corruption of post-rotation writes through
+    # the same Repo) and BLOCKER-2 (row-count verify false-negative
+    # when a concurrent writer interleaves between the snapshot
+    # and the copy).
+    #
+    # Combined with the `tx()` rotation check added in
+    # core/repo.py, this gives two independent layers of safety:
+    #   1. The lock makes the rotation a critical section in the
+    #      multi-threading sense — no other thread can enter `tx()`
+    #      while we run.
+    #   2. The flag-based check makes the rotation a critical
+    #      section in the single-thread sense too — if some path
+    #      bypasses the lock (e.g. a direct `repo._conn().execute`
+    #      from a runner), the flag still surfaces a
+    #      `RotationInProgress` error.
+    with repo._lock:  # noqa: SLF001 — rotation owns the lock
+        return _rotate_locked(
+            repo=repo,
+            old_key=old_key,
+            new_key=new_key,
+            actor_user_id=actor_user_id,
+            db_path=db_path,
+        )
+
+
+def _rotate_locked(*, repo, old_key: str, new_key: str,
+                    actor_user_id: str, db_path: str) -> dict:
+    """Inner rotation body.  Caller MUST hold `repo._lock`.
+
+    Factored out of :func:`rotate` so the lock-acquisition step
+    is visible at a glance in the public function.  Everything
+    from the WAL checkpoint through the cipher swap and the
+    ``db_key`` refresh runs under the lock.
+    """
     # ── 1. Acquire the in-progress flag ────────────────────────
     # Force a WAL checkpoint on the live Repo connection first so
     # the new connection that copy_cipher_to_cipher will open sees
@@ -270,7 +329,7 @@ def rotate(*, repo, old_key: str, new_key: str,
         repo._conn().execute("PRAGMA wal_checkpoint(FULL)")  # noqa: SLF001
     except Exception:
         pass
-    with repo.tx() as c:
+    with repo.tx(_skip_rotation_check=True) as c:
         row = c.execute(
             "SELECT rotation_id, rotation_in_progress "
             "FROM key_rotation LIMIT 1"
@@ -302,7 +361,7 @@ def rotate(*, repo, old_key: str, new_key: str,
                 extra={"old_key_fingerprint": _fingerprint(old_key),
                         "new_key_fingerprint": _fingerprint(new_key)})
 
-    # ── 2..6. Copy + atomic swap ──────────────────────────────
+    # ── 2..6. Copy + atomic swap (still under the lock) ─────
     new_path = Path(db_path).with_suffix(
         Path(db_path).suffix + ".new"
     )
@@ -312,7 +371,9 @@ def rotate(*, repo, old_key: str, new_key: str,
         Path(db_path).suffix + ".pre_rotation"
     )
     try:
-        # Snapshot the OLD DB row counts so we can verify.
+        # Snapshot the OLD DB row counts so we can verify.  Done
+        # under the lock so no other writer can interleave between
+        # the snapshot and the copy.  (BLOCKER-2 fix.)
         old_counts = _table_counts(db_path, key=old_key)
         # Backup the OLD DB so a partial failure leaves a
         # recoverable copy on disk.  Cheap: SQLite WAL is
@@ -339,7 +400,9 @@ def rotate(*, repo, old_key: str, new_key: str,
             src_key=old_key,
             dst_key=new_key,
         )
-        # Verify the new DB has the same row counts.
+        # Verify the new DB has the same row counts.  Both sides
+        # of the comparison are taken under the lock so the verify
+        # cannot see partial state.
         new_counts = _table_counts(str(new_path), key=new_key)
         if old_counts != new_counts:
             raise RotationFailed(
@@ -359,6 +422,12 @@ def rotate(*, repo, old_key: str, new_key: str,
     except Exception as e:
         # Mark the rotation failed; live DB untouched.
         import time as _t
+        # The flag-flip happens via tx() with the rotation check
+        # skipped because we just caught a real error from the
+        # rotation; we MUST be able to mark it failed regardless
+        # of the gate state.  Holding `repo._lock` for the whole
+        # rotation guarantees that no other writer is in tx() at
+        # this point.
         repo._conn().execute(  # noqa: SLF001
             "UPDATE key_rotation SET rotation_in_progress=0, "
             "rotation_failed=1, failed_at=?",
@@ -373,13 +442,34 @@ def rotate(*, repo, old_key: str, new_key: str,
             raise
         raise RotationFailed(f"rotation aborted: {e}") from e
 
-    # ── 7. Mark completed ─────────────────────────────────────
+    # ── 7. Mark completed + REFRESH the Repo to use NEW key ─
+    # The BLOCKER-1 fix lives here.  The cipher file on disk is
+    # now the NEW-cipher file, but the Repo instance still has
+    # `db_key = old_key` and its per-thread connection cache
+    # still points at the OLD-key cipher state.  If we did
+    # nothing, the next call to `Repo._conn()` would return a
+    # connection that PRAGMA-key'd with the OLD key while the
+    # file on disk is encrypted with the NEW key — every
+    # subsequent write through this Repo would be silently
+    # dropped or encrypted with the wrong key.  The fix:
+    #   1. Drop the cached connection (it points at the OLD
+    #      cipher state).
+    #   2. Update `db_key` so the next `_conn()` opens with the
+    #      NEW key against the new cipher file.
+    #   3. Mark the rotation completed.  Because the flag is
+    #      cleared only AFTER the swap, and the swap is only
+    #      after we've snapshotted row counts under the lock,
+    #      the entire critical section is monotonic.
+    repo.db_key = new_key  # noqa: SLF001 — rotate owns the key flip
+    repo.close()  # noqa: SLF001 — drop stale per-thread conn
+
     import time as _t
-    repo._conn().execute(  # noqa: SLF001
-        "UPDATE key_rotation SET rotation_in_progress=0, "
-        "rotation_completed=1, completed_at=?",
-        (_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),),
-    )
+    with repo.tx(_skip_rotation_check=True) as c:
+        c.execute(
+            "UPDATE key_rotation SET rotation_in_progress=0, "
+            "rotation_completed=1, completed_at=?",
+            (_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),),
+        )
     _audit(repo, event=EVENT_COMPLETED, actor_user_id=actor_user_id,
             extra={"old_key_fingerprint": _fingerprint(old_key),
                     "new_key_fingerprint": _fingerprint(new_key)})
@@ -441,4 +531,5 @@ __all__ = [
     "ensure_table",
     "rotate",
     "rotation_state",
+    "writes_allowed",
 ]

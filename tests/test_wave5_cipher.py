@@ -450,19 +450,48 @@ def test_key_rotation_concurrent_reads_blocked(
     barrier = threading.Event()
 
     def slow_migrate(*args, **kwargs):
-        # Simulate a slow copy.  The live DB is untouched.
+        # Simulate a slow copy.  The live DB is untouched until
+        # the rotation code's atomic-swap step.
         barrier.wait(timeout=5)
         # `copy_cipher_to_cipher` returns {"src_path", "dst_path"};
         # the rotation code uses the return value only to confirm
-        # the copy completed.  We must also create the destination
-        # file because the rotation code's atomic-swap step
-        # (`os.replace(new_path, db_path)`) requires it to exist
-        # — we mimic the real copy by touching an empty file.
-        with open(kwargs.get("dst_path") or args[1], "wb") as f:
-            f.write(b"")
+        # the copy completed.  We mimic the real copy by creating
+        # a *valid* NEW-cipher file (encrypted with the NEW key)
+        # at the destination.  An empty file would satisfy the
+        # atomic-swap step but would fail the post-swap
+        # `UPDATE key_rotation SET rotation_completed=1` because
+        # the new connection opens with the NEW key against a
+        # file that does not have the schema.  This mirrors what
+        # a real `copy_cipher_to_cipher` produces — a populated
+        # cipher DB under the destination key.
+        dst = kwargs.get("dst_path") or args[1]
+        new_conn = cipher_db.connect(dst, key="k2")
+        try:
+            new_conn.execute(
+                "CREATE TABLE IF NOT EXISTS key_rotation ("
+                "rotation_id TEXT PRIMARY KEY, "
+                "rotation_in_progress INTEGER NOT NULL DEFAULT 0, "
+                "rotation_completed INTEGER NOT NULL DEFAULT 0, "
+                "rotation_failed INTEGER NOT NULL DEFAULT 0, "
+                "started_at TEXT, completed_at TEXT, failed_at TEXT, "
+                "actor_user_id TEXT, "
+                "old_key_fingerprint TEXT, new_key_fingerprint TEXT)"
+            )
+            new_conn.execute(
+                "CREATE TABLE IF NOT EXISTS secrets ("
+                "id INTEGER PRIMARY KEY, payload TEXT)"
+            )
+            new_conn.execute(
+                "INSERT OR REPLACE INTO key_rotation"
+                "(rotation_id, rotation_in_progress) VALUES (?, 0)",
+                ("rot_0001",),
+            )
+            new_conn.commit()
+        finally:
+            new_conn.close()
         return {
             "src_path": db,
-            "dst_path": db + ".new",
+            "dst_path": dst,
         }
 
     def reader():

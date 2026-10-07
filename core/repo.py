@@ -880,8 +880,36 @@ class Repo:
             self._local.conn = None
 
     @contextmanager
-    def tx(self) -> Iterator[sqlite3.Connection]:
+    def tx(self, *, _skip_rotation_check: bool = False
+           ) -> Iterator[sqlite3.Connection]:
+        """Open a transaction with rotation-in-progress gating.
+
+        Wave 5 follow-up (t_abf264b4): while a master-key rotation
+        is in progress, every write transaction MUST raise
+        `RotationInProgress` so concurrent writers cannot land on
+        a freshly-swapped cipher file with a stale key.  The
+        canonical write path in the API layer is `with repo.tx() as
+        c: c.execute(...)`, so gating here covers all the methods
+        on `Repo` that perform INSERT/UPDATE/DELETE.
+
+        Internal callers (e.g. `key_rotation.rotate` itself) pass
+        `_skip_rotation_check=True` so the rotation function can
+        write its own bookkeeping rows while the flag is set.
+
+        Reads via `repo._conn()` (no lock, no rotation check) are
+        unchanged; they observe the on-disk state of the live DB.
+        """
         with self._lock:
+            if not _skip_rotation_check:
+                # Imported lazily so the Repo module remains
+                # importable without the key_rotation dependency
+                # being available at import time.
+                from control_plane import key_rotation as _kr
+                if not _kr.writes_allowed(self):
+                    raise _kr.RotationInProgress(
+                        "master-key rotation in progress; "
+                        "writes are paused"
+                    )
             c = self._conn()
             try:
                 yield c
