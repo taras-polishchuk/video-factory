@@ -93,6 +93,208 @@ def create_app(*, repo: Optional[Repo] = None,
     async def spec():
         return {"openapi_url": "/openapi.json", "docs_url": "/docs"}
 
+    # ── Wave 2: workspace-scoped routes ───────────────────────
+    # These mirror the legacy /api/v1/companies/{cid}/* routes
+    # but bind the workspace_id from the URL path and enforce
+    # workspace membership via the auth context.
+
+    def _resolve_ws(request: Request, wid: str):
+        """Resolve a workspace from a path param, with 401/403/404."""
+        from auth.dependencies import get_current_user
+        try:
+            ctx = get_current_user(request)
+        except HTTPException as e:
+            raise HTTPException(e.status_code,
+                                "authentication required for workspace access")
+        m = repo.get_membership(ctx.user_id, wid)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        try:
+            ws = repo.get_workspace(wid)
+        except Exception:
+            raise HTTPException(404, f"workspace {wid} not found")
+        if ws.get("status") == "disabled":
+            raise HTTPException(503, "workspace is disabled")
+        return ctx, ws
+
+    @app.get("/api/v1/workspaces/{wid}/companies")
+    async def ws_list_companies(request: Request, wid: str):
+        """Alias for /workspaces/{wid}: list the workspace as a
+        "company" (the legacy noun).  Returns the workspace
+        record itself plus a list of child entities the user can
+        access.
+        """
+        _ctx, ws = _resolve_ws(request, wid)
+        return [{"company_id": ws["workspace_id"],
+                 "workspace_id": ws["workspace_id"],
+                 "slug": ws["slug"],
+                 "name": ws["name"],
+                 "description": ws.get("description", ""),
+                 "created_at": ws["created_at"],
+                 "updated_at": ws["updated_at"]}]
+
+    @app.get("/api/v1/workspaces/{wid}/jobs")
+    async def ws_list_jobs(request: Request, wid: str,
+                            state: Optional[str] = None):
+        _ctx, _ws = _resolve_ws(request, wid)
+        return repo.list_jobs(workspace_id=wid, state=state)
+
+    @app.post("/api/v1/workspaces/{wid}/jobs")
+    async def ws_create_job(request: Request, wid: str, payload: dict):
+        _ctx, _ws = _resolve_ws(request, wid)
+        required = ("topic", "language", "duration_seconds", "platforms")
+        for f in required:
+            if f not in payload:
+                raise HTTPException(400, f"missing {f}")
+        job = repo.create_job(
+            workspace_id=wid,
+            topic=payload["topic"],
+            language=payload["language"],
+            duration_seconds=int(payload["duration_seconds"]),
+            platforms=list(payload["platforms"]),
+            aspect_ratio=payload.get("aspect_ratio", "9:16"),
+            count=int(payload.get("count", 1)),
+            render_profile=payload.get("render_profile", "mock"),
+            bible_id=payload.get("bible_id"),
+            approval_required=bool(payload.get("approval_required", False)),
+        )
+        runner.submit(job["job_id"])
+        return job
+
+    @app.get("/api/v1/workspaces/{wid}/bibles")
+    async def ws_list_bibles(request: Request, wid: str):
+        _ctx, _ws = _resolve_ws(request, wid)
+        return repo.list_bibles(wid)
+
+    @app.post("/api/v1/workspaces/{wid}/bibles")
+    async def ws_create_bible(request: Request, wid: str, payload: dict):
+        _ctx, _ws = _resolve_ws(request, wid)
+        return repo.create_bible(
+            workspace_id=wid,
+            payload=payload.get("payload", {}),
+            notes=payload.get("notes", ""),
+        )
+
+    @app.get("/api/v1/workspaces/{wid}/assets")
+    async def ws_list_assets(request: Request, wid: str):
+        _ctx, _ws = _resolve_ws(request, wid)
+        return repo.list_assets(wid)
+
+    @app.post("/api/v1/workspaces/{wid}/assets")
+    async def ws_create_asset(request: Request, wid: str,
+                                kind: str = "misc",
+                                file: UploadFile = File(...)):
+        _ctx, ws = _resolve_ws(request, wid)
+        from core.repo import new_id
+        import hashlib
+        raw_filename = file.filename or "upload"
+        safe_name = Path(raw_filename).name
+        if ".." in raw_filename.replace("\\", "/").split("/"):
+            raise HTTPException(400, "invalid filename: path traversal")
+        if not safe_name or safe_name in (".", ".."):
+            raise HTTPException(400, "invalid filename")
+        asset_dir = (Path(storage_root) / "workspaces" / ws["slug"]
+                     / "assets")
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        asset_id = new_id("ast")
+        storage_key = f"workspaces/{ws['slug']}/assets/{asset_id}_{safe_name}"
+        data = await file.read()
+        if len(data) > 50 * 1024 * 1024:
+            raise HTTPException(413, "asset exceeds 50MB cap (mock mode)")
+        target = Path(storage_root) / storage_key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        checksum = hashlib.sha256(data).hexdigest()
+        return repo.create_asset(
+            workspace_id=wid,
+            kind=kind,
+            filename=safe_name,
+            storage_key=storage_key,
+            mime_type=file.content_type or "application/octet-stream",
+            size_bytes=len(data),
+            checksum=checksum,
+        )
+
+    @app.get("/api/v1/workspaces/{wid}/credentials")
+    async def ws_list_credentials(request: Request, wid: str):
+        _ctx, _ws = _resolve_ws(request, wid)
+        return repo.list_credentials(wid)
+
+    @app.get("/api/v1/workspaces/{wid}/credentials/{provider}")
+    async def ws_get_credential(request: Request, wid: str, provider: str):
+        _ctx, _ws = _resolve_ws(request, wid)
+        return repo.get_credential(wid, provider)
+
+    @app.put("/api/v1/workspaces/{wid}/credentials/{provider}")
+    async def ws_put_credential(
+        request: Request, wid: str, provider: str, payload: dict,
+        x_operator: Optional[str] = Header(default=None),
+    ):
+        _ctx, _ws = _resolve_ws(request, wid)
+        plaintext = payload.get("value")
+        if not isinstance(plaintext, str) or not plaintext.strip():
+            raise HTTPException(400, "value required (non-empty string)")
+        if provider not in repo.CREDENTIAL_PROVIDERS:
+            raise HTTPException(400, f"unknown provider: {provider!r}")
+        from control_plane.secret_vault import (
+            encrypt, fingerprint, SecretKeyMissing,
+        )
+        try:
+            blob = encrypt(wid, provider, plaintext)
+        except SecretKeyMissing as e:
+            raise HTTPException(503, str(e))
+        fp = fingerprint(plaintext)
+        operator = (x_operator or "operator").strip()[:64]
+        result = repo.upsert_credential(
+            workspace_id=wid, provider=provider,
+            fingerprint_str=fp, encrypted_blob=blob,
+            updated_by=operator,
+        )
+        try:
+            from control_plane.repo_helpers import append_runner_audit
+            append_runner_audit(
+                repo,
+                job_id=f"cred::{wid}::{provider}",
+                event="credentials.upserted",
+                context={"provider": provider,
+                          "fingerprint": fp, "updated_by": operator,
+                          "workspace_id": wid},
+            )
+        except Exception:
+            pass
+        return result
+
+    @app.delete("/api/v1/workspaces/{wid}/credentials/{provider}")
+    async def ws_delete_credential(
+        request: Request, wid: str, provider: str,
+        x_operator: Optional[str] = Header(default=None),
+    ):
+        _ctx, _ws = _resolve_ws(request, wid)
+        operator = (x_operator or "operator").strip()[:64]
+        try:
+            repo.delete_credential(workspace_id=wid, provider=provider)
+        except Exception as e:
+            raise HTTPException(404, str(e))
+        try:
+            from control_plane.repo_helpers import append_runner_audit
+            append_runner_audit(
+                repo,
+                job_id=f"cred::{wid}::{provider}",
+                event="credentials.deleted",
+                context={"provider": provider, "deleted_by": operator,
+                          "workspace_id": wid},
+            )
+        except Exception:
+            pass
+        return {"deleted": True, "provider": provider,
+                "workspace_id": wid}
+
+    @app.get("/api/v1/workspaces/{wid}/audit")
+    async def ws_audit(request: Request, wid: str, limit: int = 100):
+        _ctx, _ws = _resolve_ws(request, wid)
+        from auth.audit_log import list_for_workspace
+        return list_for_workspace(repo, workspace_id=wid, limit=limit)
+
     # ── companies ──────────────────────────────────────────────
 
     @app.post("/api/v1/companies")
@@ -130,7 +332,8 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.post("/api/v1/companies/{company_id}/bibles")
     async def create_bible(company_id: str, payload: dict):
-        return repo.create_bible(company_id, payload=payload.get("payload", {}),
+        return repo.create_bible(company_id=company_id,
+                                  payload=payload.get("payload", {}),
                                   notes=payload.get("notes", ""))
 
     @app.get("/api/v1/companies/{company_id}/bibles")
@@ -174,7 +377,7 @@ def create_app(*, repo: Optional[Repo] = None,
         target.write_bytes(data)
         checksum = hashlib.sha256(data).hexdigest()
         asset = repo.create_asset(
-            company_id,
+            company_id=company_id,
             kind=kind,
             filename=safe_name,
             storage_key=storage_key,
@@ -209,7 +412,7 @@ def create_app(*, repo: Optional[Repo] = None,
             if f not in payload:
                 raise HTTPException(400, f"missing {f}")
         job = repo.create_job(
-            company_id,
+            company_id=company_id,
             topic=payload["topic"],
             language=payload["language"],
             duration_seconds=int(payload["duration_seconds"]),
@@ -277,7 +480,7 @@ def create_app(*, repo: Optional[Repo] = None,
             raise HTTPException(400, "scheduled_for required for schedule action")
         intent = repo.create_publish_intent(
             job_id=job_id,
-            company_id=job["company_id"],
+            company_id=job["workspace_id"],
             action=action,
             platforms=platforms,
             caption=payload.get("caption", ""),
@@ -341,7 +544,7 @@ def create_app(*, repo: Optional[Repo] = None,
         # Encrypt here. The repo only ever sees ciphertext.
         from control_plane.secret_vault import encrypt, fingerprint, SecretKeyMissing
         try:
-            blob = encrypt(provider, plaintext)
+            blob = encrypt(company_id, provider, plaintext)
         except SecretKeyMissing as e:
             raise HTTPException(503, str(e))
         fp = fingerprint(plaintext)

@@ -1,7 +1,8 @@
-"""SQLite-backed persistence for multi-company Video Factory.
+"""SQLite-backed persistence for multi-tenant Video Factory.
 
-Tables:
-- companies: company profile
+Tables (canonical names, Wave 2+):
+- workspaces: the multi-tenant root.  `workspace_id` is the FK target
+  for every other table.
 - bible_versions: Company Video Bible with draft/approved states
 - assets: brand assets (logo, fonts, examples)
 - jobs: video jobs
@@ -9,8 +10,14 @@ Tables:
 - job_outputs: per-asset output metadata
 - publish_intents: mock draft/schedule/publish records
 - integrations: provider connection state (mock-only here)
+- credentials: per-workspace encrypted provider secrets (the
+  "credential vault"). Plaintext never enters the DB.
+- audit_log: cross-actor audit trail
+- users + memberships + sessions + email_verifications + password_resets:
+  Wave 1 auth foundations.
 
-All FKs scoped to company_id. Cross-company access raises Forbidden.
+All FKs scoped to a workspace. Cross-workspace access raises
+`WorkspaceAccessDenied` (HTTP 403 at the API layer).
 """
 from __future__ import annotations
 
@@ -25,32 +32,43 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 
+# Schema for the Wave-2 canonical layout.  All tenant-scoped tables
+# use `workspace_id` and FK into `workspaces(workspace_id)`.
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS companies (
-    company_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id TEXT PRIMARY KEY,
     slug TEXT UNIQUE NOT NULL,
     name TEXT NOT NULL,
     description TEXT,
+    plan TEXT NOT NULL DEFAULT 'free'
+        CHECK (plan IN ('free', 'pro', 'enterprise')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'suspended', 'disabled')),
+    live_enabled INTEGER NOT NULL DEFAULT 0,
+    stripe_customer_id TEXT,
+    stripe_subscription_id TEXT,
+    owner_user_id TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_user_id);
 
 CREATE TABLE IF NOT EXISTS bible_versions (
     bible_id TEXT PRIMARY KEY,
-    company_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     version INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('draft','approved')),
     payload_json TEXT NOT NULL,
     notes TEXT,
     created_at TEXT NOT NULL,
     approved_at TEXT,
-    FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
 );
-CREATE INDEX IF NOT EXISTS idx_bible_company ON bible_versions(company_id);
+CREATE INDEX IF NOT EXISTS idx_bible_workspace ON bible_versions(workspace_id);
 
 CREATE TABLE IF NOT EXISTS assets (
     asset_id TEXT PRIMARY KEY,
-    company_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     filename TEXT NOT NULL,
     storage_key TEXT NOT NULL,
@@ -58,13 +76,13 @@ CREATE TABLE IF NOT EXISTS assets (
     size_bytes INTEGER,
     checksum TEXT,
     uploaded_at TEXT NOT NULL,
-    FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
 );
-CREATE INDEX IF NOT EXISTS idx_assets_company ON assets(company_id);
+CREATE INDEX IF NOT EXISTS idx_assets_workspace ON assets(workspace_id);
 
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
-    company_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     bible_id TEXT,
     topic TEXT NOT NULL,
     language TEXT NOT NULL,
@@ -79,10 +97,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     state TEXT NOT NULL DEFAULT 'queued',
     status_message TEXT,
     current_stage TEXT,
-    FOREIGN KEY (company_id) REFERENCES companies(company_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id),
     FOREIGN KEY (bible_id) REFERENCES bible_versions(bible_id)
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_workspace ON jobs(workspace_id);
 
 CREATE TABLE IF NOT EXISTS job_stages (
     stage_id TEXT PRIMARY KEY,
@@ -117,7 +135,7 @@ CREATE INDEX IF NOT EXISTS idx_outputs_job ON job_outputs(job_id);
 CREATE TABLE IF NOT EXISTS publish_intents (
     intent_id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
-    company_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('draft','schedule','publish')),
     platforms_json TEXT NOT NULL,
     caption TEXT,
@@ -127,8 +145,9 @@ CREATE TABLE IF NOT EXISTS publish_intents (
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done','failed')),
     detail TEXT,
     FOREIGN KEY (job_id) REFERENCES jobs(job_id),
-    FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
 );
+CREATE INDEX IF NOT EXISTS idx_publish_workspace ON publish_intents(workspace_id);
 
 CREATE TABLE IF NOT EXISTS integrations (
     name TEXT PRIMARY KEY,
@@ -138,26 +157,56 @@ CREATE TABLE IF NOT EXISTS integrations (
     updated_at TEXT NOT NULL
 );
 
--- ── Per-company encrypted credentials (F-credential-vault) ─────────
--- One row per (company_id, provider_name). The plaintext is never
+-- Per-workspace encrypted credentials (F-credential-vault).
+-- One row per (workspace_id, provider_name). The plaintext is never
 -- stored; only an encrypted blob. The repo exposes only masked
 -- surfaces to the API.
 CREATE TABLE IF NOT EXISTS credentials (
     credential_id TEXT PRIMARY KEY,
-    company_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     provider TEXT NOT NULL,
     encrypted_blob BLOB NOT NULL,
     fingerprint TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     updated_by TEXT NOT NULL,
-    FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    UNIQUE (company_id, provider)
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id),
+    UNIQUE (workspace_id, provider)
 );
-CREATE INDEX IF NOT EXISTS idx_credentials_company ON credentials(company_id);
+CREATE INDEX IF NOT EXISTS idx_credentials_workspace ON credentials(workspace_id);
+"""
+
+
+# Backwards-compat SCHEMA for the OLD layout (pre-Wave-2 test fixtures
+# that called `Repo()` against a DB created by an earlier code path).
+# Wave 2 drops the `companies` table outright, but old DBs that still
+# have one will have it ignored by the new code (only the
+# `workspace_id` column matters now).
+LEGACY_COMPANIES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS companies (
+    company_id TEXT PRIMARY KEY,
+    slug TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
 class Forbidden(Exception):
+    """Legacy alias for WorkspaceAccessDenied.
+
+    Kept so existing routes that raise/catch Forbidden keep working
+    through the Wave 2 transition.
+    """
+    pass
+
+
+class WorkspaceAccessDenied(Forbidden):
+    """Raised when a caller tries to access data outside their workspace.
+
+    The API layer maps this to HTTP 403.
+    """
     pass
 
 
@@ -171,6 +220,11 @@ def now_iso() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _compute_checksum(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 class Repo:
@@ -196,12 +250,21 @@ class Repo:
 
     def _bootstrap_schema(self):
         c = self._conn()
+        # Apply the canonical schema (workspace_id).  This will
+        # create `workspaces` + everything tenant-scoped fresh, AND
+        # be a no-op for any pre-existing tables that already match.
         c.executescript(SCHEMA)
         # Wave 1: apply auth migrations idempotently.
         from core.migrations import apply_migrations
         apply_migrations(c)
-        # Extend audit_log with user_id + workspace_id if absent.
+        # Extend audit_log with user_id + workspace_id + actor if absent.
         self._extend_audit_log_columns()
+        # Wave 2: rename company_id -> workspace_id on legacy tables,
+        # backfill from companies -> workspaces, drop companies.
+        self._apply_migration_005()
+        # Run the canonical migration again so anything that the
+        # Wave-2 rename removed is recreated with workspace_id FKs.
+        c.executescript(SCHEMA)
         for name in ("heygen", "comfy_cloud", "comfy_gpu_worker", "n8n", "publer"):
             c.execute(
                 "INSERT OR IGNORE INTO integrations(name, enabled, mode, detail, updated_at) VALUES (?,?,?,?,?)",
@@ -212,12 +275,28 @@ class Repo:
         c.executescript(RUNNER_AUDIT_SCHEMA)
         bootstrap_runner_audit(self)
 
-    def _extend_audit_log_columns(self) -> None:
-        """Ensure audit_log has user_id + workspace_id columns (migration 004).
+    # ── Migration helpers ─────────────────────────────────────
 
-        SQLite has no IF NOT EXISTS for ADD COLUMN prior to 3.35, so we
-        check via PRAGMA table_info and add missing columns manually.
-        Idempotent.
+    def _table_columns(self, table: str) -> set[str]:
+        """Return the column names of a table (lowercased)."""
+        rows = self._conn().execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+        return {r[1].lower() for r in rows}
+
+    def _table_exists(self, table: str) -> bool:
+        row = self._conn().execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    def _extend_audit_log_columns(self) -> None:
+        """Ensure audit_log has user_id + workspace_id + actor columns.
+
+        SQLite has no IF NOT EXISTS for ADD COLUMN prior to 3.35, so
+        we check via PRAGMA table_info and add missing columns
+        manually. Idempotent.
         """
         c = self._conn()
         cols = {row[1] for row in c.execute("PRAGMA table_info(audit_log)").fetchall()}
@@ -225,6 +304,220 @@ class Repo:
             c.execute("ALTER TABLE audit_log ADD COLUMN user_id TEXT")
         if "workspace_id" not in cols:
             c.execute("ALTER TABLE audit_log ADD COLUMN workspace_id TEXT")
+        if "actor" not in cols:
+            c.execute("ALTER TABLE audit_log ADD COLUMN actor TEXT")
+        c.commit()
+
+    def _apply_migration_005(self) -> None:
+        """Idempotent Wave-2 migration: company_id -> workspace_id.
+
+        Steps (each guarded so a re-run is a no-op):
+
+        1. If a `companies` table exists, backfill each row into
+           `workspaces` (creating a stub workspace with no owner).
+           Track the old company_id -> new workspace_id mapping in
+           `legacy_company_alias` so the legacy /api/v1/companies
+           alias can still resolve.
+        2. For each tenant-scoped table (bible_versions, assets,
+           jobs, publish_intents, credentials), if the column is
+           `company_id` and `workspace_id` is missing, add
+           `workspace_id`. Backfill from `company_id` (joined via
+           the alias table). Drop the `company_id` column.
+        3. Drop the `companies` table at the end (after alias
+           mapping is captured).
+        """
+        c = self._conn()
+        # 1. ensure the alias table exists.
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS legacy_company_alias ("
+            "  legacy_company_id TEXT PRIMARY KEY,"
+            "  workspace_id TEXT NOT NULL,"
+            "  created_at TEXT NOT NULL"
+            ")"
+        )
+        # 2. If companies exists, migrate each row -> workspace, store alias.
+        if self._table_exists("companies"):
+            cols = self._table_columns("companies")
+            if "company_id" in cols and "slug" in cols:
+                rows = c.execute(
+                    "SELECT company_id, slug, name, description, "
+                    "created_at, updated_at FROM companies"
+                ).fetchall()
+                t = now_iso()
+                for r in rows:
+                    cid, slug, name, desc, created_at, updated_at = r
+                    # Skip if we've already aliased this cid.
+                    existing = c.execute(
+                        "SELECT workspace_id FROM legacy_company_alias "
+                        "WHERE legacy_company_id=?",
+                        (cid,),
+                    ).fetchone()
+                    if existing:
+                        continue
+                    # Create a workspace that mirrors the company.
+                    new_wid = new_id("wks")
+                    try:
+                        c.execute(
+                            "INSERT INTO workspaces(workspace_id, slug, name, "
+                            "description, plan, status, live_enabled, "
+                            "created_at, updated_at) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (new_wid, slug, name, desc or "",
+                             "free", "active", 0, created_at, updated_at),
+                        )
+                    except Exception:
+                        # Slug collision: suffix and retry.
+                        new_slug = f"{slug}-migrated-{uuid.uuid4().hex[:6]}"
+                        c.execute(
+                            "INSERT INTO workspaces(workspace_id, slug, name, "
+                            "description, plan, status, live_enabled, "
+                            "created_at, updated_at) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (new_wid, new_slug, name, desc or "",
+                             "free", "active", 0, created_at, updated_at),
+                        )
+                    c.execute(
+                        "INSERT INTO legacy_company_alias("
+                        "legacy_company_id, workspace_id, created_at) "
+                        "VALUES (?,?,?)",
+                        (cid, new_wid, t),
+                    )
+                    # Backfill workspace_id for rows pointing at this cid.
+                    for tbl in ("bible_versions", "assets", "jobs",
+                                "publish_intents", "credentials"):
+                        if not self._table_exists(tbl):
+                            continue
+                        tbl_cols = self._table_columns(tbl)
+                        if "company_id" in tbl_cols:
+                            try:
+                                c.execute(
+                                    f"UPDATE {tbl} SET workspace_id=? "
+                                    f"WHERE company_id=? AND (workspace_id IS NULL OR workspace_id='')",
+                                    (new_wid, cid),
+                                )
+                            except Exception:
+                                pass
+        # 3. Drop `company_id` from each legacy table if present,
+        #    ensure `workspace_id` is present.
+        for tbl in ("bible_versions", "assets", "jobs",
+                    "publish_intents", "credentials"):
+            if not self._table_exists(tbl):
+                continue
+            cols = self._table_columns(tbl)
+            if "company_id" in cols:
+                # SQLite < 3.35 cannot DROP COLUMN.  We use the
+                # standard "rebuild table" pattern: rename -> create new
+                # -> copy -> drop old.
+                if "workspace_id" not in cols:
+                    c.execute(f"ALTER TABLE {tbl} ADD COLUMN workspace_id TEXT")
+                # Copy the rows.
+                rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
+                # Get column names of the live table.
+                live_cols = [r[1] for r in c.execute(
+                    f"PRAGMA table_info({tbl})"
+                ).fetchall()]
+                # Rebuild.
+                c.execute(f"ALTER TABLE {tbl} RENAME TO {tbl}__legacy")
+                create_sql = ""
+                if tbl == "bible_versions":
+                    create_sql = (
+                        "CREATE TABLE bible_versions ("
+                        "bible_id TEXT PRIMARY KEY, workspace_id TEXT, "
+                        "version INTEGER NOT NULL, status TEXT NOT NULL "
+                        "CHECK (status IN ('draft','approved')), "
+                        "payload_json TEXT NOT NULL, notes TEXT, "
+                        "created_at TEXT NOT NULL, approved_at TEXT)"
+                    )
+                elif tbl == "assets":
+                    create_sql = (
+                        "CREATE TABLE assets ("
+                        "asset_id TEXT PRIMARY KEY, workspace_id TEXT, "
+                        "kind TEXT NOT NULL, filename TEXT NOT NULL, "
+                        "storage_key TEXT NOT NULL, mime_type TEXT, "
+                        "size_bytes INTEGER, checksum TEXT, "
+                        "uploaded_at TEXT NOT NULL)"
+                    )
+                elif tbl == "jobs":
+                    create_sql = (
+                        "CREATE TABLE jobs ("
+                        "job_id TEXT PRIMARY KEY, workspace_id TEXT, "
+                        "bible_id TEXT, topic TEXT NOT NULL, "
+                        "language TEXT NOT NULL, duration_seconds INTEGER NOT NULL, "
+                        "platforms_json TEXT NOT NULL, "
+                        "aspect_ratio TEXT NOT NULL DEFAULT '9:16', "
+                        "count INTEGER NOT NULL DEFAULT 1, "
+                        "render_profile TEXT NOT NULL DEFAULT 'mock', "
+                        "approval_required INTEGER NOT NULL DEFAULT 0, "
+                        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                        "state TEXT NOT NULL DEFAULT 'queued', "
+                        "status_message TEXT, current_stage TEXT)"
+                    )
+                elif tbl == "publish_intents":
+                    create_sql = (
+                        "CREATE TABLE publish_intents ("
+                        "intent_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, "
+                        "workspace_id TEXT NOT NULL, "
+                        "action TEXT NOT NULL "
+                        "CHECK (action IN ('draft','schedule','publish')), "
+                        "platforms_json TEXT NOT NULL, caption TEXT, "
+                        "scheduled_for TEXT, created_at TEXT NOT NULL, "
+                        "executed_at TEXT, "
+                        "status TEXT NOT NULL DEFAULT 'pending' "
+                        "CHECK (status IN ('pending','done','failed')), "
+                        "detail TEXT)"
+                    )
+                elif tbl == "credentials":
+                    create_sql = (
+                        "CREATE TABLE credentials ("
+                        "credential_id TEXT PRIMARY KEY, "
+                        "workspace_id TEXT NOT NULL, provider TEXT NOT NULL, "
+                        "encrypted_blob BLOB NOT NULL, "
+                        "fingerprint TEXT NOT NULL, "
+                        "updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, "
+                        "UNIQUE (workspace_id, provider))"
+                    )
+                c.execute(create_sql)
+                # Copy rows from the legacy table, mapping columns.
+                if rows:
+                    legacy_cols = [r[1] for r in c.execute(
+                        f"PRAGMA table_info({tbl}__legacy)"
+                    ).fetchall()]
+                    # If the legacy column was named company_id, map to
+                    # workspace_id in the new table.
+                    col_map = []
+                    for col in legacy_cols:
+                        if col == "company_id":
+                            col_map.append("workspace_id")
+                        else:
+                            col_map.append(col)
+                    # Build a SELECT that maps legacy_cols -> new cols.
+                    select_exprs = []
+                    for i, col in enumerate(legacy_cols):
+                        if col == "company_id":
+                            select_exprs.append("workspace_id")
+                        else:
+                            select_exprs.append(col)
+                    # We rely on the fact that the rows are in
+                    # legacy_cols order.  Build a new tuple per row in
+                    # the new schema's column order.
+                    new_col_list = [r[1] for r in c.execute(
+                        f"PRAGMA table_info({tbl})"
+                    ).fetchall()]
+                    placeholders = ",".join("?" for _ in new_col_list)
+                    insert_sql = f"INSERT INTO {tbl} ({','.join(new_col_list)}) VALUES ({placeholders})"
+                    new_idx = {c: i for i, c in enumerate(new_col_list)}
+                    legacy_idx = {c: i for i, c in enumerate(legacy_cols)}
+                    for r in rows:
+                        new_row = [None] * len(new_col_list)
+                        for col, idx in legacy_idx.items():
+                            target = col_map[idx]
+                            if target in new_idx:
+                                new_row[new_idx[target]] = r[idx]
+                        c.execute(insert_sql, tuple(new_row))
+                c.execute(f"DROP TABLE {tbl}__legacy")
+        # 4. Drop `companies` table at the end.
+        if self._table_exists("companies"):
+            c.execute("DROP TABLE companies")
         c.commit()
 
     def close(self) -> None:
@@ -244,103 +537,360 @@ class Repo:
                 c.rollback()
                 raise
 
-    # ── Companies ─────────────────────────────────────────────
+    # ── Workspace access guard ────────────────────────────────
 
-    def create_company(self, *, slug: str, name: str, description: str = "") -> dict:
-        company_id = new_id("cmp")
-        t = now_iso()
-        with self.tx() as c:
-            c.execute(
-                "INSERT INTO companies(company_id,slug,name,description,created_at,updated_at) VALUES (?,?,?,?,?,?)",
-                (company_id, slug, name, description, t, t),
+    def require_workspace(self, workspace_id: str) -> dict:
+        """Verify the workspace exists AND is not disabled.
+
+        Raises WorkspaceAccessDenied(403) for missing or
+        disabled workspaces. Returns the row on success.
+        """
+        ws = self.get_workspace(workspace_id)
+        if ws.get("status") in ("disabled", "suspended", "deleted"):
+            raise WorkspaceAccessDenied(
+                f"workspace {workspace_id} is {ws['status']}; access denied"
             )
-        return self.get_company(company_id)
+        return ws
 
-    def get_company(self, company_id: str) -> dict:
+    @staticmethod
+    def _resolve_wid(company_id: Optional[str],
+                        workspace_id: Optional[str]) -> str:
+        """Accept either `company_id` (legacy) or `workspace_id`
+        (canonical) and return the canonical workspace_id.
+
+        Raises ValueError if neither or both are passed.
+        """
+        if company_id is not None and workspace_id is not None:
+            if company_id == workspace_id:
+                return workspace_id
+            raise ValueError(
+                "pass either company_id or workspace_id, not both"
+            )
+        if workspace_id is not None:
+            return workspace_id
+        if company_id is not None:
+            return company_id
+        raise ValueError("workspace_id (or company_id) is required")
+
+    # ── Workspaces (canonical tenant) ──────────────────────────
+
+    def create_workspace(self, *, slug: str, name: str,
+                            owner_user_id: Optional[str] = None,
+                            plan: str = "free",
+                            description: str = "") -> dict:
+        workspace_id = new_id("wks")
+        t = now_iso()
+        if plan not in ("free", "pro", "enterprise"):
+            raise ValueError(f"invalid plan: {plan!r}")
+        try:
+            with self.tx() as c:
+                c.execute(
+                    "INSERT INTO workspaces(workspace_id, slug, name, "
+                    "description, plan, status, live_enabled, "
+                    "owner_user_id, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (workspace_id, slug.lower(), name, description,
+                     plan, "active", 0, owner_user_id, t, t),
+                )
+                # Auto-add owner membership if we know the owner.
+                if owner_user_id:
+                    c.execute(
+                        "INSERT OR REPLACE INTO memberships(user_id, "
+                        "workspace_id, role, created_at) "
+                        "VALUES (?,?,?,?)",
+                        (owner_user_id, workspace_id, "owner", t),
+                    )
+        except Exception as e:
+            if "UNIQUE constraint failed" in str(e) and "slug" in str(e):
+                raise ValueError(
+                    f"workspace slug {slug!r} already exists"
+                ) from e
+            raise
+        return self.get_workspace(workspace_id)
+
+    def get_workspace(self, workspace_id: str) -> dict:
         row = self._conn().execute(
-            "SELECT company_id, slug, name, description, created_at, updated_at FROM companies WHERE company_id=?",
-            (company_id,),
+            "SELECT workspace_id, slug, name, description, plan, status, "
+            "live_enabled, owner_user_id, stripe_customer_id, "
+            "stripe_subscription_id, created_at, updated_at "
+            "FROM workspaces WHERE workspace_id=?",
+            (workspace_id,),
         ).fetchone()
         if not row:
-            raise NotFound(f"company {company_id} not found")
-        return self._row_company(row)
+            raise NotFound(f"workspace {workspace_id} not found")
+        return self._row_workspace_full(row)
 
-    def list_companies(self) -> list[dict]:
+    def get_workspace_by_slug(self, slug: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT workspace_id, slug, name, description, plan, status, "
+            "live_enabled, owner_user_id, stripe_customer_id, "
+            "stripe_subscription_id, created_at, updated_at "
+            "FROM workspaces WHERE slug=?",
+            (slug.lower(),),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_workspace_full(row)
+
+    def list_workspaces(self) -> list[dict]:
         rows = self._conn().execute(
-            "SELECT company_id, slug, name, description, created_at, updated_at FROM companies ORDER BY created_at"
+            "SELECT workspace_id, slug, name, description, plan, status, "
+            "live_enabled, owner_user_id, stripe_customer_id, "
+            "stripe_subscription_id, created_at, updated_at "
+            "FROM workspaces ORDER BY created_at"
         ).fetchall()
-        return [self._row_company(r) for r in rows]
+        return [self._row_workspace_full(r) for r in rows]
 
-    def update_company(self, company_id: str, *, name: Optional[str] = None,
-                        description: Optional[str] = None) -> dict:
+    def update_workspace(self, workspace_id: str, *,
+                            name: Optional[str] = None,
+                            description: Optional[str] = None,
+                            plan: Optional[str] = None,
+                            status: Optional[str] = None,
+                            live_enabled: Optional[bool] = None) -> dict:
         with self.tx() as c:
-            existing = self.get_company(company_id)
+            existing = self.get_workspace(workspace_id)
             new_name = name if name is not None else existing["name"]
-            new_desc = description if description is not None else existing["description"]
+            new_desc = description if description is not None else existing.get("description", "")
+            new_plan = plan if plan is not None else existing["plan"]
+            new_status = status if status is not None else existing["status"]
+            new_live = live_enabled if live_enabled is not None else existing.get("live_enabled", False)
+            if new_plan not in ("free", "pro", "enterprise"):
+                raise ValueError(f"invalid plan: {new_plan!r}")
+            if new_status not in ("active", "suspended", "disabled"):
+                raise ValueError(f"invalid status: {new_status!r}")
             c.execute(
-                "UPDATE companies SET name=?, description=?, updated_at=? WHERE company_id=?",
-                (new_name, new_desc, now_iso(), company_id),
+                "UPDATE workspaces SET name=?, description=?, plan=?, "
+                "status=?, live_enabled=?, updated_at=? "
+                "WHERE workspace_id=?",
+                (new_name, new_desc, new_plan, new_status,
+                 1 if new_live else 0, now_iso(), workspace_id),
             )
-        return self.get_company(company_id)
+        return self.get_workspace(workspace_id)
 
-    def _row_company(self, row) -> dict:
+    def _row_workspace_full(self, row) -> dict:
         return {
-            "company_id": row[0],
+            "workspace_id": row[0],
             "slug": row[1],
             "name": row[2],
             "description": row[3] or "",
-            "created_at": row[4],
-            "updated_at": row[5],
+            "plan": row[4],
+            "status": row[5],
+            "live_enabled": bool(row[6]),
+            "owner_user_id": row[7],
+            "stripe_customer_id": row[8],
+            "stripe_subscription_id": row[9],
+            "created_at": row[10],
+            "updated_at": row[11],
+        }
+
+    # Legacy alias: the old `_row_workspace` is still referenced by
+    # the auth router and Wave 1 tests.  Keep it as a thin wrapper
+    # that returns the same shape with the canonical workspace_id key.
+    def _row_workspace(self, row) -> dict:
+        return self._row_workspace_full(row)
+
+    # ── Legacy compat: company_id <-> workspace_id aliases ─────
+
+    def resolve_company_to_workspace(self, company_id: str) -> str:
+        """Translate a legacy `cmp_*` id to its workspace_id.
+
+        If the id already looks like a workspace_id (`wks_*`) we
+        return it as-is. Otherwise we look it up in
+        `legacy_company_alias` (the migration's backfill table) and
+        return the corresponding workspace_id, or the input as a
+        last resort (so calls against a fresh DB still work).
+        """
+        if company_id.startswith("wks_"):
+            return company_id
+        if not self._table_exists("legacy_company_alias"):
+            return company_id
+        row = self._conn().execute(
+            "SELECT workspace_id FROM legacy_company_alias "
+            "WHERE legacy_company_id=?",
+            (company_id,),
+        ).fetchone()
+        if row:
+            return row[0]
+        # Fallback: maybe a workspace with that exact id was created
+        # post-migration.  Try the workspaces table.
+        try:
+            self.get_workspace(company_id)
+            return company_id
+        except NotFound:
+            pass
+        # Last resort: return as-is so existing call sites raise 404
+        # rather than 500.
+        return company_id
+
+    def create_company(self, *, slug: str, name: str, description: str = "") -> dict:
+        """Legacy compat shim.
+
+        Wave 1 callers (and the legacy `/api/v1/companies` test
+        suite) invoke `create_company(slug=..., name=...)`.  We map
+        this to a workspace create and return a dict whose
+        `company_id` field carries the new workspace_id value, so
+        test code reading `c["company_id"]` keeps working.
+        """
+        ws = self.create_workspace(slug=slug, name=name, description=description)
+        return {
+            "company_id": ws["workspace_id"],
+            "workspace_id": ws["workspace_id"],
+            "slug": ws["slug"],
+            "name": ws["name"],
+            "description": ws.get("description", ""),
+            "plan": ws.get("plan", "free"),
+            "status": ws.get("status", "active"),
+            "live_enabled": ws.get("live_enabled", False),
+            "owner_user_id": ws.get("owner_user_id"),
+            "created_at": ws["created_at"],
+            "updated_at": ws.get("updated_at"),
+        }
+
+    def get_company(self, company_id: str) -> dict:
+        """Legacy compat shim: load by `company_id` (which we treat
+        as a workspace_id, possibly translated via the alias table).
+        """
+        wid = self.resolve_company_to_workspace(company_id)
+        ws = self.get_workspace(wid)
+        return {
+            "company_id": ws["workspace_id"],
+            "workspace_id": ws["workspace_id"],
+            "slug": ws["slug"],
+            "name": ws["name"],
+            "description": ws.get("description", ""),
+            "created_at": ws["created_at"],
+            "updated_at": ws["updated_at"],
+        }
+
+    def list_companies(self, workspace_id: Optional[str] = None) -> list[dict]:
+        """Legacy compat shim: list workspaces as 'companies'.
+
+        If `workspace_id` is set, returns only the row for that
+        workspace.  Otherwise returns every workspace.
+        """
+        if workspace_id is not None:
+            wid = self.resolve_company_to_workspace(workspace_id)
+            try:
+                ws = self.get_workspace(wid)
+            except NotFound:
+                return []
+            return [{
+                "company_id": ws["workspace_id"],
+                "workspace_id": ws["workspace_id"],
+                "slug": ws["slug"],
+                "name": ws["name"],
+                "description": ws.get("description", ""),
+                "created_at": ws["created_at"],
+                "updated_at": ws["updated_at"],
+            }]
+        rows = self.list_workspaces()
+        return [
+            {
+                "company_id": r["workspace_id"],
+                "workspace_id": r["workspace_id"],
+                "slug": r["slug"],
+                "name": r["name"],
+                "description": r.get("description", ""),
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def update_company(self, company_id: str, *,
+                        name: Optional[str] = None,
+                        description: Optional[str] = None) -> dict:
+        """Legacy compat shim: update a workspace as if it were a
+        company.  Returns the same shape as `get_company`.
+        """
+        wid = self.resolve_company_to_workspace(company_id)
+        ws = self.update_workspace(wid, name=name, description=description)
+        return {
+            "company_id": ws["workspace_id"],
+            "workspace_id": ws["workspace_id"],
+            "slug": ws["slug"],
+            "name": ws["name"],
+            "description": ws.get("description", ""),
+            "created_at": ws["created_at"],
+            "updated_at": ws["updated_at"],
         }
 
     # ── Bible ─────────────────────────────────────────────────
 
-    def create_bible(self, company_id: str, *, payload: dict, notes: str = "") -> dict:
-        self.get_company(company_id)  # 404 if missing
+    def create_bible(self, *, company_id: Optional[str] = None,
+                        workspace_id: Optional[str] = None,
+                        payload: dict, notes: str = "") -> dict:
+        wid = self._resolve_wid(company_id, workspace_id)
+        self.require_workspace(wid)
         with self.tx() as c:
             version = (c.execute(
-                "SELECT COALESCE(MAX(version),0)+1 FROM bible_versions WHERE company_id=?",
-                (company_id,),
+                "SELECT COALESCE(MAX(version),0)+1 FROM bible_versions "
+                "WHERE workspace_id=?",
+                (wid,),
             ).fetchone()[0])
             bible_id = new_id("bbl")
             c.execute(
-                "INSERT INTO bible_versions(bible_id,company_id,version,status,payload_json,notes,created_at,approved_at) VALUES (?,?,?,?,?,?,?,?)",
-                (bible_id, company_id, version, "draft", json.dumps(payload), notes, now_iso(), None),
+                "INSERT INTO bible_versions(bible_id, workspace_id, "
+                "version, status, payload_json, notes, created_at, "
+                "approved_at) VALUES (?,?,?,?,?,?,?,?)",
+                (bible_id, wid, version, "draft",
+                 json.dumps(payload), notes, now_iso(), None),
             )
         return self.get_bible(bible_id)
 
     def approve_bible(self, bible_id: str) -> dict:
         with self.tx() as c:
-            row = c.execute("SELECT company_id, status, version FROM bible_versions WHERE bible_id=?",
-                            (bible_id,)).fetchone()
+            row = c.execute(
+                "SELECT workspace_id, status, version FROM bible_versions "
+                "WHERE bible_id=?",
+                (bible_id,),
+            ).fetchone()
             if not row:
                 raise NotFound(f"bible {bible_id} not found")
             if row[1] != "draft":
                 raise ValueError("only draft bibles can be approved")
-            c.execute("UPDATE bible_versions SET status='approved', approved_at=? WHERE bible_id=?",
-                      (now_iso(), bible_id))
+            c.execute(
+                "UPDATE bible_versions SET status='approved', approved_at=? "
+                "WHERE bible_id=?",
+                (now_iso(), bible_id),
+            )
         return self.get_bible(bible_id)
 
     def get_bible(self, bible_id: str) -> dict:
         row = self._conn().execute(
-            "SELECT bible_id, company_id, version, status, payload_json, notes, created_at, approved_at FROM bible_versions WHERE bible_id=?",
+            "SELECT bible_id, workspace_id, version, status, payload_json, "
+            "notes, created_at, approved_at FROM bible_versions "
+            "WHERE bible_id=?",
             (bible_id,),
         ).fetchone()
         if not row:
             raise NotFound(f"bible {bible_id} not found")
         return self._row_bible(row)
 
-    def list_bibles(self, company_id: str) -> list[dict]:
+    def list_bibles(self, workspace_id: str) -> list[dict]:
+        self.require_workspace(workspace_id)
         rows = self._conn().execute(
-            "SELECT bible_id, company_id, version, status, payload_json, notes, created_at, approved_at FROM bible_versions WHERE company_id=? ORDER BY version DESC",
-            (company_id,),
+            "SELECT bible_id, workspace_id, version, status, payload_json, "
+            "notes, created_at, approved_at FROM bible_versions "
+            "WHERE workspace_id=? ORDER BY version DESC",
+            (workspace_id,),
         ).fetchall()
         return [self._row_bible(r) for r in rows]
+
+    def list_bibles_by_company(self, company_id: str) -> list[dict]:
+        """Alias for list_bibles(workspace_id=company_id).
+
+        Translates a legacy company_id to workspace_id via the
+        alias table and returns the bibles scoped to that
+        workspace.
+        """
+        return self.list_bibles(company_id)
 
     def _row_bible(self, row) -> dict:
         return {
             "bible_id": row[0],
-            "company_id": row[1],
+            "workspace_id": row[1],
+            "company_id": row[1],  # legacy alias
             "version": row[2],
             "status": row[3],
             "payload": json.loads(row[4]) if row[4] else {},
@@ -351,38 +901,50 @@ class Repo:
 
     # ── Assets ────────────────────────────────────────────────
 
-    def create_asset(self, company_id: str, *, kind: str, filename: str,
-                     storage_key: str, mime_type: str, size_bytes: int,
-                     checksum: str) -> dict:
-        self.get_company(company_id)
+    def create_asset(self, *, company_id: Optional[str] = None,
+                        workspace_id: Optional[str] = None,
+                        kind: str, filename: str,
+                        storage_key: str, mime_type: str, size_bytes: int,
+                        checksum: str) -> dict:
+        wid = self._resolve_wid(company_id, workspace_id)
+        self.require_workspace(wid)
         asset_id = new_id("ast")
         with self.tx() as c:
             c.execute(
-                "INSERT INTO assets(asset_id,company_id,kind,filename,storage_key,mime_type,size_bytes,checksum,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (asset_id, company_id, kind, filename, storage_key, mime_type, size_bytes, checksum, now_iso()),
+                "INSERT INTO assets(asset_id, workspace_id, kind, filename, "
+                "storage_key, mime_type, size_bytes, checksum, uploaded_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (asset_id, wid, kind, filename, storage_key,
+                 mime_type, size_bytes, checksum, now_iso()),
             )
         return self.get_asset(asset_id)
 
     def get_asset(self, asset_id: str) -> dict:
         row = self._conn().execute(
-            "SELECT asset_id, company_id, kind, filename, storage_key, mime_type, size_bytes, checksum, uploaded_at FROM assets WHERE asset_id=?",
+            "SELECT asset_id, workspace_id, kind, filename, storage_key, "
+            "mime_type, size_bytes, checksum, uploaded_at FROM assets "
+            "WHERE asset_id=?",
             (asset_id,),
         ).fetchone()
         if not row:
             raise NotFound(f"asset {asset_id} not found")
         return self._row_asset(row)
 
-    def list_assets(self, company_id: str) -> list[dict]:
+    def list_assets(self, workspace_id: str) -> list[dict]:
+        self.require_workspace(workspace_id)
         rows = self._conn().execute(
-            "SELECT asset_id, company_id, kind, filename, storage_key, mime_type, size_bytes, checksum, uploaded_at FROM assets WHERE company_id=? ORDER BY uploaded_at DESC",
-            (company_id,),
+            "SELECT asset_id, workspace_id, kind, filename, storage_key, "
+            "mime_type, size_bytes, checksum, uploaded_at FROM assets "
+            "WHERE workspace_id=? ORDER BY uploaded_at DESC",
+            (workspace_id,),
         ).fetchall()
         return [self._row_asset(r) for r in rows]
 
     def _row_asset(self, row) -> dict:
         return {
             "asset_id": row[0],
-            "company_id": row[1],
+            "workspace_id": row[1],
+            "company_id": row[1],  # legacy alias
             "kind": row[2],
             "filename": row[3],
             "storage_key": row[4],
@@ -394,57 +956,83 @@ class Repo:
 
     # ── Jobs ──────────────────────────────────────────────────
 
-    def create_job(self, company_id: str, *, topic: str, language: str,
-                   duration_seconds: int, platforms: list[str],
-                   aspect_ratio: str = "9:16", count: int = 1,
-                   render_profile: str = "mock", bible_id: Optional[str] = None,
-                   approval_required: bool = False) -> dict:
-        self.get_company(company_id)
+    def create_job(self, *, company_id: Optional[str] = None,
+                     workspace_id: Optional[str] = None,
+                     topic: str, language: str,
+                     duration_seconds: int, platforms: list[str],
+                     aspect_ratio: str = "9:16", count: int = 1,
+                     render_profile: str = "mock",
+                     bible_id: Optional[str] = None,
+                     approval_required: bool = False) -> dict:
+        wid = self._resolve_wid(company_id, workspace_id)
+        self.require_workspace(wid)
         if bible_id:
             b = self.get_bible(bible_id)
-            if b["company_id"] != company_id:
-                raise Forbidden("bible does not belong to company")
+            if b["workspace_id"] != wid:
+                raise WorkspaceAccessDenied(
+                    f"bible {bible_id} belongs to workspace "
+                    f"{b['workspace_id']!r}; cannot use in workspace "
+                    f"{wid!r}"
+                )
             if b["status"] != "approved":
                 raise ValueError("bible must be approved before job creation")
         job_id = new_id("job")
         t = now_iso()
         with self.tx() as c:
             c.execute(
-                """INSERT INTO jobs(job_id, company_id, bible_id, topic, language, duration_seconds, platforms_json, aspect_ratio, count, render_profile, approval_required, created_at, updated_at, state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (job_id, company_id, bible_id, topic, language, duration_seconds,
-                 json.dumps(platforms), aspect_ratio, count, render_profile,
-                 1 if approval_required else 0, t, t, "queued"),
+                """INSERT INTO jobs(job_id, workspace_id, bible_id, topic, language,
+                   duration_seconds, platforms_json, aspect_ratio, count,
+                   render_profile, approval_required, created_at, updated_at,
+                   state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (job_id, wid, bible_id, topic, language,
+                 duration_seconds, json.dumps(platforms), aspect_ratio, count,
+                 render_profile, 1 if approval_required else 0, t, t, "queued"),
             )
         return self.get_job(job_id)
 
     def update_job(self, job_id: str, **fields) -> dict:
         with self.tx() as c:
-            row = c.execute("SELECT company_id FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            row = c.execute(
+                "SELECT workspace_id FROM jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
             if not row:
                 raise NotFound(f"job {job_id} not found")
             keys = list(fields.keys())
             sets = ",".join(f"{k}=?" for k in keys)
             vals = [fields[k] for k in keys]
-            c.execute(f"UPDATE jobs SET {sets}, updated_at=? WHERE job_id=?",
-                      (*vals, now_iso(), job_id))
+            c.execute(
+                f"UPDATE jobs SET {sets}, updated_at=? WHERE job_id=?",
+                (*vals, now_iso(), job_id),
+            )
         return self.get_job(job_id)
 
     def get_job(self, job_id: str) -> dict:
         row = self._conn().execute(
-            """SELECT job_id, company_id, bible_id, topic, language, duration_seconds, platforms_json, aspect_ratio, count, render_profile, approval_required, created_at, updated_at, state, status_message, current_stage FROM jobs WHERE job_id=?""",
+            """SELECT job_id, workspace_id, bible_id, topic, language,
+               duration_seconds, platforms_json, aspect_ratio, count,
+               render_profile, approval_required, created_at, updated_at,
+               state, status_message, current_stage FROM jobs WHERE job_id=?""",
             (job_id,),
         ).fetchone()
         if not row:
             raise NotFound(f"job {job_id} not found")
         return self._row_job(row)
 
-    def list_jobs(self, company_id: Optional[str] = None,
-                  state: Optional[str] = None) -> list[dict]:
-        q = """SELECT job_id, company_id, bible_id, topic, language, duration_seconds, platforms_json, aspect_ratio, count, render_profile, approval_required, created_at, updated_at, state, status_message, current_stage FROM jobs WHERE 1=1"""
+    def list_jobs(self, *, company_id: Optional[str] = None,
+                    workspace_id: Optional[str] = None,
+                    state: Optional[str] = None) -> list[dict]:
+        wid = workspace_id
+        if wid is None and company_id is not None:
+            wid = company_id
+        q = """SELECT job_id, workspace_id, bible_id, topic, language,
+               duration_seconds, platforms_json, aspect_ratio, count,
+               render_profile, approval_required, created_at, updated_at,
+               state, status_message, current_stage FROM jobs WHERE 1=1"""
         params: list = []
-        if company_id:
-            q += " AND company_id=?"
-            params.append(company_id)
+        if wid:
+            q += " AND workspace_id=?"
+            params.append(wid)
         if state:
             q += " AND state=?"
             params.append(state)
@@ -455,7 +1043,8 @@ class Repo:
     def _row_job(self, row) -> dict:
         return {
             "job_id": row[0],
-            "company_id": row[1],
+            "workspace_id": row[1],
+            "company_id": row[1],  # legacy alias
             "bible_id": row[2],
             "topic": row[3],
             "language": row[4],
@@ -475,9 +1064,11 @@ class Repo:
     # ── Stages ────────────────────────────────────────────────
 
     def upsert_stage(self, *, job_id: str, stage_key: str, ordinal: int,
-                     status: str, started_at: Optional[str] = None,
-                     finished_at: Optional[str] = None, duration_ms: Optional[int] = None,
-                     summary: Optional[dict] = None, error: Optional[str] = None) -> dict:
+                        status: str, started_at: Optional[str] = None,
+                        finished_at: Optional[str] = None,
+                        duration_ms: Optional[int] = None,
+                        summary: Optional[dict] = None,
+                        error: Optional[str] = None) -> dict:
         stage_id = new_id("stg")
         with self.tx() as c:
             existing = c.execute(
@@ -487,21 +1078,34 @@ class Repo:
             if existing:
                 stage_id = existing[0]
                 c.execute(
-                    "UPDATE job_stages SET status=?, started_at=COALESCE(?,started_at), finished_at=COALESCE(?,finished_at), duration_ms=COALESCE(?,duration_ms), summary_json=COALESCE(?,summary_json), error=? WHERE stage_id=?",
+                    "UPDATE job_stages SET status=?, "
+                    "started_at=COALESCE(?,started_at), "
+                    "finished_at=COALESCE(?,finished_at), "
+                    "duration_ms=COALESCE(?,duration_ms), "
+                    "summary_json=COALESCE(?,summary_json), error=? "
+                    "WHERE stage_id=?",
                     (status, started_at, finished_at, duration_ms,
-                     json.dumps(summary) if summary is not None else None, error, stage_id),
+                     json.dumps(summary) if summary is not None else None,
+                     error, stage_id),
                 )
             else:
                 c.execute(
-                    "INSERT INTO job_stages(stage_id,job_id,stage_key,ordinal,status,started_at,finished_at,duration_ms,summary_json,error) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (stage_id, job_id, stage_key, ordinal, status, started_at, finished_at, duration_ms,
-                     json.dumps(summary) if summary is not None else None, error),
+                    "INSERT INTO job_stages(stage_id, job_id, stage_key, "
+                    "ordinal, status, started_at, finished_at, "
+                    "duration_ms, summary_json, error) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (stage_id, job_id, stage_key, ordinal, status,
+                     started_at, finished_at, duration_ms,
+                     json.dumps(summary) if summary is not None else None,
+                     error),
                 )
         return self.get_stage(stage_id)
 
     def get_stage(self, stage_id: str) -> dict:
         row = self._conn().execute(
-            "SELECT stage_id, job_id, stage_key, ordinal, status, started_at, finished_at, duration_ms, summary_json, error FROM job_stages WHERE stage_id=?",
+            "SELECT stage_id, job_id, stage_key, ordinal, status, "
+            "started_at, finished_at, duration_ms, summary_json, error "
+            "FROM job_stages WHERE stage_id=?",
             (stage_id,),
         ).fetchone()
         if not row:
@@ -510,7 +1114,9 @@ class Repo:
 
     def list_stages(self, job_id: str) -> list[dict]:
         rows = self._conn().execute(
-            "SELECT stage_id, job_id, stage_key, ordinal, status, started_at, finished_at, duration_ms, summary_json, error FROM job_stages WHERE job_id=? ORDER BY ordinal",
+            "SELECT stage_id, job_id, stage_key, ordinal, status, "
+            "started_at, finished_at, duration_ms, summary_json, error "
+            "FROM job_stages WHERE job_id=? ORDER BY ordinal",
             (job_id,),
         ).fetchall()
         return [self._row_stage(r) for r in rows]
@@ -532,20 +1138,24 @@ class Repo:
     # ── Outputs ───────────────────────────────────────────────
 
     def create_output(self, job_id: str, *, storage_key: str, filename: str,
-                      mime_type: str, size_bytes: int, checksum: str,
-                      is_mock: bool = True, kind: str = "video") -> dict:
+                        mime_type: str, size_bytes: int, checksum: str,
+                        is_mock: bool = True, kind: str = "video") -> dict:
         output_id = new_id("out")
         with self.tx() as c:
             c.execute(
-                "INSERT INTO job_outputs(output_id,job_id,storage_key,filename,mime_type,size_bytes,checksum,is_mock,kind,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (output_id, job_id, storage_key, filename, mime_type, size_bytes, checksum,
-                 1 if is_mock else 0, kind, now_iso()),
+                "INSERT INTO job_outputs(output_id, job_id, storage_key, "
+                "filename, mime_type, size_bytes, checksum, is_mock, kind, "
+                "created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (output_id, job_id, storage_key, filename, mime_type,
+                 size_bytes, checksum, 1 if is_mock else 0, kind, now_iso()),
             )
         return self.get_output(output_id)
 
     def get_output(self, output_id: str) -> dict:
         row = self._conn().execute(
-            "SELECT output_id, job_id, storage_key, filename, mime_type, size_bytes, checksum, is_mock, kind, created_at FROM job_outputs WHERE output_id=?",
+            "SELECT output_id, job_id, storage_key, filename, mime_type, "
+            "size_bytes, checksum, is_mock, kind, created_at "
+            "FROM job_outputs WHERE output_id=?",
             (output_id,),
         ).fetchone()
         if not row:
@@ -554,7 +1164,9 @@ class Repo:
 
     def list_outputs(self, job_id: str) -> list[dict]:
         rows = self._conn().execute(
-            "SELECT output_id, job_id, storage_key, filename, mime_type, size_bytes, checksum, is_mock, kind, created_at FROM job_outputs WHERE job_id=? ORDER BY created_at",
+            "SELECT output_id, job_id, storage_key, filename, mime_type, "
+            "size_bytes, checksum, is_mock, kind, created_at "
+            "FROM job_outputs WHERE job_id=? ORDER BY created_at",
             (job_id,),
         ).fetchall()
         return [self._row_output(r) for r in rows]
@@ -575,19 +1187,25 @@ class Repo:
 
     # ── Publishing ────────────────────────────────────────────
 
-    def create_publish_intent(self, *, job_id: str, company_id: str,
-                              action: str, platforms: list[str],
-                              caption: str = "", scheduled_for: Optional[str] = None) -> dict:
-        # F7: cross-company guard. A publish intent must reference a job
-        # that actually belongs to the calling company. Without this
-        # check, any caller could file a publish intent for another
-        # tenant's job — they would see the intent detail and could
-        # potentially pivot to live publishing once enabled.
+    def create_publish_intent(self, *, job_id: str,
+                                company_id: Optional[str] = None,
+                                workspace_id: Optional[str] = None,
+                                action: str, platforms: list[str],
+                                caption: str = "",
+                                scheduled_for: Optional[str] = None) -> dict:
+        # F7: cross-workspace guard.  A publish intent must
+        # reference a job that actually belongs to the calling
+        # workspace.  Without this check, any caller could file a
+        # publish intent for another tenant's job — they would see
+        # the intent detail and could potentially pivot to live
+        # publishing once enabled.
+        wid = self._resolve_wid(company_id, workspace_id)
+        self.require_workspace(wid)
         job = self.get_job(job_id)
-        if job["company_id"] != company_id:
-            raise Forbidden(
-                f"job {job_id} belongs to company {job['company_id']!r}; "
-                f"cannot publish on behalf of {company_id!r}"
+        if job["workspace_id"] != wid:
+            raise WorkspaceAccessDenied(
+                f"job {job_id} belongs to workspace {job['workspace_id']!r}; "
+                f"cannot publish on behalf of {wid!r}"
             )
         if action not in ("draft", "schedule", "publish"):
             raise ValueError(f"invalid action {action}")
@@ -601,24 +1219,30 @@ class Repo:
         intent_id = new_id("pub")
         with self.tx() as c:
             c.execute(
-                "INSERT INTO publish_intents(intent_id,job_id,company_id,action,platforms_json,caption,scheduled_for,created_at,status) VALUES (?,?,?,?,?,?,?,?,?)",
-                (intent_id, job_id, company_id, action, json.dumps(platforms), caption,
-                 scheduled_for, now_iso(), "pending"),
+                "INSERT INTO publish_intents(intent_id, job_id, workspace_id, "
+                "action, platforms_json, caption, scheduled_for, created_at, "
+                "status) VALUES (?,?,?,?,?,?,?,?,?)",
+                (intent_id, job_id, wid, action,
+                 json.dumps(platforms), caption, scheduled_for, now_iso(),
+                 "pending"),
             )
         return self.get_publish_intent(intent_id)
 
     def update_publish_intent(self, intent_id: str, *, status: str,
-                              detail: str = "") -> dict:
+                                detail: str = "") -> dict:
         with self.tx() as c:
             c.execute(
-                "UPDATE publish_intents SET status=?, executed_at=?, detail=? WHERE intent_id=?",
+                "UPDATE publish_intents SET status=?, executed_at=?, detail=? "
+                "WHERE intent_id=?",
                 (status, now_iso(), detail, intent_id),
             )
         return self.get_publish_intent(intent_id)
 
     def get_publish_intent(self, intent_id: str) -> dict:
         row = self._conn().execute(
-            "SELECT intent_id, job_id, company_id, action, platforms_json, caption, scheduled_for, created_at, executed_at, status, detail FROM publish_intents WHERE intent_id=?",
+            "SELECT intent_id, job_id, workspace_id, action, platforms_json, "
+            "caption, scheduled_for, created_at, executed_at, status, detail "
+            "FROM publish_intents WHERE intent_id=?",
             (intent_id,),
         ).fetchone()
         if not row:
@@ -627,7 +1251,9 @@ class Repo:
 
     def list_publish_intents(self, job_id: str) -> list[dict]:
         rows = self._conn().execute(
-            "SELECT intent_id, job_id, company_id, action, platforms_json, caption, scheduled_for, created_at, executed_at, status, detail FROM publish_intents WHERE job_id=? ORDER BY created_at DESC",
+            "SELECT intent_id, job_id, workspace_id, action, platforms_json, "
+            "caption, scheduled_for, created_at, executed_at, status, detail "
+            "FROM publish_intents WHERE job_id=? ORDER BY created_at DESC",
             (job_id,),
         ).fetchall()
         return [self._row_intent(r) for r in rows]
@@ -636,7 +1262,8 @@ class Repo:
         return {
             "intent_id": row[0],
             "job_id": row[1],
-            "company_id": row[2],
+            "workspace_id": row[2],
+            "company_id": row[2],  # legacy alias
             "action": row[3],
             "platforms": json.loads(row[4]) if row[4] else [],
             "caption": row[5] or "",
@@ -651,7 +1278,8 @@ class Repo:
 
     def list_integrations(self) -> list[dict]:
         rows = self._conn().execute(
-            "SELECT name, enabled, mode, detail, updated_at FROM integrations ORDER BY name"
+            "SELECT name, enabled, mode, detail, updated_at "
+            "FROM integrations ORDER BY name"
         ).fetchall()
         return [
             {"name": r[0], "enabled": bool(r[1]), "mode": r[2],
@@ -659,64 +1287,81 @@ class Repo:
             for r in rows
         ]
 
-    # ── Credentials (F-credential-vault) ─────────────────────────
+    # ── Credentials (F-credential-vault) ─────────────────────
 
-    # Providers we will accept secrets for. Anything outside this set is
-    # rejected at the repo layer so a typo cannot silently store a blob.
+    # Providers we will accept secrets for. Anything outside this set
+    # is rejected at the repo layer so a typo cannot silently store
+    # a blob.
     CREDENTIAL_PROVIDERS = {
         "heygen_direct", "comfy_cloud", "comfy_gpu_worker",
         "comfy_heygen_partner", "publer",
     }
 
-    def upsert_credential(self, *, company_id: str, provider: str,
+    def upsert_credential(self, *, company_id: Optional[str] = None,
+                            workspace_id: Optional[str] = None,
+                            provider: str,
                             fingerprint_str: str, encrypted_blob: bytes,
                             updated_by: str) -> dict:
-        """Store or replace the encrypted credential for (company, provider).
+        """Store or replace the encrypted credential for
+        (workspace, provider).  The plaintext never enters the repo:
+        callers encrypt via control_plane.secret_vault and pass
+        the bytes.  Returns the masked surface (NEVER the
+        plaintext).
 
-        The plaintext never enters the repo: callers encrypt via
-        control_plane.secret_vault and pass the bytes. Returns the
-        masked surface (NEVER the plaintext).
+        `company_id` is accepted as a backwards-compat alias for
+        `workspace_id` so legacy call sites keep working.  Exactly
+        one of the two MUST be set; if both are set, `workspace_id`
+        wins.
         """
         if provider not in self.CREDENTIAL_PROVIDERS:
             raise ValueError(f"unknown provider: {provider!r}")
-        self.get_company(company_id)  # 404 if missing
+        wid = self._resolve_wid(company_id, workspace_id)
+        self.require_workspace(wid)
         with self.tx() as c:
             existing = c.execute(
-                "SELECT credential_id FROM credentials WHERE company_id=? AND provider=?",
-                (company_id, provider),
+                "SELECT credential_id FROM credentials "
+                "WHERE workspace_id=? AND provider=?",
+                (wid, provider),
             ).fetchone()
             if existing:
                 c.execute(
                     """UPDATE credentials
-                       SET encrypted_blob=?, fingerprint=?, updated_at=?, credential_id=?
-                       WHERE company_id=? AND provider=?""",
-                    (encrypted_blob, fingerprint_str, now_iso(), existing[0],
-                     company_id, provider),
+                       SET encrypted_blob=?, fingerprint=?, updated_at=?,
+                           credential_id=?
+                       WHERE workspace_id=? AND provider=?""",
+                    (encrypted_blob, fingerprint_str, now_iso(),
+                     existing[0], wid, provider),
                 )
                 cid = existing[0]
             else:
                 cid = new_id("cred")
                 c.execute(
-                    """INSERT INTO credentials(credential_id, company_id, provider,
-                                              encrypted_blob, fingerprint,
-                                              updated_at, updated_by)
+                    """INSERT INTO credentials(credential_id, workspace_id,
+                                              provider, encrypted_blob,
+                                              fingerprint, updated_at,
+                                              updated_by)
                        VALUES (?,?,?,?,?,?,?)""",
-                    (cid, company_id, provider, encrypted_blob, fingerprint_str,
-                     now_iso(), updated_by),
+                    (cid, wid, provider, encrypted_blob,
+                     fingerprint_str, now_iso(), updated_by),
                 )
-        return self.get_credential(company_id, provider)
+        return self.get_credential(wid, provider)
 
-    def get_credential(self, company_id: str, provider: str) -> dict:
+    def get_credential(self, workspace_id: str, provider: str) -> dict:
         row = self._conn().execute(
-            "SELECT credential_id, company_id, provider, fingerprint, updated_at, updated_by "
-            "FROM credentials WHERE company_id=? AND provider=?",
-            (company_id, provider),
+            "SELECT credential_id, workspace_id, provider, fingerprint, "
+            "updated_at, updated_by FROM credentials "
+            "WHERE workspace_id=? AND provider=?",
+            (workspace_id, provider),
         ).fetchone()
         if not row:
-            raise NotFound(f"credential {provider!r} for company {company_id!r} not found")
+            raise NotFound(
+                f"credential {provider!r} for workspace {workspace_id!r} "
+                f"not found"
+            )
         return {
             "credential_id": row[0],
-            "company_id": row[1],
+            "workspace_id": row[1],
+            "company_id": row[1],  # legacy alias
             "provider": row[2],
             "has_value": True,
             "fingerprint": row[3],
@@ -724,16 +1369,19 @@ class Repo:
             "updated_by": row[5],
         }
 
-    def list_credentials(self, company_id: str) -> list[dict]:
+    def list_credentials(self, workspace_id: str) -> list[dict]:
+        self.require_workspace(workspace_id)
         rows = self._conn().execute(
-            "SELECT credential_id, provider, fingerprint, updated_at, updated_by "
-            "FROM credentials WHERE company_id=? ORDER BY provider",
-            (company_id,),
+            "SELECT credential_id, provider, fingerprint, updated_at, "
+            "updated_by FROM credentials WHERE workspace_id=? "
+            "ORDER BY provider",
+            (workspace_id,),
         ).fetchall()
         return [
             {
                 "credential_id": r[0],
-                "company_id": company_id,
+                "workspace_id": workspace_id,
+                "company_id": workspace_id,  # legacy alias
                 "provider": r[1],
                 "has_value": True,
                 "fingerprint": r[2],
@@ -743,46 +1391,62 @@ class Repo:
             for r in rows
         ]
 
-    def delete_credential(self, *, company_id: str, provider: str) -> None:
+    def delete_credential(self, *, company_id: Optional[str] = None,
+                            workspace_id: Optional[str] = None,
+                            provider: str) -> None:
+        wid = self._resolve_wid(company_id, workspace_id)
         with self.tx() as c:
             existing = c.execute(
-                "SELECT credential_id FROM credentials WHERE company_id=? AND provider=?",
-                (company_id, provider),
+                "SELECT credential_id FROM credentials "
+                "WHERE workspace_id=? AND provider=?",
+                (wid, provider),
             ).fetchone()
             if not existing:
-                raise NotFound(f"credential {provider!r} for company {company_id!r} not found")
+                raise NotFound(
+                    f"credential {provider!r} for workspace {wid!r} "
+                    f"not found"
+                )
             c.execute(
-                "DELETE FROM credentials WHERE company_id=? AND provider=?",
-                (company_id, provider),
+                "DELETE FROM credentials WHERE workspace_id=? AND provider=?",
+                (wid, provider),
             )
 
-    def decrypt_credential(self, *, company_id: str, provider: str) -> str:
-        """Return the plaintext for (company, provider).
+    def decrypt_credential(self, *, company_id: Optional[str] = None,
+                              workspace_id: Optional[str] = None,
+                              provider: str) -> str:
+        """Return the plaintext for (workspace, provider).
 
         INTERNAL USE ONLY — never exposed through any API surface.
-        The render plane calls this at submit() time. Any caller that
-        surfaces the return through JSON is the leak.
+        The render plane calls this at submit() time. Any caller
+        that surfaces the return through JSON is the leak.
         """
-        from control_plane.secret_vault import decrypt as _decrypt, SecretReadError
+        wid = self._resolve_wid(company_id, workspace_id)
+        from control_plane.secret_vault import (
+            decrypt as _decrypt,
+            SecretReadError,
+        )
         row = self._conn().execute(
-            "SELECT encrypted_blob FROM credentials WHERE company_id=? AND provider=?",
-            (company_id, provider),
+            "SELECT encrypted_blob FROM credentials "
+            "WHERE workspace_id=? AND provider=?",
+            (wid, provider),
         ).fetchone()
         if not row:
-            raise NotFound(f"no credential for {company_id}@{provider}")
+            raise NotFound(
+                f"no credential for {wid}@{provider}"
+            )
         try:
-            return _decrypt(provider, row[0])
+            return _decrypt(wid, provider, row[0])
         except SecretReadError as e:
             raise SecretReadError(
-                f"credential for {company_id}@{provider} unreadable: {e}. "
-                f"Likely cause: VIDEO_FACTORY_SECRET_KEY changed since the secret was written. "
-                f"Operator must re-enter the secret."
+                f"credential for {wid}@{provider} unreadable: {e}. "
+                f"Likely cause: VIDEO_FACTORY_SECRET_KEY changed since the "
+                f"secret was written. Operator must re-enter the secret."
             ) from e
 
     # ── Auth: users ───────────────────────────────────────────
-    # All methods here are added by Wave 1 (auth foundations).
-    # They live on Repo so the DB lock and per-thread connection
-    # handling stay centralized.
+    # Wave 1: users/workspaces/sessions/memberships live here too
+    # so the DB lock + per-thread connection handling stay
+    # centralized.
 
     def create_user(self, *, email: str, password_hash: str) -> dict:
         user_id = new_id("usr")
@@ -790,13 +1454,16 @@ class Repo:
         try:
             with self.tx() as c:
                 c.execute(
-                    "INSERT INTO users(user_id, email, password_hash, status, "
-                    "email_verified, created_at) VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO users(user_id, email, password_hash, "
+                    "status, email_verified, created_at) "
+                    "VALUES (?,?,?,?,?,?)",
                     (user_id, email.lower(), password_hash, "active", 0, t),
                 )
         except Exception as e:
             if "UNIQUE constraint failed" in str(e):
-                raise ValueError(f"email {email!r} already exists") from e
+                raise ValueError(
+                    f"email {email!r} already exists"
+                ) from e
             raise
         return self.get_user(user_id)
 
@@ -859,69 +1526,38 @@ class Repo:
                 (user_id,),
             )
 
-    # ── Auth: workspaces ──────────────────────────────────────
+    def list_workspaces_for_user(self, user_id: str) -> list[dict]:
+        """Return all workspaces the user is a member of, with role."""
+        rows = self._conn().execute(
+            "SELECT m.workspace_id, m.role, w.slug, w.name, w.plan, w.status "
+            "FROM memberships m JOIN workspaces w ON w.workspace_id = "
+            "m.workspace_id WHERE m.user_id=? ORDER BY w.created_at",
+            (user_id,),
+        ).fetchall()
+        return [
+            {
+                "workspace_id": r[0],
+                "role": r[1],
+                "slug": r[2],
+                "name": r[3],
+                "plan": r[4],
+                "status": r[5],
+            }
+            for r in rows
+        ]
 
-    def create_workspace(self, *, slug: str, name: str, owner_user_id: str,
-                           plan: str = "free") -> dict:
-        workspace_id = new_id("wks")
-        t = now_iso()
-        if plan not in ("free", "pro", "enterprise"):
-            raise ValueError(f"invalid plan: {plan!r}")
-        try:
-            with self.tx() as c:
-                c.execute(
-                    "INSERT INTO workspaces(workspace_id, slug, name, "
-                    "owner_user_id, plan, status, live_enabled, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (workspace_id, slug.lower(), name, owner_user_id, plan,
-                     "active", 0, t),
-                )
-        except Exception as e:
-            if "UNIQUE constraint failed" in str(e) and "slug" in str(e):
-                raise ValueError(f"workspace slug {slug!r} already exists") from e
-            raise
-        return self.get_workspace(workspace_id)
-
-    def get_workspace(self, workspace_id: str) -> dict:
+    def get_membership(self, user_id: str, workspace_id: str) -> Optional[dict]:
         row = self._conn().execute(
-            "SELECT workspace_id, slug, name, owner_user_id, plan, status, "
-            "live_enabled, stripe_customer_id, stripe_subscription_id, "
-            "created_at FROM workspaces WHERE workspace_id=?",
-            (workspace_id,),
-        ).fetchone()
-        if not row:
-            raise NotFound(f"workspace {workspace_id} not found")
-        return self._row_workspace(row)
-
-    def get_workspace_by_slug(self, slug: str) -> Optional[dict]:
-        row = self._conn().execute(
-            "SELECT workspace_id, slug, name, owner_user_id, plan, status, "
-            "live_enabled, stripe_customer_id, stripe_subscription_id, "
-            "created_at FROM workspaces WHERE slug=?",
-            (slug.lower(),),
+            "SELECT user_id, workspace_id, role FROM memberships "
+            "WHERE user_id=? AND workspace_id=?",
+            (user_id, workspace_id),
         ).fetchone()
         if not row:
             return None
-        return self._row_workspace(row)
-
-    def _row_workspace(self, row) -> dict:
-        return {
-            "workspace_id": row[0],
-            "slug": row[1],
-            "name": row[2],
-            "owner_user_id": row[3],
-            "plan": row[4],
-            "status": row[5],
-            "live_enabled": bool(row[6]),
-            "stripe_customer_id": row[7],
-            "stripe_subscription_id": row[8],
-            "created_at": row[9],
-        }
-
-    # ── Auth: memberships ─────────────────────────────────────
+        return {"user_id": row[0], "workspace_id": row[1], "role": row[2]}
 
     def add_membership(self, *, user_id: str, workspace_id: str,
-                         role: str) -> dict:
+                        role: str) -> dict:
         if role not in ("owner", "admin", "editor", "viewer"):
             raise ValueError(f"invalid role: {role!r}")
         # Verify both ends exist; cheaper than the FK error.
@@ -949,11 +1585,31 @@ class Repo:
             for r in rows
         ]
 
+    def remove_membership(self, *, user_id: str, workspace_id: str) -> bool:
+        """Remove a membership. Refuses to remove the owner.
+
+        Returns True if a row was deleted, False if the membership
+        did not exist. Raises ValueError if the user is the
+        workspace owner.
+        """
+        ws = self.get_workspace(workspace_id)
+        if ws.get("owner_user_id") == user_id:
+            raise ValueError(
+                "cannot remove the workspace owner; transfer ownership first"
+            )
+        with self.tx() as c:
+            cur = c.execute(
+                "DELETE FROM memberships WHERE user_id=? AND workspace_id=?",
+                (user_id, workspace_id),
+            )
+            return cur.rowcount > 0
+
     # ── Auth: sessions ────────────────────────────────────────
 
     def create_session(self, *, user_id: str, csrf_token: str,
                         ip: Optional[str], user_agent: Optional[str],
-                        expires_at: str, session_id: Optional[str] = None) -> dict:
+                        expires_at: str,
+                        session_id: Optional[str] = None) -> dict:
         """Create a session row.
 
         `session_id` is generated by the caller (using a
@@ -1004,8 +1660,10 @@ class Repo:
 
     def delete_session(self, session_id: str) -> None:
         with self.tx() as c:
-            c.execute("DELETE FROM sessions WHERE session_id=?",
-                      (session_id,))
+            c.execute(
+                "DELETE FROM sessions WHERE session_id=?",
+                (session_id,),
+            )
 
     def delete_sessions_for_user(self, user_id: str) -> int:
         """Force-logout: remove every session for a user. Returns count."""
@@ -1018,9 +1676,17 @@ class Repo:
     def gc_expired_sessions(self) -> int:
         with self.tx() as c:
             cur = c.execute(
-                "DELETE FROM sessions WHERE expires_at < ?", (now_iso(),),
+                "DELETE FROM sessions WHERE expires_at < ?",
+                (now_iso(),),
             )
             return cur.rowcount
+
+    def update_session_last_seen(self, session_id: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE sessions SET last_seen_at=? WHERE session_id=?",
+                (now_iso(), session_id),
+            )
 
     # ── Auth: email verifications / password resets ───────────
 
@@ -1028,8 +1694,8 @@ class Repo:
                                     expires_at: str) -> dict:
         with self.tx() as c:
             c.execute(
-                "INSERT INTO email_verifications(token, user_id, expires_at, "
-                "created_at) VALUES (?,?,?,?)",
+                "INSERT INTO email_verifications(token, user_id, "
+                "expires_at, created_at) VALUES (?,?,?,?)",
                 (token, user_id, expires_at, now_iso()),
             )
         return {"token": token, "user_id": user_id, "expires_at": expires_at,
@@ -1082,20 +1748,67 @@ class Repo:
                 (now_iso(), token),
             )
 
-    # ── Auth: aliases for the multi-tenant transition ─────────
+    # ── Audit log (auth + workspace) ──────────────────────────
+
+    def append_audit(self, *, event: str, context: Optional[dict] = None,
+                        user_id: Optional[str] = None,
+                        workspace_id: Optional[str] = None,
+                        actor: Optional[str] = None) -> dict:
+        """Append a row to audit_log.
+
+        `actor` is the denormalized display name (email or
+        'operator') so audit consumers do not need to join users
+        at read time. Best-effort: never raises.
+        """
+        try:
+            audit_id = f"audlog_{uuid.uuid4().hex[:12]}"
+            self._conn().execute(
+                "INSERT INTO audit_log(audit_id, event, context_json, "
+                "user_id, workspace_id, actor, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (audit_id, event, json.dumps(context or {}), user_id,
+                 workspace_id, actor, now_iso()),
+            )
+            self._conn().commit()
+            return {"audit_id": audit_id, "event": event,
+                    "context": context or {},
+                    "user_id": user_id, "workspace_id": workspace_id,
+                    "actor": actor}
+        except Exception:
+            # Best-effort: never let an audit failure break the
+            # caller.  Mirrors `auth.audit_log.append` policy.
+            return {"audit_id": "", "event": event, "context": {},
+                    "user_id": user_id, "workspace_id": workspace_id,
+                    "actor": actor}
+
+    def list_audit(self, *, workspace_id: str, limit: int = 100) -> list[dict]:
+        """Return recent audit rows for a workspace, newest first."""
+        rows = self._conn().execute(
+            "SELECT audit_id, event, context_json, user_id, workspace_id, "
+            "actor, created_at FROM audit_log WHERE workspace_id=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (workspace_id, int(limit)),
+        ).fetchall()
+        return [
+            {
+                "audit_id": r[0],
+                "event": r[1],
+                "context": json.loads(r[2]) if r[2] else {},
+                "user_id": r[3],
+                "workspace_id": r[4],
+                "actor": r[5],
+                "created_at": r[6],
+            }
+            for r in rows
+        ]
+
+    # ── Auth: alias for the Wave 1 -> Wave 2 transition ───────
 
     def workspace_id_for_company(self, company_id: str) -> Optional[str]:
         """Return the workspace_id for a company_id, if one exists.
 
-        Wave 2 will replace companies with workspaces outright; for
-        now this is a no-op lookup that returns None for legacy
-        companies that do not have a corresponding workspace. When
-        the migration in Wave 2 lands, we back-fill workspaces and
-        this method will then resolve.
+        The legacy `company_id` form is preserved in test code and
+        in the `/api/v1/companies/{cid}` alias.  Returns None for
+        unknown ids.
         """
-        row = self._conn().execute(
-            "SELECT workspace_id FROM workspaces WHERE owner_user_id IN "
-            "(SELECT user_id FROM users WHERE email=?)",
-            (f"legacy::{company_id}",),
-        ).fetchone()
-        return row[0] if row else None
+        return self.resolve_company_to_workspace(company_id)

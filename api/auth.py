@@ -442,6 +442,151 @@ def build_router(repo: Repo) -> APIRouter:
         sid = request.cookies.get(SESSION_COOKIE_NAME) or ""
         return {"csrf_token": derive_csrf_token(sid)}
 
+    # ── Wave 2: workspace switching + active-workspace surfacing
+
+    @router.get("/me/active-workspace")
+    async def me_active_workspace(
+        request: Request,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        """Return the workspace the current request resolves to.
+
+        Resolution order:
+        1. X-Workspace-Id header (if user is a member).
+        2. Session's `active_workspace_id`.
+        3. The user's oldest membership.
+        """
+        from auth.workspace_resolver import resolve_active_workspace
+        try:
+            ws = resolve_active_workspace(request)
+        except HTTPException as e:
+            raise e
+        return {
+            "workspace_id": ws["workspace_id"],
+            "slug": ws["slug"],
+            "name": ws["name"],
+            "plan": ws.get("plan", "free"),
+            "status": ws.get("status", "active"),
+            "live_enabled": ws.get("live_enabled", False),
+        }
+
+    @router.post("/switch-workspace")
+    async def switch_workspace(
+        request: Request, payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        """Switch the active workspace for the current session.
+
+        Body: { "workspace_id": "wks_..." }.
+        The user MUST already be a member of the target workspace
+        (admins cannot grant access via this endpoint; memberships
+        are managed by a separate flow).
+        """
+        from auth.dependencies import require_csrf
+        from auth.session import SESSION_COOKIE_NAME
+        from auth.workspace_resolver import set_session_active_workspace
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        target = (payload.get("workspace_id") or "").strip()
+        if not target:
+            raise HTTPException(400, "workspace_id required")
+        # Membership check
+        m = repo.get_membership(ctx.user_id, target)
+        if not m:
+            raise HTTPException(403, "not a member of this workspace")
+        try:
+            ws = repo.get_workspace(target)
+        except Exception:
+            raise HTTPException(404, f"workspace {target} not found")
+        if ws.get("status") == "disabled":
+            raise HTTPException(503, "workspace is disabled")
+        sid = request.cookies.get(SESSION_COOKIE_NAME)
+        if not sid:
+            raise HTTPException(401, "no session cookie")
+        set_session_active_workspace(repo, sid, target)
+        audit_append(
+            repo, event="auth.workspace_switched",
+            context={"from": None, "to": target},
+            user_id=ctx.user_id, workspace_id=target,
+            actor=ctx.email,
+        )
+        return {
+            "workspace_id": ws["workspace_id"],
+            "slug": ws["slug"],
+            "name": ws["name"],
+            "plan": ws.get("plan", "free"),
+        }
+
+    @router.post("/workspaces/{workspace_id}/members")
+    async def add_member(
+        request: Request, workspace_id: str, payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        """Owner/admin adds a member to a workspace.
+
+        Body: { "email": "...", "role": "editor"|"viewer"|"admin" }.
+        Returns 403 if the caller is not owner/admin of the
+        target workspace.
+        """
+        from auth.dependencies import require_csrf
+        from auth.roles import has_min_role
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        # Caller must be at least admin of the target workspace.
+        m = repo.get_membership(ctx.user_id, workspace_id)
+        if not m or not has_min_role(m["role"], "admin"):
+            raise HTTPException(403, "requires admin role on this workspace")
+        email = (payload.get("email") or "").strip().lower()
+        role = (payload.get("role") or "").strip()
+        if not email or role not in ("admin", "editor", "viewer"):
+            raise HTTPException(400, "email and role (admin|editor|viewer) required")
+        target_user = repo.get_user_by_email(email)
+        if not target_user:
+            raise HTTPException(404, f"user {email!r} not found")
+        rec = repo.add_membership(
+            user_id=target_user["user_id"],
+            workspace_id=workspace_id,
+            role=role,
+        )
+        audit_append(
+            repo, event="auth.member_added",
+            context={"email": email, "role": role},
+            user_id=ctx.user_id, workspace_id=workspace_id,
+            actor=ctx.email,
+        )
+        return rec
+
+    @router.delete("/workspaces/{workspace_id}/members/{user_id}")
+    async def remove_member(
+        request: Request, workspace_id: str, user_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        """Owner/admin removes a member from a workspace.
+
+        Refuses to remove the workspace owner.
+        """
+        from auth.dependencies import require_csrf
+        from auth.roles import has_min_role
+        require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
+        m = repo.get_membership(ctx.user_id, workspace_id)
+        if not m or not has_min_role(m["role"], "admin"):
+            raise HTTPException(403, "requires admin role on this workspace")
+        try:
+            removed = repo.remove_membership(
+                user_id=user_id, workspace_id=workspace_id,
+            )
+        except ValueError as e:
+            # Refused because the target is the owner.
+            raise HTTPException(400, str(e))
+        if not removed:
+            raise HTTPException(404, "membership not found")
+        audit_append(
+            repo, event="auth.member_removed",
+            context={"target_user_id": user_id},
+            user_id=ctx.user_id, workspace_id=workspace_id,
+            actor=ctx.email,
+        )
+        return {"removed": True, "user_id": user_id,
+                "workspace_id": workspace_id}
+
     # ── legacy /api/v1/companies/{cid} alias ─────────────────
     # Wave 1: keep the cid endpoint working by returning a body
     # whose `workspace_id` is the resolved workspace id (or the

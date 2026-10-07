@@ -486,7 +486,7 @@ def test_job_runner_assembly_skip_does_not_fail_job(tmp_path):
         # Create a company + job
         c = repo.create_company(slug="acme", name="Acme")
         job = repo.create_job(
-            c["company_id"], topic="t", language="en",
+            company_id=c["company_id"], topic="t", language="en",
             duration_seconds=10, platforms=["tiktok"], aspect_ratio="9:16",
             count=1, render_profile="mock",
         )

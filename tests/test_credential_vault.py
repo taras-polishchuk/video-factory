@@ -1,4 +1,9 @@
-"""Tests for the per-company credential vault + UI-facing API."""
+"""Tests for the per-workspace credential vault + UI-facing API.
+
+Wave 2: the vault now binds the per-blob HMAC tag to a
+workspace_id.  Tests use the new ``encrypt(wid, provider, value)``
+/ ``decrypt(wid, provider, blob)`` signature.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -11,6 +16,8 @@ from fastapi.testclient import TestClient
 
 from control_plane.secret_vault import (
     SecretKeyMissing,
+    WorkspaceMismatch,
+    ProviderMismatch,
     encrypt,
     decrypt,
     fingerprint as fp,
@@ -30,34 +37,38 @@ def key_env(monkeypatch):
     return key
 
 
+# Test workspace id used by vault-only tests (no repo required).
+_TEST_WID = "wks_testvault"
+
+
 # ── Vault primitives ─────────────────────────────────────────────
 
 
 def test_encrypt_decrypt_round_trip(key_env):
-    blob = encrypt("heygen_direct", "secret_value_xyz")
-    assert decrypt("heygen_direct", blob) == "secret_value_xyz"
+    blob = encrypt(_TEST_WID, "heygen_direct", "secret_value_xyz")
+    assert decrypt(_TEST_WID, "heygen_direct", blob) == "secret_value_xyz"
 
 
 def test_encrypt_rejects_empty(key_env):
     with pytest.raises(ValueError):
-        encrypt("heygen_direct", "")
+        encrypt(_TEST_WID, "heygen_direct", "")
 
 
 def test_decrypt_rejects_provider_mismatch(key_env):
-    blob = encrypt("heygen_direct", "secret_value_xyz")
-    with pytest.raises(Exception):
-        decrypt("comfy_cloud", blob)
+    blob = encrypt(_TEST_WID, "heygen_direct", "secret_value_xyz")
+    with pytest.raises(ProviderMismatch):
+        decrypt(_TEST_WID, "comfy_cloud", blob)
 
 
 def test_decrypt_rejects_short_blob(key_env):
     with pytest.raises(Exception):
-        decrypt("heygen_direct", b"short")
+        decrypt(_TEST_WID, "heygen_direct", b"short")
 
 
 def test_vault_refuses_without_key(monkeypatch):
     monkeypatch.delenv("VIDEO_FACTORY_SECRET_KEY", raising=False)
     with pytest.raises(SecretKeyMissing):
-        encrypt("heygen_direct", "x")
+        encrypt(_TEST_WID, "heygen_direct", "x")
 
 
 def test_fingerprint_is_stable_short_hash():
@@ -86,7 +97,7 @@ def test_repo_credential_round_trip(tmp_path: pathlib.Path, key_env):
     from core.repo import Repo
     repo = Repo(str(tmp_path / "r.db"))
     c = repo.create_company(slug="acme", name="Acme")
-    blob = encrypt("heygen_direct", "test_secret_12345")
+    blob = encrypt(c["company_id"], "heygen_direct", "test_secret_12345")
     rec = repo.upsert_credential(
         company_id=c["company_id"], provider="heygen_direct",
         fingerprint_str=fp("test_secret_12345"),
@@ -118,12 +129,12 @@ def test_repo_credential_upsert_replaces_existing(tmp_path: pathlib.Path, key_en
     from core.repo import Repo
     repo = Repo(str(tmp_path / "r.db"))
     c = repo.create_company(slug="acme", name="Acme")
-    blob1 = encrypt("heygen_direct", "first_secret")
+    blob1 = encrypt(c["company_id"], "heygen_direct", "first_secret")
     repo.upsert_credential(
         company_id=c["company_id"], provider="heygen_direct",
         fingerprint_str=fp("first_secret"), encrypted_blob=blob1, updated_by="alice",
     )
-    blob2 = encrypt("heygen_direct", "second_secret")
+    blob2 = encrypt(c["company_id"], "heygen_direct", "second_secret")
     rec = repo.upsert_credential(
         company_id=c["company_id"], provider="heygen_direct",
         fingerprint_str=fp("second_secret"), encrypted_blob=blob2, updated_by="alice",
@@ -138,17 +149,18 @@ def test_repo_credential_upsert_replaces_existing(tmp_path: pathlib.Path, key_en
     assert plain == "second_secret"
 
 
-def test_repo_credential_cross_company_isolation(tmp_path: pathlib.Path, key_env):
+def test_repo_credential_cross_workspace_isolation(tmp_path: pathlib.Path, key_env):
+    """Workspace A's credential is NOT visible to workspace B."""
     from core.repo import Repo, NotFound
     repo = Repo(str(tmp_path / "r.db"))
     a = repo.create_company(slug="a", name="A")
     b = repo.create_company(slug="b", name="B")
-    blob = encrypt("heygen_direct", "secret_for_a")
+    blob = encrypt(a["company_id"], "heygen_direct", "secret_for_a")
     repo.upsert_credential(
         company_id=a["company_id"], provider="heygen_direct",
         fingerprint_str=fp("secret_for_a"), encrypted_blob=blob, updated_by="alice",
     )
-    # Company B has no credential for heygen_direct
+    # Workspace B has no credential for heygen_direct
     assert repo.list_credentials(b["company_id"]) == []
     with pytest.raises(NotFound):
         repo.decrypt_credential(
@@ -160,7 +172,7 @@ def test_repo_credential_delete(tmp_path: pathlib.Path, key_env):
     from core.repo import Repo, NotFound
     repo = Repo(str(tmp_path / "r.db"))
     c = repo.create_company(slug="acme", name="Acme")
-    blob = encrypt("heygen_direct", "secret_x")
+    blob = encrypt(c["company_id"], "heygen_direct", "secret_x")
     repo.upsert_credential(
         company_id=c["company_id"], provider="heygen_direct",
         fingerprint_str=fp("secret_x"), encrypted_blob=blob, updated_by="alice",

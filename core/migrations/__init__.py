@@ -150,6 +150,22 @@ MIGRATIONS: List[Tuple[str, str, str]] = [
         # bootstrap. See core/repo.py.
         "SELECT 1;",
     ),
+    (
+        "005",
+        "rename company_id -> workspace_id across legacy tables; "
+        "backfill from companies into workspaces; drop companies",
+        # This migration is applied via _apply_migration_005() in
+        # core/repo.py because SQLite has no RENAME COLUMN on older
+        # versions and the backfill must touch multiple tables in a
+        # deterministic order. The empty SQL here is intentional.
+        "SELECT 1;",
+    ),
+    (
+        "006",
+        "audit_log.actor column (denormalized actor display name)",
+        # Handled by _extend_audit_log_columns() in core/repo.py.
+        "SELECT 1;",
+    ),
 ]
 
 

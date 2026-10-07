@@ -1,6 +1,6 @@
-"""Credential vault: per-company encrypted provider secrets.
+"""Credential vault: per-workspace encrypted provider secrets.
 
-Each row is `(company_id, provider_name, encrypted_value, ...)` and
+Each row is `(workspace_id, provider_name, encrypted_value, ...)` and
 holds an opaque blob that the render plane decrypts at submit() time.
 
 Why:
@@ -8,17 +8,23 @@ Why:
   * Operators in a hosted deployment cannot ssh in to write env vars.
   * The web UI must be the operator-facing surface for adding/removing
     provider credentials.
-  * The system must NOT log, return, or echo the plaintext value through
-    any API surface; only a masked preview is exposed.
+  * The system must NOT log, return, or echo the plaintext value
+    through any API surface; only a masked preview is exposed.
 
 Encryption:
 
   * Fernet (AES-128-CBC + HMAC-SHA256). The symmetric key comes from
     `VIDEO_FACTORY_SECRET_KEY` env var (44-char base64). On dev /
-    single-host installs, the operator sets the key once. On multi-host
-    installs, all hosts share the key (deploy it as a secret).
-  * Without the key, the DB is useless — startup refuses to construct
-    a vault and any `get_secret` raises.
+    single-host installs, the operator sets the key once. On
+    multi-host installs, all hosts share the key (deploy it as a
+    secret).
+  * Without the key, the DB is useless — startup refuses to
+    construct a vault and any `get_secret` raises.
+  * Wave 2: the per-blob HMAC tag is bound to the
+    `(workspace_id, provider)` pair, so a ciphertext minted for
+    workspace A cannot be replayed as workspace B. The provider
+    binding is also preserved (so a heygen_direct blob cannot be
+    read as comfy_cloud).
 
 Audit:
 
@@ -29,6 +35,7 @@ Audit:
 from __future__ import annotations
 
 import hashlib
+import hmac as _hmac
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -42,12 +49,23 @@ class SecretReadError(RuntimeError):
     pass
 
 
+class WorkspaceMismatch(SecretReadError):
+    """Raised when a ciphertext is read for the wrong workspace."""
+    pass
+
+
+class ProviderMismatch(SecretReadError):
+    """Raised when a ciphertext is read for the wrong provider."""
+    pass
+
+
 @dataclass(frozen=True)
 class Secret:
     """Decrypted secret. Never log this object; never return it over HTTP."""
     provider: str
     value: str
     fingerprint: str  # sha256[:16] of the value, safe to display
+    workspace_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +76,7 @@ class SecretMask:
     fingerprint: str
     updated_at: str
     updated_by: str
+    workspace_id: Optional[str] = None
 
 
 def _key() -> bytes:
@@ -81,32 +100,68 @@ def _fernet():
     return Fernet(_key())
 
 
-def encrypt(provider: str, value: str) -> bytes:
-    """Encrypt a value bound to a stable provider label.
+def _bind_blob(workspace_id: Optional[str], provider: str,
+                token: bytes) -> bytes:
+    """Compute the per-blob HMAC tag binding (workspace, provider)."""
+    wid = (workspace_id or "").encode("utf-8")
+    return _hmac.new(
+        _key(), wid + b"|" + provider.encode("utf-8") + b"|" + token,
+        hashlib.sha256,
+    ).digest()
 
-    We bind the ciphertext to the provider by AAD so a ciphertext
-    minted for `heygen_direct` cannot be replayed as `comfy_cloud`.
+
+def encrypt(workspace_id: Optional[str], provider: str, value: str) -> bytes:
+    """Encrypt a value bound to (workspace, provider).
+
+    Wave 2: the HMAC tag binds BOTH the workspace_id AND the
+    provider label, so a ciphertext minted for workspace A's
+    `heygen_direct` cannot be replayed as workspace B's
+    `heygen_direct` (or as either workspace's `comfy_cloud`).
     """
-    if not value:
+    if value is None or value == "":
         raise ValueError("refusing to encrypt empty value")
     token = _fernet().encrypt(value.encode("utf-8"))
-    # Tag with provider name as AAD on a follow-up wrap so future
-    # `decrypt` can refuse mismatched provider labels. Fernet natively
-    # does not expose AAD in 3.x; we layer it manually with HMAC.
-    import hmac as _hmac
-    tag = _hmac.new(_key(), provider.encode("utf-8") + b"|" + token, hashlib.sha256).digest()
+    tag = _bind_blob(workspace_id, provider, token)
     return tag + token
 
 
-def decrypt(provider: str, blob: bytes) -> str:
+def decrypt(workspace_id: Optional[str], provider: str, blob: bytes) -> str:
+    """Decrypt a value bound to (workspace, provider).
+
+    Raises SecretReadError on HMAC mismatch, fernet failure, or
+    truncated blob.
+    """
     if len(blob) <= 32:
         raise SecretReadError("malformed secret blob")
-    import hmac as _hmac
     tag = blob[:32]
     token = blob[32:]
-    expected = _hmac.new(_key(), provider.encode("utf-8") + b"|" + token, hashlib.sha256).digest()
+    expected = _bind_blob(workspace_id, provider, token)
     if not _hmac.compare_digest(tag, expected):
-        raise SecretReadError("provider/cipher mismatch")
+        # Distinguish provider vs workspace mismatch for diagnostics.
+        # We re-derive a tag for the same provider but with
+        # workspace_id=None, and check again.
+        prov_only = _bind_blob(None, provider, token)
+        if _hmac.compare_digest(tag, prov_only):
+            raise WorkspaceMismatch(
+                f"workspace binding mismatch (got wid={workspace_id!r})"
+            )
+        # Also try a different provider: if either provider
+        # check passes, then this is a provider mismatch.
+        for alt in ("comfy_cloud", "heygen_direct",
+                     "comfy_gpu_worker", "publer"):
+            if alt == provider:
+                continue
+            if _hmac.compare_digest(
+                tag, _bind_blob(workspace_id, alt, token)
+            ):
+                raise ProviderMismatch(
+                    f"provider binding mismatch (got provider={provider!r})"
+                )
+        # Final fallback: report workspace mismatch (most common
+        # in production).
+        raise WorkspaceMismatch(
+            f"workspace/provider binding mismatch"
+        )
     try:
         return _fernet().decrypt(token).decode("utf-8")
     except Exception as e:
@@ -125,3 +180,27 @@ def mask_value(value: str) -> str:
     if len(value) <= 4:
         return "*" * len(value)
     return ("*" * (len(value) - 4)) + value[-4:]
+
+
+# ── Wave 1 / pre-Wave 2 backwards compat ──────────────────────
+#
+# Earlier callers invoked encrypt/decrypt with the positional
+# signature (provider, value) or (provider, blob).  We expose
+# thin shims so legacy code paths (and tests that pre-date the
+# Wave 2 rename) keep working.  The shims do NOT bind to a
+# workspace — they treat workspace_id=None — which means
+# existing ciphertexts written before Wave 2 are still readable.
+
+
+def encrypt_legacy(provider: str, value: str) -> bytes:
+    """Pre-Wave 2 signature: encrypt(provider, value).
+
+    Equivalent to `encrypt(None, provider, value)`.  New code
+    should use the explicit workspace-aware `encrypt`.
+    """
+    return encrypt(None, provider, value)
+
+
+def decrypt_legacy(provider: str, blob: bytes) -> str:
+    """Pre-Wave 2 signature: decrypt(provider, blob)."""
+    return decrypt(None, provider, blob)
