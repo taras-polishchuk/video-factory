@@ -166,6 +166,25 @@ MIGRATIONS: List[Tuple[str, str, str]] = [
         # Handled by _extend_audit_log_columns() in core/repo.py.
         "SELECT 1;",
     ),
+    (
+        "007",
+        "oauth_identities table (Wave 4 OIDC: Google + GitHub sign-in)",
+        """
+        CREATE TABLE IF NOT EXISTS oauth_identities (
+            oauth_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_sub TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (provider, provider_sub),
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_identities_user
+            ON oauth_identities(user_id);
+        CREATE INDEX IF NOT EXISTS idx_oauth_identities_provider
+            ON oauth_identities(provider, provider_sub);
+        """,
+    ),
 ]
 
 

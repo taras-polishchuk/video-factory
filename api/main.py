@@ -787,6 +787,22 @@ def create_app(*, repo: Optional[Repo] = None,
     _auth_router = _build_auth_router(repo)
     app.include_router(_auth_router)
 
+    # ── Wave 4 OIDC router (Google + GitHub) ────────────────
+    # Only registered if at least one provider has both
+    # *_OIDC_CLIENT_ID and *_OIDC_CLIENT_SECRET set in env;
+    # otherwise it stays dormant and tests can poke the helpers
+    # directly. This keeps offline / CI environments free of
+    # dangling 503s.
+    try:
+        from api.oidc import build_router as _build_oidc_router
+        _oidc_router = _build_oidc_router(repo)
+        app.include_router(_oidc_router)
+    except Exception as _e:
+        # Surface the failure on /health for operator debugging.
+        @app.get("/_oidc_init_error")
+        def _oidc_init_error() -> dict:
+            return {"ok": False, "error": str(_e)}
+
     # Set-Cookie middleware: the auth router stashes the cookie
     # value on request.state and the middleware writes it on the
     # way out. This keeps the route signatures clean.

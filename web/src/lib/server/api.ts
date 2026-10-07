@@ -17,6 +17,10 @@ export interface ApiRequestOpts {
 	body?: unknown;
 	cookie?: string; // raw "vf_session=..." value
 	headers?: Record<string, string>;
+	// Pass-through for OIDC /start which returns a 302.
+	// We forward this to fetch() so SvelteKit never follows
+	// the redirect (the browser needs the Location URL).
+	redirect?: RequestRedirect;
 }
 
 export class ApiError extends Error {
@@ -39,6 +43,7 @@ export async function api_request<T = unknown>(
 	const init: RequestInit = {
 		method: opts.method || "GET",
 		headers,
+		redirect: opts.redirect || "follow",
 	};
 	if (opts.body !== undefined) {
 		init.body = opts.body instanceof FormData
@@ -46,6 +51,15 @@ export async function api_request<T = unknown>(
 			: JSON.stringify(opts.body);
 	}
 	const r = await fetch(API_BASE + path, init);
+	if (r.status >= 300 && r.status < 400) {
+		// OIDC /start returns 302 to the provider authorize URL.
+		// Surface the Location header to the caller as
+		// `{ location: "..." }` so the UI can decide whether to
+		// follow it (window.location = url) or open in a popup.
+		if (opts.redirect === "manual") {
+			return { location: r.headers.get("location") || "" } as T;
+		}
+	}
 	if (!r.ok) {
 		let detail = r.statusText;
 		try {
@@ -97,6 +111,28 @@ export const Auth = {
 			method: "POST", cookie, body: { workspace_id },
 			headers: { "x-csrf-token": csrf_for_cookie(cookie) },
 		}),
+	// Wave 4 OIDC: trigger the Google / GitHub authorize redirect.
+	// The browser follows the 302 returned by /start; this wrapper
+	// returns the Location URL so the UI can either open it
+	// directly (window.location = url) or open it in a popup.
+	oidc_start: (provider: "google" | "github", cookie?: string) =>
+		api_request<{ location: string }>(
+			`/auth/oauth/${provider}/start`,
+			{ method: "GET", cookie, redirect: "manual" },
+		),
+	// Wave 4 OIDC: list every linked provider for the current user.
+	oidc_identities: (cookie: string) =>
+		api_request<{
+			identities: Array<{ provider: string; provider_sub: string; created_at: string }>;
+		}>("/auth/oauth/identities", { cookie }),
+	// Wave 4 OIDC: disconnect a previously linked identity.
+	oidc_disconnect: (cookie: string, provider: string, provider_sub: string) =>
+		api_request<{ ok: true }>(
+			`/auth/oauth/${provider}/disconnect`, {
+				method: "POST", cookie,
+				body: { provider_sub },
+				headers: { "x-csrf-token": csrf_for_cookie(cookie) },
+			}),
 };
 
 // Mirrors the FastAPI HMAC: csrftok = hmac_sha256(secret, session_id).

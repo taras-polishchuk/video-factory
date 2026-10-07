@@ -2102,3 +2102,129 @@ class Repo:
         unknown ids.
         """
         return self.resolve_company_to_workspace(company_id)
+
+    # ── Wave 4 OIDC helpers ─────────────────────────────────
+
+    def create_oauth_identity(
+        self, *, user_id: str, provider: str, provider_sub: str,
+    ) -> dict:
+        """Link an OIDC identity (provider + sub) to an existing user.
+
+        Idempotent: if the (provider, provider_sub) pair is already
+        linked to `user_id`, returns the existing row. If it is
+        linked to a DIFFERENT user, raises ValueError so the caller
+        can refuse to steal another account's identity.
+        """
+        provider = provider.lower()
+        with self.tx() as c:
+            existing = c.execute(
+                "SELECT oauth_id, user_id, provider, provider_sub, "
+                "created_at FROM oauth_identities WHERE provider=? AND "
+                "provider_sub=?",
+                (provider, provider_sub),
+            ).fetchone()
+            if existing:
+                if existing[1] != user_id:
+                    raise ValueError(
+                        f"OIDC identity {provider}:{provider_sub} is already "
+                        f"linked to user {existing[1]} (not {user_id})"
+                    )
+                return {
+                    "oauth_id": existing[0],
+                    "user_id": existing[1],
+                    "provider": existing[2],
+                    "provider_sub": existing[3],
+                    "created_at": existing[4],
+                }
+            oauth_id = new_id("oauth")
+            c.execute(
+                "INSERT INTO oauth_identities(oauth_id, user_id, provider, "
+                "provider_sub, created_at) VALUES (?,?,?,?,?)",
+                (oauth_id, user_id, provider, provider_sub, now_iso()),
+            )
+            return {
+                "oauth_id": oauth_id,
+                "user_id": user_id,
+                "provider": provider,
+                "provider_sub": provider_sub,
+                "created_at": now_iso(),
+            }
+
+    def get_oauth_identity(
+        self, *, provider: str, provider_sub: str,
+    ) -> Optional[dict]:
+        """Return the oauth_identity row for (provider, provider_sub), or None."""
+        row = self._conn().execute(
+            "SELECT oauth_id, user_id, provider, provider_sub, created_at "
+            "FROM oauth_identities WHERE provider=? AND provider_sub=?",
+            (provider.lower(), provider_sub),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "oauth_id": row[0],
+            "user_id": row[1],
+            "provider": row[2],
+            "provider_sub": row[3],
+            "created_at": row[4],
+        }
+
+    def list_oauth_identities_for_user(self, user_id: str) -> list[dict]:
+        """Return every oauth identity linked to this user."""
+        rows = self._conn().execute(
+            "SELECT oauth_id, provider, provider_sub, created_at "
+            "FROM oauth_identities WHERE user_id=? ORDER BY created_at",
+            (user_id,),
+        ).fetchall()
+        return [
+            {
+                "oauth_id": r[0],
+                "provider": r[1],
+                "provider_sub": r[2],
+                "created_at": r[3],
+            }
+            for r in rows
+        ]
+
+    def delete_oauth_identity(self, *, user_id: str, provider: str,
+                              provider_sub: str) -> bool:
+        """Disconnect a (provider, provider_sub) from the user.
+
+        Refuses to remove the LAST identity for a user that has no
+        password set — without *something* to authenticate with, the
+        account becomes permanently unreachable.  Raises ValueError
+        if the disconnect would orphan the account.
+        """
+        provider = provider.lower()
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT oauth_id FROM oauth_identities WHERE user_id=? AND "
+                "provider=? AND provider_sub=?",
+                (user_id, provider, provider_sub),
+            ).fetchone()
+            if not row:
+                return False
+            user_row = c.execute(
+                "SELECT password_hash FROM users WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            password_disabled = (
+                user_row is None
+                or user_row[0] is None
+                or user_row[0] == "disabled"
+            )
+            if password_disabled:
+                remaining = c.execute(
+                    "SELECT COUNT(*) FROM oauth_identities WHERE user_id=?",
+                    (user_id,),
+                ).fetchone()[0]
+                if remaining <= 1:
+                    raise ValueError(
+                        "cannot remove last authentication method: "
+                        "user has no password set"
+                    )
+            c.execute(
+                "DELETE FROM oauth_identities WHERE oauth_id=?",
+                (row[0],),
+            )
+            return True

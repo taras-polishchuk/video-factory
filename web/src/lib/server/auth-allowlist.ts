@@ -28,6 +28,11 @@ const PREFIX_PUBLIC: ReadonlyArray<string> = [
 	"/api/v1/auth/",
 	"/api/v1/webhooks/",
 	"/verify/",
+	// Wave 4: OIDC sign-in / callback / disconnect — must be
+	// reachable without a session cookie. /start and /callback
+	// issue the session on success; /disconnect requires one
+	// (enforced by the FastAPI handler, not the gate).
+	"/auth/oauth/",
 ];
 
 function normalize(pathname: string): string {
