@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from core.repo import Forbidden, NotFound, Repo
 from core.runners import JobRunner, Singleton
+from auth.dependencies import get_current_user  # noqa: E402  (module-scope)
 
 
 def create_app(*, repo: Optional[Repo] = None,
@@ -89,6 +90,17 @@ def create_app(*, repo: Optional[Repo] = None,
             "mock_only": True,
         }
 
+    # Wave 5: surface a startup warning when the artifact HMAC
+    # key is missing in env (i.e. we're using the static dev
+    # fallback).  This is intentionally informational — the dev
+    # fallback still binds workspace_ids to blobs, but a key
+    # shared across environments is unsafe.
+    from control_plane import artifact_hmac as _ahmac
+    _warn = _ahmac.warn_if_dev_key_in_use()
+    if _warn:
+        import logging as _lg
+        _lg.getLogger("video_factory.startup").warning(_warn)
+
     @app.get("/api/v1/spec")
     async def spec():
         return {"openapi_url": "/openapi.json", "docs_url": "/docs"}
@@ -100,7 +112,6 @@ def create_app(*, repo: Optional[Repo] = None,
 
     def _resolve_ws(request: Request, wid: str):
         """Resolve a workspace from a path param, with 401/403/404."""
-        from auth.dependencies import get_current_user
         try:
             ctx = get_current_user(request)
         except HTTPException as e:
@@ -116,6 +127,26 @@ def create_app(*, repo: Optional[Repo] = None,
         if ws.get("status") == "disabled":
             raise HTTPException(503, "workspace is disabled")
         return ctx, ws
+
+    def _find_owner_workspace(repo, user_id: str) -> Optional[str]:
+        """Return the first workspace_id where `user_id` is owner.
+
+        Used by the Wave 5 admin/keys endpoints to enforce owner-
+        only access.  Returns None if the caller is not an owner
+        of any workspace, which the caller translates to 403.
+        """
+        try:
+            memberships = repo._conn().execute(  # noqa: SLF001
+                "SELECT workspace_id, role FROM memberships "
+                "WHERE user_id=?",
+                (user_id,),
+            ).fetchall()
+        except Exception:
+            return None
+        for wid, role in memberships:
+            if role == "owner":
+                return wid
+        return None
 
     @app.get("/api/v1/workspaces/{wid}/companies")
     async def ws_list_companies(request: Request, wid: str):
@@ -205,6 +236,15 @@ def create_app(*, repo: Optional[Repo] = None,
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         checksum = hashlib.sha256(data).hexdigest()
+        # Wave 5: bind this blob to its workspace via an HMAC
+        # sidecar so a workspace cannot read another workspace's
+        # blobs even with shell access to artifacts/storage/.
+        from control_plane import artifact_hmac
+        artifact_hmac.write_sidecar(
+            storage_root=storage_root,
+            storage_key=storage_key,
+            workspace_id=wid,
+        )
         return repo.create_asset(
             workspace_id=wid,
             kind=kind,
@@ -295,6 +335,60 @@ def create_app(*, repo: Optional[Repo] = None,
         from auth.audit_log import list_for_workspace
         return list_for_workspace(repo, workspace_id=wid, limit=limit)
 
+    # ── Wave 5: master-key rotation (admin, owner only) ───────
+    #
+    # Two endpoints:
+    #   GET  /api/v1/admin/keys/status         -> rotation state
+    #   POST /api/v1/admin/keys/rotate         -> run the rotation
+    #
+    # Owner-only because the new key is sourced from the request
+    # body and would otherwise let any caller re-encrypt the DB
+    # (and break the operator's backups in the process).  The
+    # brief explicitly says owner-only.
+
+    @app.get("/api/v1/admin/keys/status")
+    async def keys_status(request: Request,
+                          ctx: AuthContext = Depends(get_current_user)):
+        # Owner-only check at the workspace level: pick ANY
+        # workspace the caller owns.  In a single-tenant SaaS the
+        # operator's first workspace is canonical; for multi-
+        # workspace accounts the request body would carry wid.
+        # We deliberately fail closed if the caller is not an
+        # owner of any workspace.
+        from control_plane import key_rotation
+        owner_wid = _find_owner_workspace(repo, ctx.user_id)
+        if not owner_wid:
+            raise HTTPException(403, "owner role required")
+        return key_rotation.rotation_state(repo)
+
+    @app.post("/api/v1/admin/keys/rotate")
+    async def keys_rotate(request: Request,
+                          payload: dict,
+                          ctx: AuthContext = Depends(get_current_user)):
+        from control_plane import key_rotation
+        owner_wid = _find_owner_workspace(repo, ctx.user_id)
+        if not owner_wid:
+            raise HTTPException(403, "owner role required")
+        old_key = payload.get("old_key")
+        new_key = payload.get("new_key")
+        if not old_key or not new_key:
+            raise HTTPException(
+                400, "old_key and new_key are required"
+            )
+        try:
+            return key_rotation.rotate(
+                repo=repo,
+                old_key=old_key,
+                new_key=new_key,
+                actor_user_id=ctx.user_id,
+            )
+        except key_rotation.RotationInProgress as e:
+            raise HTTPException(503, str(e))
+        except key_rotation.KeyFingerprintMissing as e:
+            raise HTTPException(400, str(e))
+        except key_rotation.RotationFailed as e:
+            raise HTTPException(500, str(e))
+
     # ── companies ──────────────────────────────────────────────
     # NOTE (Wave 2 follow-up, t_d76b7c0c): the legacy alias routes
     # under /api/v1/companies* must require authentication
@@ -303,9 +397,12 @@ def create_app(*, repo: Optional[Repo] = None,
     # `company_id` in the URL for back-compat, but the resolver
     # translates that to a workspace_id before enforcing auth.
 
+    # NOTE: get_current_user is imported at module scope at the top
+    # of this file (see line 20).  Re-importing locally here would
+    # shadow the module-scope binding and break Depends() resolution
+    # inside the Wave 5 admin endpoints above.
     from auth.dependencies import (
         AuthContext,
-        get_current_user,
         require_csrf,
         resolve_workspace_membership,
     )

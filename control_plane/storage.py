@@ -89,11 +89,25 @@ class LocalDiskStorage(Storage):
     def path_for(self, key: str) -> Optional[str]:
         return str(self._resolve(key))
 
-    def put(self, *, key: str, data: bytes, mime_type: str) -> ArtifactRef:
+    def put(self, *, key: str, data: bytes, mime_type: str,
+            workspace_id: Optional[str] = None) -> ArtifactRef:
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         checksum = hashlib.sha256(data).hexdigest()
         path.write_bytes(data)
+        # Wave 5: when the caller provides a workspace_id we bind
+        # the blob to that workspace via a per-blob HMAC sidecar
+        # so a workspace cannot read another workspace's blobs
+        # even with shell access to artifacts/storage/.  The
+        # sidecar is opt-in: legacy writes that pass no
+        # workspace_id still work (e.g. mock test fixtures).
+        if workspace_id:
+            from control_plane import artifact_hmac
+            artifact_hmac.write_sidecar(
+                storage_root=str(self.root),
+                storage_key=key,
+                workspace_id=workspace_id,
+            )
         return ArtifactRef(
             key=key,
             checksum=checksum,
@@ -102,7 +116,8 @@ class LocalDiskStorage(Storage):
             path=str(path),
         )
 
-    def put_stream(self, *, key: str, stream: BinaryIO, mime_type: str) -> ArtifactRef:
+    def put_stream(self, *, key: str, stream: BinaryIO, mime_type: str,
+                    workspace_id: Optional[str] = None) -> ArtifactRef:
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         h = hashlib.sha256()
@@ -115,6 +130,13 @@ class LocalDiskStorage(Storage):
                 h.update(chunk)
                 f.write(chunk)
                 size += len(chunk)
+        if workspace_id:
+            from control_plane import artifact_hmac
+            artifact_hmac.write_sidecar(
+                storage_root=str(self.root),
+                storage_key=key,
+                workspace_id=workspace_id,
+            )
         return ArtifactRef(
             key=key,
             checksum=h.hexdigest(),

@@ -338,10 +338,18 @@ class JobRunner:
             outputs = renderer.fetch_outputs(provider_job_id=provider_job_id) or status.outputs
             # Materialize mock assets to durable storage under job_id
             output_records = []
+            # Wave 5: bind each output to the job's workspace via the
+            # per-blob HMAC sidecar.  Reading the job is cheap (one
+            # SELECT) and the workspace_id is already known by the
+            # repo layer.
+            _job = self.repo.get_job(job_id)
+            _output_wid = _job.get("workspace_id") if _job else None
             for o in outputs:
                 data = render_storage.get(o.ref)
                 out_key = f"jobs/{job_id}/assets/{Path(o.ref).name}"
-                ref = global_storage.put(key=out_key, data=data, mime_type=o.mime_type)
+                ref = global_storage.put(key=out_key, data=data,
+                                          mime_type=o.mime_type,
+                                          workspace_id=_output_wid)
                 output_records.append({
                     "storage_key": out_key,
                     "filename": Path(o.ref).name,

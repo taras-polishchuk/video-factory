@@ -230,8 +230,51 @@ def _compute_checksum(s: str) -> str:
 class Repo:
     """Thread-safe SQLite wrapper. Per-thread connections guarded by a lock."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *,
+                 db_key: Optional[str] = None) -> None:
+        """Construct a Repo.
+
+        `db_key` overrides the env var `VIDEO_FACTORY_DB_KEY`. If
+        the env var is set the bare constructor picks it up
+        automatically; tests can pass `db_key="x"` directly.
+
+        Wave 5 startup rules:
+
+      * if `VIDEO_FACTORY_DB_KEY` is set AND the file at `db_path`
+        exists AND it is plaintext → raise `PlaintextDBRefused`.
+        The operator must run a one-time migration via
+        `core.cipher_db.migrate_plaintext_to_cipher`.  We do NOT
+        silently re-open a "keyed" deployment as plaintext, because
+        that defeats the entire point of Wave 5.
+
+      * if `VIDEO_FACTORY_DB_KEY` is set AND the file doesn't
+        exist → create a new cipher DB at `db_path` with the key.
+
+      * if `VIDEO_FACTORY_DB_KEY` is unset → behave exactly as in
+        Wave 1..4 (plaintext dev / legacy).
+        """
         self.db_path = db_path
+        # Effective key (env override wins unless caller forced one).
+        import core.cipher_db as _cipher
+        if db_key is None:
+            db_key = _cipher._cipher_key()  # type: ignore[attr-defined]
+        self.db_key = db_key
+        # If a key is configured, the file MUST be cipher (or
+        # missing). Reject plaintext.
+        if self.db_key is not None:
+            if _cipher.detect_plaintext(db_path):  # type: ignore[attr-defined]
+                raise _cipher.PlaintextDBRefused(  # type: ignore[attr-defined]
+                    f"{db_path} is a plaintext SQLite DB but "
+                    f"VIDEO_FACTORY_DB_KEY is set. Refusing to open. "
+                    f"Run one of:\n"
+                    f"  python -c 'from core.cipher_db import "
+                    f"migrate_plaintext_to_cipher; "
+                    f"migrate_plaintext_to_cipher(plain_path=\"{db_path}\","
+                    f" cipher_path=\"{db_path}\", "
+                    f"key=...)'\n"
+                    f"or unset VIDEO_FACTORY_DB_KEY for plaintext "
+                    f"dev mode (NOT for production)."
+                )
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         # Open one connection per thread (sqlite3 is connection-thread-local).
@@ -242,8 +285,28 @@ class Repo:
     def _conn(self):
         c = getattr(self._local, "conn", None)
         if c is None:
-            c = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
-            c.execute("PRAGMA journal_mode=WAL")
+            import core.cipher_db as _cipher
+            c = _cipher.connect(self.db_path, key=self.db_key)
+            # SQLCipher raises a private `DatabaseError` subclass
+            # that does NOT inherit from `sqlite3.DatabaseError`
+            # (verified 2026-10).  The rest of the Repo (and tests)
+            # expect stdlib `sqlite3.DatabaseError` for "wrong key
+            # / corrupt page" cases, so we normalise the failure
+            # of the post-open pragmas here.  We don't swallow the
+            # error — we re-raise it as a stdlib exception so the
+            # caller's `except sqlite3.DatabaseError` still fires.
+            try:
+                c.execute("PRAGMA journal_mode=WAL")
+            except Exception as exc:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                if isinstance(exc, sqlite3.DatabaseError):
+                    raise
+                raise sqlite3.DatabaseError(
+                    f"sqlcipher post-open pragma failed: {exc}"
+                ) from exc
             c.execute("PRAGMA foreign_keys=ON")
             self._local.conn = c
         return c
@@ -1598,11 +1661,23 @@ class Repo:
         the bytes.  Returns the masked surface (NEVER the
         plaintext).
 
+        Wave 5: refuses to write while a master-key rotation is in
+        progress.  The API maps this to HTTP 503 with a clear
+        "rotation in progress" message so the UI can render its
+        banner.
+
         `company_id` is accepted as a backwards-compat alias for
         `workspace_id` so legacy call sites keep working.  Exactly
         one of the two MUST be set; if both are set, `workspace_id`
         wins.
         """
+        # Wave 5: refuse new credentials while a rotation runs.
+        from control_plane import key_rotation
+        if not key_rotation.credential_writes_allowed(self):
+            raise key_rotation.RotationInProgress(
+                "master-key rotation in progress; "
+                "credential writes are paused"
+            )
         if provider not in self.CREDENTIAL_PROVIDERS:
             raise ValueError(f"unknown provider: {provider!r}")
         wid = self._resolve_wid(company_id, workspace_id)

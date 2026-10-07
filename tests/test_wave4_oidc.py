@@ -737,9 +737,16 @@ def test_oidc_audit_row_records_provider_and_sub(
 # ────────────────────────────────────────────────────────────────────
 
 def test_existing_211_tests_still_green():
+    """Smoke: the prior-wave suites still collect via the active venv.
+
+    D-W4-QA-M1 fix: shell out via sys.executable (the venv python) so
+    the subprocess picks up the project's pinned deps; bare `pytest`
+    falls back to a system interpreter that may not have pydantic.
+    """
     import subprocess
+    import sys
     r = subprocess.run(
-        ["pytest", "--collect-only", "-q",
+        [sys.executable, "-m", "pytest", "--collect-only", "-q",
          "tests/test_auth.py", "tests/test_wave3_ui.py",
          "tests/test_wave3_qa.py"],
         capture_output=True, text=True, cwd=str(REPO_ROOT),
