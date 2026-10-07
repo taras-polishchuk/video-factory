@@ -690,6 +690,27 @@ class Repo:
         # 4. Drop `companies` table at the end.
         if self._table_exists("companies"):
             c.execute("DROP TABLE companies")
+        # 5. Rebuild `memberships` so its `FOREIGN KEY (workspace_id)`
+        #    points at the new `workspaces` table. The earlier
+        #    `workspaces` rebuild (0c) renamed the table to
+        #    `workspaces__legacy` and dropped it; SQLite preserves FK
+        #    metadata through `ALTER TABLE RENAME`, so the existing
+        #    `memberships` table (created on a legacy DB by the
+        #    Wave-1 auth migration in `core/migrations/__init__.py`)
+        #    still claims its FK targets `workspaces__legacy`.
+        #    Result: any `INSERT INTO memberships (...)` against a
+        #    legacy prod DB raises `sqlite3.OperationalError:
+        #    no such table: main.workspaces__legacy` at
+        #    `api/auth.py:158` (Wave 3 follow-up — t_7e0153fd).
+        #
+        #    The SCHEMA in `core/repo.py` does not declare
+        #    `memberships` (it lives in `core/migrations/__init__.py`
+        #    migration 001), so a fresh DB has no `memberships` table
+        #    at this point — `CREATE TABLE IF NOT EXISTS` in the
+        #    migration runs AFTER 005 and creates it correctly.
+        #    On a legacy prod DB, the table exists but its FK is bad;
+        #    rebuild it now. Idempotent: no-op when the FK is fine.
+        self._rebuild_memberships_workspace_fk()
         # Re-enable foreign-key checks and verify integrity.
         c.execute("PRAGMA foreign_keys=ON")
         try:
@@ -698,6 +719,96 @@ class Repo:
             import sys
             print(f"005: foreign_key_check failed: {e}", file=sys.stderr)
         c.commit()
+
+    def _rebuild_memberships_workspace_fk(self) -> None:
+        """Idempotent: rebuild `memberships` if its FK still points
+        at the dropped `workspaces__legacy` table.
+
+        Called from `_apply_migration_005` AFTER `DROP TABLE
+        workspaces__legacy` and BEFORE `PRAGMA foreign_keys=ON`
+        (so the rebuild can safely drop the broken table without
+        tripping FK checks against the missing legacy name).
+
+        Behaviour:
+
+        - `memberships` does not exist (fresh DB at migration 005
+          time): no-op. The Wave-1 auth migration in
+          `core/migrations/__init__.py` runs AFTER 005 and creates
+          `memberships` with the correct FK from the start.
+        - `memberships` exists and its `workspace_id` FK targets
+          something other than `workspaces__legacy`: no-op.
+        - `memberships` exists and its `workspace_id` FK targets
+          `workspaces__legacy` (the dropped temp name): rebuild
+          the table using the standard SQLite
+          rename -> create new -> copy -> drop legacy pattern,
+          so the FK points at the new `workspaces` table.
+        """
+        c = self._conn()
+        if not self._table_exists("memberships"):
+            return  # fresh DB path — nothing to rebuild.
+        fk_rows = c.execute(
+            "PRAGMA foreign_key_list(memberships)"
+        ).fetchall()
+        # fk_rows columns: id, seq, table, from, to, on_update, on_delete, match
+        bad = any(row[2] == "workspaces__legacy" for row in fk_rows)
+        if not bad:
+            return  # already fine.
+        rows = c.execute("SELECT * FROM memberships").fetchall()
+        old_cols = [
+            r[1] for r in c.execute(
+                "PRAGMA table_info(memberships)"
+            ).fetchall()
+        ]
+        c.execute(
+            "ALTER TABLE memberships RENAME TO memberships__legacy"
+        )
+        # Recreate with the canonical Wave-1 schema + a corrected
+        # workspace_id FK pointing at the new `workspaces` table.
+        # The role CHECK matches migration 001 exactly.
+        c.execute(
+            "CREATE TABLE memberships ("
+            "user_id TEXT NOT NULL, "
+            "workspace_id TEXT NOT NULL, "
+            "role TEXT NOT NULL "
+            "    CHECK (role IN ('owner','admin','editor','viewer')), "
+            "created_at TEXT NOT NULL, "
+            "PRIMARY KEY (user_id, workspace_id), "
+            "FOREIGN KEY (user_id) REFERENCES users(user_id), "
+            "FOREIGN KEY (workspace_id) REFERENCES "
+            "    workspaces(workspace_id))"
+        )
+        new_cols = [
+            r[1] for r in c.execute(
+                "PRAGMA table_info(memberships)"
+            ).fetchall()
+        ]
+        new_idx = {col: i for i, col in enumerate(new_cols)}
+        legacy_idx = {col: i for i, col in enumerate(old_cols)}
+        placeholders = ",".join("?" for _ in new_cols)
+        insert_sql = (
+            f"INSERT INTO memberships ({','.join(new_cols)}) "
+            f"VALUES ({placeholders})"
+        )
+        for r in rows:
+            new_row = [None] * len(new_cols)
+            for col, idx in legacy_idx.items():
+                if col in new_idx:
+                    new_row[new_idx[col]] = r[idx]
+            c.execute(insert_sql, tuple(new_row))
+        c.execute("DROP TABLE memberships__legacy")
+        # Re-create the index that the legacy table carried. SCHEMA
+        # in core/repo.py doesn't declare `memberships` so the
+        # second `c.executescript(SCHEMA)` later in bootstrap
+        # doesn't recreate it; `core/migrations/__init__.py`
+        # migration 001 does declare it, but a legacy DB has
+        # already run that migration so the `CREATE INDEX IF NOT
+        # EXISTS` is a no-op once `memberships__legacy` is the
+        # table it bound to. Recreate here so the new `memberships`
+        # has its workspace_id index again.
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memberships_workspace "
+            "ON memberships(workspace_id)"
+        )
 
     def close(self) -> None:
         c = getattr(self._local, "conn", None)
