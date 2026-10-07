@@ -111,3 +111,92 @@ In `tests/test_wave5_qa.py` after the original 6 adversarial tests:
 - Wave 1..4 tests untouched.
 - No commits to remote.
 - No new dependencies added.
+
+---
+
+# Wave 5 follow-up-2 — progress log (t_282da1ca)
+
+## Summary
+
+Fixed the cross-thread connection-cache BLOCKER uncovered by QA
+in t_68649331. After a master-key rotation, threads that had
+called `repo._conn()` before the swap kept their stale OLD-key
+per-thread connections, causing either permanent
+`RotationInProgress` (Symptom A) or silent data corruption via
+`repo._conn().execute()` bypass (Symptom B). Now every thread
+closes-and-rebuilds on its next `_conn()` access via a single
+Repo-level epoch counter.
+
+## Test results
+
+```
+tests/test_wave5_followup_xthread.py: 2/2 passed (was 0/2 — both reproduced the BLOCKER pre-fix)
+tests/test_wave5_qa.py:              14/14 passed (unchanged)
+tests/test_wave5_cipher.py:          20/20 passed (unchanged)
+Full suite:                          270 passed + 1 pre-existing fail + 3 skipped = 274 total
+```
+
+The 1 pre-existing failure is the same `test_existing_211_tests_still_green`
+in `tests/test_wave4_oidc.py:755` flagged by the prior t_68649331
+QA report — depends on `tests/test_wave3_qa.py` (untracked, not on
+this branch). Was failing on baseline; not a Wave 5 regression.
+
+## Fix (Option A — epoch counter)
+
+### Symptom A — permanent RotationInProgress
+
+`repo._conn()` on the writer thread returned a connection that
+was PRAGMA-key'd with the OLD key before the swap. That stale
+conn read the `key_rotation` table as it stood on its OWN cipher
+state — which still said `rotation_in_progress=1` because the
+post-swap `UPDATE` was issued by the rotating thread's NEW-key
+conn (different cipher state). Every `repo.tx()` from the writer
+therefore raised `RotationInProgress` forever.
+
+### Symptom B — silent corruption via `_conn()` bypass
+
+If a writer bypassed `tx()` and called `repo._conn().execute()`
+directly, writes were encrypted with the OLD key into the
+NEW-cipher file. A fresh NEW-key connection found zero rows.
+
+### Resolution
+
+Add `Repo._epoch: int` and per-thread `_local.conn_epoch` in
+`core/repo.py`. In `_conn()`, if the cached per-thread conn was
+opened at an earlier epoch, close it and rebuild with
+`self.db_key` (the only sqlcipher3-documented way to switch the
+page-encryption key on a connection). In
+`control_plane/key_rotation.py`, increment `repo._epoch` after
+assigning `repo.db_key = new_key` and before `repo.close()` so
+every other thread's next access picks up the new key.
+
+Trade-off vs. Option B (walk `threading.enumerate()`): no global
+conn registry needed, no risk of missing threads, identical cost
+(microseconds for the rebuild on the next access). Trade-off vs.
+Option C (refuse writes + supervisor restart): preserves the
+"rotate without downtime" invariant from the brief.
+
+## Files changed
+
+- `core/repo.py` — added `self._epoch`, `_local.conn_epoch`
+  tracking, drop-stale-conn path in `_conn()`
+- `control_plane/key_rotation.py` — increment `repo._epoch`
+  immediately after `repo.db_key = new_key` and before
+  `repo.close()`
+- `tests/test_wave5_followup_xthread.py` — cherry-picked QA's 2
+  adversarial cross-thread tests; replaced the hardcoded
+  `WORKTREE` sys.path with a self-resolving parent-dir fallback
+  so the file runs from any checkout.
+
+## Stability
+
+Cross-thread tests ran deterministically 3/3 (4.36s, 4.47s,
+4.75s).
+
+## Out of scope
+
+- `tests/test_wave3_qa.py` still missing on this branch — same
+  pre-existing condition as before.
+- Wave 1..4 tests untouched.
+- No commits to remote.
+- No new dependencies added.
