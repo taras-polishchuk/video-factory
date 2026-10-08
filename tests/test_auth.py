@@ -343,8 +343,12 @@ def test_role_hierarchy_owner_admin_editor_viewer():
 
 
 def test_csrf_token_required_on_state_changing_requests(auth_env):
-    client, _, _ = auth_env
-    _signup(client, email="kim@example.com")
+    client, repo, _ = auth_env
+    r = _signup(client, email="kim@example.com")
+    wid = r.json()["workspace_id"]
+    # Wave 6b: promote to 'pro' so the FREE=1-workspace gate
+    # does not pre-empt the CSRF check under test.
+    repo.update_workspace(wid, plan="pro")
     # Without X-CSRF-Token: 403
     r = client.post("/auth/workspaces", json={"slug": "kim-2", "name": "Kim 2"})
     assert r.status_code == 403
@@ -380,8 +384,12 @@ def test_session_secret_rotation_invalidates_old_sessions(auth_env, monkeypatch)
     itself, so a secret rotation in production is handled by
     invalidating all sessions (a separate command). The test asserts
     that the CSRF token check fails after a secret rotation."""
-    client, _, _ = auth_env
-    _signup(client, email="mia@example.com")
+    client, repo, _ = auth_env
+    r = _signup(client, email="mia@example.com")
+    wid = r.json()["workspace_id"]
+    # Wave 6b: promote to 'pro' so the FREE=1-workspace gate
+    # does not pre-empt the CSRF check under test.
+    repo.update_workspace(wid, plan="pro")
     # Rotate the secret
     monkeypatch.setenv("VIDEO_FACTORY_SESSION_SECRET", "y" * 64)
     csrf = client.get("/auth/csrf").json()["csrf_token"]

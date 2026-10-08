@@ -280,11 +280,19 @@ def test_x_workspace_id_header_resolves_to_member_workspace(tmp_path):
     """With the X-Workspace-Id header pointing at a workspace the
     user IS a member of, the active-workspace endpoint returns
     that workspace.
+
+    Wave 6b note: the FREE plan now caps a user at 1 owned
+    workspace.  We promote the primary workspace to 'pro' so
+    we can create the second one and exercise the header
+    resolution the test was written for.
     """
-    client, _repo, _ = _make_app(tmp_path)
+    client, repo, _ = _make_app(tmp_path)
     r = _signup(client, email="alice-h@example.com",
                  workspace_name="Alice H")
     wid = r.json()["workspace_id"]
+    # Promote to 'pro' so the FREE=1-workspace gate does not
+    # pre-empt the multi-workspace resolution under test.
+    repo.update_workspace(wid, plan="pro")
     csrf = client.get("/auth/csrf").json()["csrf_token"]
     # Create a second workspace so we have something to switch to.
     r2 = client.post("/auth/workspaces",
@@ -403,12 +411,18 @@ def test_credential_vault_hmac_tag_binds_to_workspace(tmp_path):
 def test_audit_log_records_workspace_id_on_every_action(tmp_path):
     """Every audit row for an authenticated action has
     workspace_id populated.
+
+    Wave 6b note: the FREE plan now caps a user at 1 owned
+    workspace.  We promote the primary workspace to 'pro' so
+    the test can exercise the second-create audit row under
+    test without being pre-empted by the FREE=1 gate.
     """
     from auth.audit_log import list_for_workspace
     client, repo, _ = _make_app(tmp_path)
     r = _signup(client, email="auditw@example.com",
                  workspace_name="Audit W")
     wid = r.json()["workspace_id"]
+    repo.update_workspace(wid, plan="pro")
     csrf = client.get("/auth/csrf").json()["csrf_token"]
     client.post("/auth/workspaces",
                  json={"slug": "auditw-2", "name": "Audit W 2"},
@@ -457,11 +471,18 @@ def test_active_workspace_id_in_session_default(tmp_path):
 def test_switch_active_workspace_endpoint(tmp_path):
     """POST /auth/switch-workspace sets the session's active
     workspace to the requested one (caller must be a member).
+
+    Wave 6b note: the FREE plan now caps a user at 1 owned
+    workspace.  We promote the primary workspace to 'pro' so we
+    can create a second one and exercise the switch.
     """
     client, repo, _ = _make_app(tmp_path)
     r = _signup(client, email="switcher@example.com",
                  workspace_name="Switcher")
     wid1 = r.json()["workspace_id"]
+    # Promote to 'pro' so the FREE=1-workspace gate does not
+    # pre-empt the switch-under-test below.
+    repo.update_workspace(wid1, plan="pro")
     csrf = client.get("/auth/csrf").json()["csrf_token"]
     r2 = client.post("/auth/workspaces",
                       json={"slug": "switcher-2", "name": "Switcher 2"},
@@ -496,10 +517,19 @@ def test_switch_active_workspace_endpoint(tmp_path):
 def test_workspace_slug_uniqueness_409(tmp_path):
     """Two workspaces cannot share a slug; the second create
     returns 409 (not 500).
+
+    Wave 6b note: the FREE plan now caps a user at 1 owned
+    workspace.  The slug-409 invariant is plan-independent, so
+    we promote the owner to 'pro' before creating the second
+    workspace to keep the test focused on what it's verifying.
     """
-    client, _repo, _ = _make_app(tmp_path)
-    _signup(client, email="sl@example.com",
-             workspace_name="Sl 1")
+    client, repo, _ = _make_app(tmp_path)
+    r = _signup(client, email="sl@example.com",
+                 workspace_name="Sl 1")
+    wid = r.json()["workspace_id"]
+    # Promote the owner to 'pro' so the FREE=1-workspace gate
+    # does not pre-empt the slug-uniqueness check.
+    repo.update_workspace(wid, plan="pro")
     csrf = client.get("/auth/csrf").json()["csrf_token"]
     r1 = client.post("/auth/workspaces",
                       json={"slug": "alpha", "name": "Alpha"},
@@ -746,12 +776,20 @@ def test_new_workspace_creation_increments_owner_role(tmp_path):
     `role='owner'`.  (The "increments" wording in the test
     name refers to the role being set at creation; the spec
     does not require a per-user workspace count cap here.)
+
+    Wave 6b note: the FREE plan now caps a user at 1 owned
+    workspace.  We promote the primary workspace to 'pro' so
+    the test can exercise the second-workspace-create path and
+    focus on the role=owner assertion it was written for.
     """
     client, repo, _ = _make_app(tmp_path)
     r = _signup(client, email="owner2@example.com",
                  workspace_name="Owner 2")
     uid = r.json()["user_id"]
     wid = r.json()["workspace_id"]
+    # Promote to 'pro' so the FREE=1-workspace gate does not
+    # pre-empt the role=owner assertion below.
+    repo.update_workspace(wid, plan="pro")
     csrf = client.get("/auth/csrf").json()["csrf_token"]
     r2 = client.post("/auth/workspaces",
                       json={"slug": "owner2-2", "name": "Owner 2 2"},

@@ -341,11 +341,18 @@ def test_workspace_switcher_lists_only_memberships():
 def test_workspace_switcher_updates_active_workspace(auth_env):
     """The switcher's POST sets the active workspace. The upstream
     /auth/switch-workspace endpoint is what the +page.server.ts
-    action calls."""
-    client, _, _ = auth_env
+    action calls.
+
+    Wave 6b note: the FREE plan now caps a user at 1 owned
+    workspace.  We promote the primary workspace to 'pro' so we
+    can create a second one and exercise the switch.
+    """
+    client, repo, _ = auth_env
     s = _signup(client, email="carol@example.com",
                 password="Password12345!", workspace_name="Carol Co")
     sid = s.cookies.get("vf_session")
+    wid1 = s.json()["workspace_id"]
+    repo.update_workspace(wid1, plan="pro")
     # Create a second workspace.
     csrf = client.get("/auth/csrf", cookies={"vf_session": sid}).json()["csrf_token"]
     cw = client.post(

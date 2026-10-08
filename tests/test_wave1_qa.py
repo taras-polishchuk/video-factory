@@ -419,6 +419,10 @@ def test_membership_role_inheritance_owner_can_invite_admin(tmp_path):
     r = _signup(client, email="role@example.com",
                  workspace_name="Role Co")
     uid = r.json()["user_id"]
+    wid = r.json()["workspace_id"]
+    # Wave 6b: promote to 'pro' so the FREE=1-workspace gate
+    # does not pre-empt the second-workspace create under test.
+    repo.update_workspace(wid, plan="pro")
     # Get CSRF
     csrf = client.get("/auth/csrf").json()["csrf_token"]
     r2 = client.post("/auth/workspaces",
@@ -564,8 +568,12 @@ def test_session_secret_change_invalidates_existing_sessions(tmp_path, monkeypat
     Additionally, per spec, a "new login works" requirement.
     """
     client, repo, _ = _make_app(tmp_path)
-    _signup(client, email="rot@example.com",
-             workspace_name="Rot Co")
+    r = _signup(client, email="rot@example.com",
+                 workspace_name="Rot Co")
+    wid = r.json()["workspace_id"]
+    # Wave 6b: promote to 'pro' so the FREE=1-workspace gate
+    # does not pre-empt the second-workspace CSRF test.
+    repo.update_workspace(wid, plan="pro")
     old_csrf = client.get("/auth/csrf").json()["csrf_token"]
     # Rotate the secret
     monkeypatch.setenv("VIDEO_FACTORY_SESSION_SECRET", "y" * 64)

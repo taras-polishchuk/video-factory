@@ -65,6 +65,24 @@ HANDLED_EVENT_TYPES = frozenset({
 })
 
 
+# Plan ranking for downgrade-guard (F-W6C-001).  Higher number =
+# higher tier.  Anything missing from this map is treated as
+# "free" (rank 0) for safety — never allow a webhook to demote a
+# workspace to an unknown plan.
+PLAN_RANK: dict[str, int] = {
+    "free": 0,
+    "pro": 1,
+    "enterprise": 2,
+}
+
+
+def _plan_rank(plan: Optional[str]) -> int:
+    """Return the numeric rank for a plan name (unknown = free)."""
+    if not plan:
+        return PLAN_RANK["free"]
+    return PLAN_RANK.get(plan, PLAN_RANK["free"])
+
+
 class StripeWebhookNotConfigured(Exception):
     """Raised at boot when STRIPE_WEBHOOK_SECRET is missing."""
 
@@ -306,6 +324,42 @@ def build_router(repo, *, audit=None) -> APIRouter:
                 return {"received": True, "ignored": True,
                         "event_id": event_id, "type": event_type,
                         "reason": "no workspace bound to this customer"}
+
+            # F-W6C-001 downgrade guard: a customer.subscription.updated
+            # event whose mapped plan is LOWER than the workspace's
+            # current plan is treated as a Stripe-side replay / stray
+            # event.  We must not silently demote an enterprise tenant
+            # to pro (or pro to free) because a price id flipped on
+            # Stripe's side.  The audit row tells the operator exactly
+            # what happened, and we ack the event with 200 so Stripe
+            # doesn't retry-loop.
+            existing_plan = (workspace or {}).get("plan") or "free"
+            new_rank = _plan_rank(plan)
+            existing_rank = _plan_rank(existing_plan)
+            if new_rank < existing_rank:
+                _write_audit(
+                    "billing.subscription_downgrade_blocked",
+                    {"event_id": event_id,
+                     "workspace_id": workspace["workspace_id"],
+                     "stripe_subscription_id": subscription_id,
+                     "existing_plan": existing_plan,
+                     "attempted_plan": plan,
+                     "current_period_end": period_end},
+                    workspace_id=workspace["workspace_id"],
+                )
+                _logger.warning(
+                    "refusing subscription.downgrade for workspace=%s "
+                    "existing=%s attempted=%s event=%s",
+                    workspace["workspace_id"], existing_plan, plan,
+                    event_id,
+                )
+                repo.mark_stripe_event_processed(event_id)
+                return {"received": True, "ok": True,
+                        "event_id": event_id, "type": event_type,
+                        "workspace_id": workspace["workspace_id"],
+                        "plan": existing_plan,
+                        "downgrade_refused": True}
+
             try:
                 with repo.tx() as c:
                     repo.update_workspace_billing(

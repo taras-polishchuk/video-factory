@@ -406,6 +406,53 @@ def build_router(repo: Repo) -> APIRouter:
             )
         if not name or len(name) > 80:
             raise HTTPException(400, "name required (1..80 chars)")
+        # Wave 6b: per-user workspace limit.  The brief is
+        # explicit — enforce on POST /api/v1/auth/workspaces
+        # AND the legacy /api/v1/companies alias.  We re-read
+        # the user's current plan from their primary owned
+        # workspace (the canonical plan source of truth — the
+        # Wave 6c Stripe webhook will flip this column, and the
+        # next quota check picks up the new value).  Brand-new
+        # users (no owned workspace yet) default to 'free' so
+        # the limit applies to them from their very first
+        # signup-attached workspace.
+        from core.quotas import check_workspace_count
+        from core.audit import (
+            EVENT_QUOTA_WORKSPACE_LIMIT_HIT, emit as emit_audit,
+        )
+        # Re-read the user's current plan from their primary
+        # owned workspace (the canonical plan source of truth —
+        # the Wave 6c Stripe webhook will flip this column, and
+        # the next quota check picks up the new value).
+        # Brand-new users (no owned workspace yet) default to
+        # 'free' so the limit applies to them from their very
+        # first signup-attached workspace.
+        memberships = list_workspaces_for_user(repo, ctx.user_id)
+        owned = [m for m in memberships if m.get("role") == "owner"]
+        user_plan = (
+            owned[0].get("plan", "free") if owned else "free"
+        )
+        decision = check_workspace_count(
+            plan=user_plan,
+            workspaces_owned=len(owned),
+        )
+        if not decision.allowed:
+            emit_audit(
+                repo,
+                event=EVENT_QUOTA_WORKSPACE_LIMIT_HIT,
+                context={
+                    "user_id": ctx.user_id,
+                    "plan": decision.plan,
+                    "workspaces_owned": decision.workspaces_owned,
+                    "limit": decision.limit,
+                    "reason": decision.reason,
+                    "endpoint": "POST /api/v1/auth/workspaces",
+                },
+                user_id=ctx.user_id,
+            )
+            raise HTTPException(
+                403, f"workspace limit: {decision.reason}"
+            )
         with repo.tx() as c:
             try:
                 workspace_id = f"wks_{secrets.token_hex(8)}"
