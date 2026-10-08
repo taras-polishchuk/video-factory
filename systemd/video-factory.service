@@ -1,0 +1,45 @@
+# Video Factory — production systemd unit
+#
+# Installs the api + web containers as a systemd service so the OS
+# supervises them. Secrets are passed via `LoadCredential=` (systemd
+# ≥ 250) — the operator writes the credential files under
+# /etc/video-factory/credentials/ (mode 0600) and systemd passes them
+# into the service environment without ever writing them to disk
+# inside the service.
+#
+# Companion file: docker-compose.production.yml + the LoadCredential=
+# mapping below.
+
+[Unit]
+Description=Video Factory SaaS (api + web)
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/opt/video-factory
+
+# ─── Secrets (mode 0600; never written to /opt/video-factory/.env) ──
+LoadCredential=cloudflare_api_token:/etc/video-factory/credentials/cloudflare_api_token
+LoadCredential=hetzner_token:/etc/video-factory/credentials/hetzner_token
+LoadCredential=stripe_secret_key:/etc/video-factory/credentials/stripe_secret_key
+LoadCredential=stripe_webhook_secret:/etc/video-factory/credentials/stripe_webhook_secret
+LoadCredential=video_factory_secret_key:/etc/video-factory/credentials/video_factory_secret_key
+LoadCredential=video_factory_db_key:/etc/video-factory/credentials/video_factory_db_key
+LoadCredential=video_factory_session_secret:/etc/video-factory/credentials/video_factory_session_secret
+
+# Read each credential into $CREDENTIALS_DIR/<name> at service start,
+# then export as env var to compose.
+Environment=VIDEO_FACTORY_CREDENTIALS_DIR=%d/credentials
+ExecStartPre=/usr/local/bin/video-factory-load-env.sh
+ExecStart=/usr/bin/docker compose --env-file /opt/video-factory/.env.production up
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose restart
+
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

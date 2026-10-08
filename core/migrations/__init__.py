@@ -187,13 +187,28 @@ MIGRATIONS: List[Tuple[str, str, str]] = [
     ),
     (
         "008",
-        "workspaces.current_period_end INTEGER (Stripe subscription period end, unix)",
-        # Handled by _extend_workspaces_billing_columns() in
-        # core/repo.py: SQLite has no IF NOT EXISTS for ALTER TABLE
-        # ADD COLUMN prior to 3.35, so we run via a PRAGMA table_info
-        # check at bootstrap and apply the ALTER manually. The empty
-        # SQL here is intentional.
+        "workspaces.current_period_end (Wave 6c Stripe webhook billing cycle)",
+        # Handled by _extend_workspaces_columns() in core/repo.py.
+        # SQLite has no IF NOT EXISTS for ADD COLUMN prior to 3.35;
+        # we add the column via PRAGMA table_info check at bootstrap.
         "SELECT 1;",
+    ),
+    (
+        "009",
+        "stripe_events (Wave 6c Stripe webhook idempotency + audit)",
+        """
+        CREATE TABLE IF NOT EXISTS stripe_events (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            received_at INTEGER NOT NULL,
+            raw_json TEXT NOT NULL,
+            processed_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_stripe_events_type
+            ON stripe_events(type);
+        CREATE INDEX IF NOT EXISTS idx_stripe_events_received
+            ON stripe_events(received_at);
+        """,
     ),
 ]
 

@@ -1,0 +1,15 @@
+# Example inputs for the OpenTofu module.
+#
+# Do NOT commit a populated version of this file. It exists so the
+# operator can `cp terraform.tfvars.example terraform.tfvars`, edit it,
+# then `tofu apply -var-file=terraform.tfvars`.
+#
+# Variables marked `sensitive = true` in main.tf should be supplied
+# via TF_VAR_<name> env vars, NOT in this file.
+
+# domain          = "video-factory.example.com"
+# cloudflare_zone_id = "<from cloudflare dashboard>"
+# server_type     = "cx22"
+# location        = "fsn1"
+# ssh_public_key_path = "~/.ssh/id_ed25519.pub"
+# admin_cidr      = "203.0.113.0/24"   # your home/office IP range

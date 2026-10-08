@@ -1092,6 +1092,31 @@ def create_app(*, repo: Optional[Repo] = None,
     )
     app.include_router(_heygen_router)
 
+    # ── Wave 6c: Stripe webhook (billing + plan transitions) ──
+    # Registered unconditionally: when STRIPE_WEBHOOK_SECRET is
+    # missing the router factory raises at app construction time
+    # so missing-config is loud at boot, not at first request.
+    try:
+        from api.webhooks_stripe import build_router as _stripe_webhook_router
+        _stripe_router = _stripe_webhook_router(
+            repo=repo,
+            audit=runner.audit if isinstance(getattr(runner, "audit", None), _AuditLogBase) else None,
+        )
+        app.include_router(_stripe_router)
+    except Exception as _stripe_e:
+        # STRIPE_WEBHOOK_SECRET missing → expose the config error
+        # on a debug endpoint and continue serving non-Stripe routes.
+        # Tests can opt in by setting the env var before create_app().
+        # NB: bind the message to a default arg to avoid the
+        # "free variable '_stripe_e' not associated with a value"
+        # NameError — Python clears the exception after the
+        # `except` block exits.
+        _stripe_err_msg = str(_stripe_e)
+
+        @app.get("/_stripe_init_error")
+        def _stripe_init_error() -> dict:
+            return {"ok": False, "error": _stripe_err_msg}
+
     # ── auth (Wave 1) ────────────────────────────────────────
 
     from api.auth import build_router as _build_auth_router
