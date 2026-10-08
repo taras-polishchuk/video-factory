@@ -177,6 +177,84 @@ def create_app(*, repo: Optional[Repo] = None,
         for f in required:
             if f not in payload:
                 raise HTTPException(400, f"missing {f}")
+        # Wave 6b: live-provider gate (plan + workspace flag)
+        # must fire BEFORE any DB write or provider call.  The
+        # global env flags (LIVE_PROVIDER_TESTS / SMOKE_TEST_PASSED)
+        # are checked inside the renderer at run time and are
+        # out of scope here.
+        from core.quotas import check_live_provider_allowed
+        from core.audit import (
+            EVENT_LIVE_PROVIDER_BLOCKED, emit as emit_audit,
+        )
+        live_decision = check_live_provider_allowed(
+            plan=_ws.get("plan", "free"),
+            workspace_live_enabled=_ws.get("live_enabled", False),
+            render_profile=payload.get("render_profile", "mock"),
+        )
+        if not live_decision.allowed:
+            emit_audit(
+                repo,
+                event=EVENT_LIVE_PROVIDER_BLOCKED,
+                context={
+                    "workspace_id": wid,
+                    "plan": _ws.get("plan", "free"),
+                    "ws_live_enabled": live_decision.ws_live_enabled,
+                    "render_profile": payload.get(
+                        "render_profile", "mock",
+                    ),
+                    "reason": live_decision.reason,
+                    "endpoint": "POST /api/v1/workspaces/{wid}/jobs",
+                },
+                workspace_id=wid,
+                user_id=getattr(_ctx, "user_id", None),
+                actor=getattr(_ctx, "email", None),
+            )
+            raise HTTPException(
+                403, f"live providers blocked: {live_decision.reason}",
+            )
+        # Wave 6b: FREE-tier monthly job quota (5/month).  Re-reads
+        # plan synchronously on every call (no in-memory cache) so a
+        # Stripe webhook (Wave 6c) can flip plan without race.
+        from datetime import datetime, timezone
+        from core.quotas import check_job_quota
+        quota_decision = check_job_quota(
+            workspace_id=wid,
+            plan=_ws.get("plan", "free"),
+            now=datetime.now(timezone.utc),
+            job_count_for_month=lambda w, s: repo.count_jobs_since(
+                workspace_id=w, since_iso=s,
+            ),
+        )
+        if not quota_decision.allowed:
+            from core.audit import (
+                EVENT_QUOTA_EXCEEDED, emit as emit_quota_audit,
+            )
+            emit_quota_audit(
+                repo,
+                event=EVENT_QUOTA_EXCEEDED,
+                context={
+                    "workspace_id": wid,
+                    "plan": quota_decision.plan,
+                    "jobs_used": quota_decision.jobs_used,
+                    "quota_reset_at": quota_decision.reset_at,
+                    "endpoint": "POST /api/v1/workspaces/{wid}/jobs",
+                },
+                workspace_id=wid,
+                user_id=getattr(_ctx, "user_id", None),
+                actor=getattr(_ctx, "email", None),
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"FREE plan limit {quota_decision.limit} jobs/month "
+                        f"reached; resets at {quota_decision.reset_at}"
+                    ),
+                    "quota_reset_at": quota_decision.reset_at,
+                    "jobs_used": quota_decision.jobs_used,
+                    "jobs_remaining": 0,
+                },
+                status_code=429,
+            )
         job = repo.create_job(
             workspace_id=wid,
             topic=payload["topic"],
@@ -861,6 +939,83 @@ def create_app(*, repo: Optional[Repo] = None,
         for f in required:
             if f not in payload:
                 raise HTTPException(400, f"missing {f}")
+        # Wave 6b: resolve the legacy company_id to a workspace_id
+        # so the live-provider gate and the FREE-tier job quota
+        # both see the same plan + flag as the workspace-scoped
+        # route.  Without this lookup the legacy route would
+        # silently bypass both gates.
+        wid = repo.workspace_id_for_company(company_id) or company_id
+        try:
+            _ws = repo.get_workspace(wid)
+        except Exception:
+            raise HTTPException(
+                404, f"workspace for company_id {company_id} not found"
+            )
+        from core.quotas import (
+            check_job_quota, check_live_provider_allowed,
+        )
+        from core.audit import (
+            EVENT_LIVE_PROVIDER_BLOCKED, EVENT_QUOTA_EXCEEDED,
+            emit as emit_audit,
+        )
+        from datetime import datetime, timezone
+        live_decision = check_live_provider_allowed(
+            plan=_ws.get("plan", "free"),
+            workspace_live_enabled=_ws.get("live_enabled", False),
+            render_profile=payload.get("render_profile", "mock"),
+        )
+        if not live_decision.allowed:
+            emit_audit(
+                repo,
+                event=EVENT_LIVE_PROVIDER_BLOCKED,
+                context={
+                    "workspace_id": wid,
+                    "plan": _ws.get("plan", "free"),
+                    "ws_live_enabled": live_decision.ws_live_enabled,
+                    "render_profile": payload.get(
+                        "render_profile", "mock",
+                    ),
+                    "reason": live_decision.reason,
+                    "endpoint": "POST /api/v1/jobs",
+                },
+                workspace_id=wid,
+            )
+            raise HTTPException(
+                403, f"live providers blocked: {live_decision.reason}",
+            )
+        quota_decision = check_job_quota(
+            workspace_id=wid,
+            plan=_ws.get("plan", "free"),
+            now=datetime.now(timezone.utc),
+            job_count_for_month=lambda w, s: repo.count_jobs_since(
+                workspace_id=w, since_iso=s,
+            ),
+        )
+        if not quota_decision.allowed:
+            emit_audit(
+                repo,
+                event=EVENT_QUOTA_EXCEEDED,
+                context={
+                    "workspace_id": wid,
+                    "plan": quota_decision.plan,
+                    "jobs_used": quota_decision.jobs_used,
+                    "quota_reset_at": quota_decision.reset_at,
+                    "endpoint": "POST /api/v1/jobs",
+                },
+                workspace_id=wid,
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"FREE plan limit {quota_decision.limit} jobs/month "
+                        f"reached; resets at {quota_decision.reset_at}"
+                    ),
+                    "quota_reset_at": quota_decision.reset_at,
+                    "jobs_used": quota_decision.jobs_used,
+                    "jobs_remaining": 0,
+                },
+                status_code=429,
+            )
         job = repo.create_job(
             company_id=company_id,
             topic=payload["topic"],
@@ -897,6 +1052,41 @@ def create_app(*, repo: Optional[Repo] = None,
         job = repo.get_job(job_id)
         if job["state"] == "done":
             raise HTTPException(400, "job already done")
+        # Wave 6b: live-provider gate re-checked at retry time
+        # because plan may have flipped since the original submit
+        # (downgrades, suspensions, future webhook events).  We
+        # do NOT re-check the monthly job quota here: the job
+        # already counted against the original submit, and a
+        # user-driven retry shouldn't double-burn a quota slot.
+        from core.quotas import check_live_provider_allowed
+        from core.audit import (
+            EVENT_LIVE_PROVIDER_BLOCKED, emit as emit_audit,
+        )
+        _ws = repo.get_workspace(job["workspace_id"])
+        live_decision = check_live_provider_allowed(
+            plan=_ws.get("plan", "free"),
+            workspace_live_enabled=_ws.get("live_enabled", False),
+            render_profile=job.get("render_profile", "mock"),
+        )
+        if not live_decision.allowed:
+            emit_audit(
+                repo,
+                event=EVENT_LIVE_PROVIDER_BLOCKED,
+                context={
+                    "workspace_id": job["workspace_id"],
+                    "plan": _ws.get("plan", "free"),
+                    "ws_live_enabled": live_decision.ws_live_enabled,
+                    "render_profile": job.get(
+                        "render_profile", "mock",
+                    ),
+                    "reason": live_decision.reason,
+                    "endpoint": "POST /api/v1/jobs/{job_id}/retry",
+                },
+                workspace_id=job["workspace_id"],
+            )
+            raise HTTPException(
+                403, f"live providers blocked: {live_decision.reason}",
+            )
         repo.update_job(job_id, state="queued", status_message="retry requested")
         runner.submit(job_id)
         return repo.get_job(job_id)
@@ -1104,13 +1294,9 @@ def create_app(*, repo: Optional[Repo] = None,
         )
         app.include_router(_stripe_router)
     except Exception as _stripe_e:
-        # STRIPE_WEBHOOK_SECRET missing → expose the config error
+        # STRIPE_WEBHOOK_SECRET missing -> expose the config error
         # on a debug endpoint and continue serving non-Stripe routes.
-        # Tests can opt in by setting the env var before create_app().
-        # NB: bind the message to a default arg to avoid the
-        # "free variable '_stripe_e' not associated with a value"
-        # NameError — Python clears the exception after the
-        # `except` block exits.
+        # Tests opt in by setting the env var before create_app().
         _stripe_err_msg = str(_stripe_e)
 
         @app.get("/_stripe_init_error")

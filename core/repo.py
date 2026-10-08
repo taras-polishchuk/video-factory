@@ -230,22 +230,121 @@ def _compute_checksum(s: str) -> str:
 class Repo:
     """Thread-safe SQLite wrapper. Per-thread connections guarded by a lock."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *,
+                 db_key: Optional[str] = None) -> None:
+        """Construct a Repo.
+
+        `db_key` overrides the env var `VIDEO_FACTORY_DB_KEY`. If
+        the env var is set the bare constructor picks it up
+        automatically; tests can pass `db_key="x"` directly.
+
+        Wave 5 startup rules:
+
+      * if `VIDEO_FACTORY_DB_KEY` is set AND the file at `db_path`
+        exists AND it is plaintext → raise `PlaintextDBRefused`.
+        The operator must run a one-time migration via
+        `core.cipher_db.migrate_plaintext_to_cipher`.  We do NOT
+        silently re-open a "keyed" deployment as plaintext, because
+        that defeats the entire point of Wave 5.
+
+      * if `VIDEO_FACTORY_DB_KEY` is set AND the file doesn't
+        exist → create a new cipher DB at `db_path` with the key.
+
+      * if `VIDEO_FACTORY_DB_KEY` is unset → behave exactly as in
+        Wave 1..4 (plaintext dev / legacy).
+        """
         self.db_path = db_path
+        # Effective key (env override wins unless caller forced one).
+        import core.cipher_db as _cipher
+        if db_key is None:
+            db_key = _cipher._cipher_key()  # type: ignore[attr-defined]
+        self.db_key = db_key
+        # If a key is configured, the file MUST be cipher (or
+        # missing). Reject plaintext.
+        if self.db_key is not None:
+            if _cipher.detect_plaintext(db_path):  # type: ignore[attr-defined]
+                raise _cipher.PlaintextDBRefused(  # type: ignore[attr-defined]
+                    f"{db_path} is a plaintext SQLite DB but "
+                    f"VIDEO_FACTORY_DB_KEY is set. Refusing to open. "
+                    f"Run one of:\n"
+                    f"  python -c 'from core.cipher_db import "
+                    f"migrate_plaintext_to_cipher; "
+                    f"migrate_plaintext_to_cipher(plain_path=\"{db_path}\","
+                    f" cipher_path=\"{db_path}\", "
+                    f"key=...)'\n"
+                    f"or unset VIDEO_FACTORY_DB_KEY for plaintext "
+                    f"dev mode (NOT for production)."
+                )
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         # Open one connection per thread (sqlite3 is connection-thread-local).
         import threading as _t
         self._local = _t.local()
+        # ── Cross-thread epoch counter (Wave 5 follow-up-2) ──
+        # `Repo.close()` only clears the *calling thread's* thread-local
+        # connection.  After a master-key rotation, every thread that
+        # had previously called `repo._conn()` still holds a
+        # connection that was PRAGMA-key'd with the OLD key, even
+        # though `repo.db_key` has been updated and the cipher file on
+        # disk is the NEW one.  That stale connection either:
+        #   * raises RotationInProgress forever (because it reads
+        #     the pre-swap `key_rotation` row whose
+        #     `rotation_in_progress` is still 1 from its OWN conn's
+        #     perspective — the post-swap UPDATE used a different
+        #     conn on the rotating thread), OR
+        #   * silently encrypts writes with the OLD key into the
+        #     NEW-cipher file (unreadable to any NEW-key reader).
+        # Bumping `self._epoch` after the swap forces every thread's
+        # next `_conn()` access to close its stale conn and reopen
+        # with the current `self.db_key`.  Cheaper than walking
+        # `threading.enumerate()` to enumerate per-thread caches and
+        # avoids the need for a global connection registry.
+        self._epoch: int = 0
         self._bootstrap_schema()
 
     def _conn(self):
         c = getattr(self._local, "conn", None)
+        c_epoch = getattr(self._local, "conn_epoch", None)
+        # If the per-thread conn is from an earlier epoch (i.e. the
+        # Repo was rotated after this thread last opened its conn),
+        # discard it.  A fresh open with `self.db_key` is the only
+        # sqlcipher3-documented way to switch the page-encryption key
+        # on a connection — re-issuing PRAGMA key on an existing
+        # connection is not officially supported and behaves
+        # inconsistently across sqlcipher3 versions.
+        if c is not None and c_epoch != self._epoch:
+            try:
+                c.close()
+            except Exception:
+                pass
+            c = None
+            self._local.conn = None
         if c is None:
-            c = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
-            c.execute("PRAGMA journal_mode=WAL")
+            import core.cipher_db as _cipher
+            c = _cipher.connect(self.db_path, key=self.db_key)
+            # SQLCipher raises a private `DatabaseError` subclass
+            # that does NOT inherit from `sqlite3.DatabaseError`
+            # (verified 2026-10).  The rest of the Repo (and tests)
+            # expect stdlib `sqlite3.DatabaseError` for "wrong key
+            # / corrupt page" cases, so we normalise the failure
+            # of the post-open pragmas here.  We don't swallow the
+            # error — we re-raise it as a stdlib exception so the
+            # caller's `except sqlite3.DatabaseError` still fires.
+            try:
+                c.execute("PRAGMA journal_mode=WAL")
+            except Exception as exc:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                if isinstance(exc, sqlite3.DatabaseError):
+                    raise
+                raise sqlite3.DatabaseError(
+                    f"sqlcipher post-open pragma failed: {exc}"
+                ) from exc
             c.execute("PRAGMA foreign_keys=ON")
             self._local.conn = c
+            self._local.conn_epoch = self._epoch
         return c
 
     def _bootstrap_schema(self):
@@ -275,8 +374,10 @@ class Repo:
         apply_migrations(c)
         # Extend audit_log with user_id + workspace_id + actor if absent.
         self._extend_audit_log_columns()
-        # Wave 6c: extend workspaces with current_period_end if absent.
-        self._extend_workspaces_columns()
+        # Wave 6a: ensure workspaces has the Stripe subscription
+        # period-end column. Idempotent — PRAGMA table_info check
+        # inside the helper skips ALTER if already present.
+        self._extend_workspaces_billing_columns()
         # Run the canonical schema again so anything that the
         # Wave-2 rename removed is recreated with workspace_id FKs.
         c.executescript(SCHEMA)
@@ -323,25 +424,27 @@ class Repo:
             c.execute("ALTER TABLE audit_log ADD COLUMN actor TEXT")
         c.commit()
 
-    def _extend_workspaces_columns(self) -> None:
-        """Ensure workspaces has current_period_end column.
+    def _extend_workspaces_billing_columns(self) -> None:
+        """Ensure workspaces has the Wave 6a billing columns.
 
-        Wave 6c: Stripe webhook handler stores the subscription
-        billing period end on the workspace so the UI can render
-        "renews on <date>".  Idempotent — checks via
-        PRAGMA table_info before ADD COLUMN. Mirrors
-        `_extend_audit_log_columns()` for the same SQLite < 3.35
-        reason.
+        SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+        before 3.35, so we check via `PRAGMA table_info` and ALTER
+        if missing.  Idempotent — safe to call on every bootstrap.
+
+        Adds:
+
+        - ``current_period_end INTEGER`` — unix timestamp of the
+          Stripe subscription's current period end. NULL means no
+          active subscription.
         """
         c = self._conn()
-        if not self._table_exists("workspaces"):
-            return
-        cols = {row[1] for row in
-                c.execute("PRAGMA table_info(workspaces)").fetchall()}
+        cols = {row[1].lower()
+                for row in c.execute("PRAGMA table_info(workspaces)").fetchall()}
         if "current_period_end" not in cols:
-            c.execute("ALTER TABLE workspaces "
-                      "ADD COLUMN current_period_end INTEGER")
-        c.commit()
+            c.execute(
+                "ALTER TABLE workspaces ADD COLUMN current_period_end INTEGER"
+            )
+            c.commit()
 
     def _apply_migration_005(self) -> None:
         """Idempotent Wave-2 migration: company_id -> workspace_id.
@@ -839,8 +942,36 @@ class Repo:
             self._local.conn = None
 
     @contextmanager
-    def tx(self) -> Iterator[sqlite3.Connection]:
+    def tx(self, *, _skip_rotation_check: bool = False
+           ) -> Iterator[sqlite3.Connection]:
+        """Open a transaction with rotation-in-progress gating.
+
+        Wave 5 follow-up (t_abf264b4): while a master-key rotation
+        is in progress, every write transaction MUST raise
+        `RotationInProgress` so concurrent writers cannot land on
+        a freshly-swapped cipher file with a stale key.  The
+        canonical write path in the API layer is `with repo.tx() as
+        c: c.execute(...)`, so gating here covers all the methods
+        on `Repo` that perform INSERT/UPDATE/DELETE.
+
+        Internal callers (e.g. `key_rotation.rotate` itself) pass
+        `_skip_rotation_check=True` so the rotation function can
+        write its own bookkeeping rows while the flag is set.
+
+        Reads via `repo._conn()` (no lock, no rotation check) are
+        unchanged; they observe the on-disk state of the live DB.
+        """
         with self._lock:
+            if not _skip_rotation_check:
+                # Imported lazily so the Repo module remains
+                # importable without the key_rotation dependency
+                # being available at import time.
+                from control_plane import key_rotation as _kr
+                if not _kr.writes_allowed(self):
+                    raise _kr.RotationInProgress(
+                        "master-key rotation in progress; "
+                        "writes are paused"
+                    )
             c = self._conn()
             try:
                 yield c
@@ -924,7 +1055,8 @@ class Repo:
         row = self._conn().execute(
             "SELECT workspace_id, slug, name, description, plan, status, "
             "live_enabled, owner_user_id, stripe_customer_id, "
-            "stripe_subscription_id, created_at, updated_at "
+            "stripe_subscription_id, current_period_end, "
+            "created_at, updated_at "
             "FROM workspaces WHERE workspace_id=?",
             (workspace_id,),
         ).fetchone()
@@ -936,7 +1068,8 @@ class Repo:
         row = self._conn().execute(
             "SELECT workspace_id, slug, name, description, plan, status, "
             "live_enabled, owner_user_id, stripe_customer_id, "
-            "stripe_subscription_id, created_at, updated_at "
+            "stripe_subscription_id, current_period_end, "
+            "created_at, updated_at "
             "FROM workspaces WHERE slug=?",
             (slug.lower(),),
         ).fetchone()
@@ -948,7 +1081,8 @@ class Repo:
         rows = self._conn().execute(
             "SELECT workspace_id, slug, name, description, plan, status, "
             "live_enabled, owner_user_id, stripe_customer_id, "
-            "stripe_subscription_id, created_at, updated_at "
+            "stripe_subscription_id, current_period_end, "
+            "created_at, updated_at "
             "FROM workspaces ORDER BY created_at"
         ).fetchall()
         return [self._row_workspace_full(r) for r in rows]
@@ -979,80 +1113,7 @@ class Repo:
             )
         return self.get_workspace(workspace_id)
 
-    # ── Stripe billing (Wave 6c) ────────────────────────────────
-    # These methods are called by the Stripe webhook handler.
-    # They are intentionally narrow: only the fields the webhook
-    # is allowed to change (plan, stripe_customer_id,
-    # stripe_subscription_id, current_period_end). The handler
-    # MUST compose these inside a single Repo.tx() block so the
-    # plan change and the audit row are atomic.
-
-    def update_workspace_billing(
-        self, workspace_id: str, *,
-        plan: Optional[str] = None,
-        stripe_customer_id: Optional[str] = None,
-        stripe_subscription_id: Optional[str] = None,
-        current_period_end: Optional[int] = None,
-        clear_subscription: bool = False,
-    ) -> dict:
-        """Update billing-related fields on a workspace.
-
-        All updates happen inside a single tx so a partial write
-        never leaks. Pass `clear_subscription=True` to NULL out
-        `stripe_subscription_id` (used on customer.subscription.deleted).
-        """
-        if plan is not None and plan not in ("free", "pro", "enterprise"):
-            raise ValueError(f"invalid plan: {plan!r}")
-        with self.tx() as c:
-            existing = self.get_workspace(workspace_id)
-            new_plan = plan if plan is not None else existing["plan"]
-            new_cid = (stripe_customer_id
-                       if stripe_customer_id is not None
-                       else existing.get("stripe_customer_id"))
-            new_sid = (None if clear_subscription
-                       else (stripe_subscription_id
-                             if stripe_subscription_id is not None
-                             else existing.get("stripe_subscription_id")))
-            new_cpe = (current_period_end
-                       if current_period_end is not None
-                       else existing.get("current_period_end"))
-            c.execute(
-                "UPDATE workspaces SET plan=?, stripe_customer_id=?, "
-                "stripe_subscription_id=?, current_period_end=?, "
-                "updated_at=? WHERE workspace_id=?",
-                (new_plan, new_cid, new_sid, new_cpe,
-                 now_iso(), workspace_id),
-            )
-        return self.get_workspace(workspace_id)
-
-    def find_workspace_by_stripe_customer(self, customer_id: str) -> Optional[dict]:
-        """Look up the workspace bound to a Stripe customer id.
-
-        Used by customer.subscription.* events where the only
-        link back to a tenant is the customer id. Returns None
-        if no workspace has been bound yet.
-        """
-        row = self._conn().execute(
-            "SELECT workspace_id, slug, name, description, plan, status, "
-            "live_enabled, owner_user_id, stripe_customer_id, "
-            "stripe_subscription_id, created_at, updated_at, "
-            "current_period_end "
-            "FROM workspaces WHERE stripe_customer_id=?",
-            (customer_id,),
-        ).fetchone()
-        if not row:
-            return None
-        return self._row_workspace_full_v6c(row)
-
-    def _row_workspace_full_v6c(self, row) -> dict:
-        """Workspace row decoder with current_period_end.
-
-        Mirrors `_row_workspace_full` plus the Wave 6c column.
-        Used by `find_workspace_by_stripe_customer`; the
-        `get_workspace` path keeps the older shape for back-compat
-        with Wave 1-5 callers (current_period_end comes through
-        as None for them).
-        """
+    def _row_workspace_full(self, row) -> dict:
         return {
             "workspace_id": row[0],
             "slug": row[1],
@@ -1064,10 +1125,134 @@ class Repo:
             "owner_user_id": row[7],
             "stripe_customer_id": row[8],
             "stripe_subscription_id": row[9],
-            "created_at": row[10],
-            "updated_at": row[11],
-            "current_period_end": row[12],
+            "current_period_end": row[10],
+            "created_at": row[11],
+            "updated_at": row[12],
         }
+
+    # Legacy alias: the old `_row_workspace` is still referenced by
+    # the auth router and Wave 1 tests.  Keep it as a thin wrapper
+    # that returns the same shape with the canonical workspace_id key.
+    def _row_workspace(self, row) -> dict:
+        return self._row_workspace_full(row)
+
+    # ── Wave 6a billing helpers ─────────────────────────────
+
+    def get_workspace_billing(self, workspace_id: str) -> dict:
+        """Return the Stripe billing state for a workspace.
+
+        Returns ``{}`` (NOT a NotFound) when no row matches — the
+        API layer uses this to decide whether to surface a
+        'no customer yet, click Upgrade' empty state.  Only the
+        three Stripe columns are returned; full workspace state is
+        available via ``get_workspace``.
+        """
+        row = self._conn().execute(
+            "SELECT stripe_customer_id, stripe_subscription_id, "
+            "current_period_end FROM workspaces WHERE workspace_id=?",
+            (workspace_id,),
+        ).fetchone()
+        if not row:
+            return {}
+        return {
+            "workspace_id": workspace_id,
+            "stripe_customer_id": row[0],
+            "stripe_subscription_id": row[1],
+            "current_period_end": row[2],
+        }
+
+    def upsert_stripe_customer(self, workspace_id: str,
+                                 customer_id: str) -> dict:
+        """Persist a Stripe customer id for a workspace.
+
+        Called immediately after the API creates the Customer
+        object (or after a successful Checkout Session whose
+        `customer` field was filled).  Returns the refreshed
+        workspace billing row.
+        """
+        if not customer_id:
+            raise ValueError("customer_id required")
+        with self.tx() as c:
+            existing = self.get_workspace(workspace_id)
+            c.execute(
+                "UPDATE workspaces SET stripe_customer_id=?, "
+                "updated_at=? WHERE workspace_id=?",
+                (customer_id, now_iso(), workspace_id),
+            )
+        _ = existing  # touched only to raise NotFound early on bad id
+        return self.get_workspace_billing(workspace_id)
+
+    def upsert_stripe_subscription(self, workspace_id: str,
+                                     subscription_id: str,
+                                     period_end: Optional[int]) -> dict:
+        """Persist a Stripe subscription id + current_period_end.
+
+        `period_end` is the unix timestamp from the Stripe
+        subscription object (``current_period_end`` field).  Stored
+        as INTEGER; NULL means no active subscription.
+        """
+        if not subscription_id:
+            raise ValueError("subscription_id required")
+        with self.tx() as c:
+            existing = self.get_workspace(workspace_id)
+            c.execute(
+                "UPDATE workspaces SET stripe_subscription_id=?, "
+                "current_period_end=?, updated_at=? WHERE workspace_id=?",
+                (subscription_id, period_end, now_iso(), workspace_id),
+            )
+        _ = existing
+        return self.get_workspace_billing(workspace_id)
+
+    def update_workspace_billing(self, workspace_id: str,
+                                   *,
+                                   plan: Optional[str] = None,
+                                   stripe_customer_id: Optional[str] = None,
+                                   stripe_subscription_id: Optional[str] = None,
+                                   current_period_end: Optional[int] = None,
+                                   clear_subscription: bool = False) -> dict:
+        """Multi-column setter for Stripe billing state.
+
+        Only the fields that are not None are updated; ``None``
+        means 'leave unchanged'.  ``clear_subscription=True``
+        forcibly nulls ``stripe_subscription_id`` (used by the
+        ``customer.subscription.deleted`` webhook to express the
+        "ended" state without ambiguity).  This is the unified
+        entry point used by the Wave 6c webhook handlers (plan
+        flip + period refresh + customer binding all happen
+        here).  Returns the refreshed billing row via
+        ``get_workspace_billing``.
+        """
+        sets = []
+        vals: list = []
+        if plan is not None:
+            sets.append("plan=?")
+            vals.append(plan)
+        if stripe_customer_id is not None:
+            sets.append("stripe_customer_id=?")
+            vals.append(stripe_customer_id)
+        if clear_subscription:
+            sets.append("stripe_subscription_id=NULL")
+        elif stripe_subscription_id is not None:
+            sets.append("stripe_subscription_id=?")
+            vals.append(stripe_subscription_id)
+        if current_period_end is not None:
+            sets.append("current_period_end=?")
+            vals.append(current_period_end)
+        if not sets:
+            return self.get_workspace_billing(workspace_id)
+        sets.append("updated_at=?")
+        vals.append(now_iso())
+        vals.append(workspace_id)
+        # Confirm workspace exists so callers get a clear
+        # NotFound rather than a silent no-op.
+        self.get_workspace(workspace_id)
+        with self.tx() as c:
+            c.execute(
+                f"UPDATE workspaces SET {', '.join(sets)} "
+                f"WHERE workspace_id=?",
+                tuple(vals),
+            )
+        return self.get_workspace_billing(workspace_id)
 
     def insert_stripe_event(self, *, event_id: str, event_type: str,
                               raw_json: str) -> bool:
@@ -1124,27 +1309,33 @@ class Repo:
             "processed_at": row[4],
         }
 
-    def _row_workspace_full(self, row) -> dict:
-        return {
-            "workspace_id": row[0],
-            "slug": row[1],
-            "name": row[2],
-            "description": row[3] or "",
-            "plan": row[4],
-            "status": row[5],
-            "live_enabled": bool(row[6]),
-            "owner_user_id": row[7],
-            "stripe_customer_id": row[8],
-            "stripe_subscription_id": row[9],
-            "created_at": row[10],
-            "updated_at": row[11],
-        }
+    def find_workspace_by_stripe_customer(self,
+                                           customer_id: str) -> Optional[dict]:
+        """Look up a workspace by its Stripe customer id.
 
-    # Legacy alias: the old `_row_workspace` is still referenced by
-    # the auth router and Wave 1 tests.  Keep it as a thin wrapper
-    # that returns the same shape with the canonical workspace_id key.
-    def _row_workspace(self, row) -> dict:
-        return self._row_workspace_full(row)
+        Returns ``None`` (not a NotFound) when the customer is
+        unknown — webhook handlers use this to map an inbound
+        event back to the affected workspace.
+        """
+        row = self._conn().execute(
+            "SELECT * FROM workspaces WHERE stripe_customer_id=?",
+            (customer_id,),
+        ).fetchone()
+        if not row:
+            return None
+        # Mirror get_workspace's row-keyed dict shape.
+        return {k: row[i] for i, k in enumerate(self._workspace_columns())}
+
+    def _workspace_columns(self) -> list:
+        """Column names in the workspaces table (cached)."""
+        if not hasattr(self, "_ws_cols_cache"):
+            cur = self._conn().execute(
+                "SELECT * FROM workspaces LIMIT 0"
+            )
+            self._ws_cols_cache = [
+                d[0] for d in cur.description
+            ]
+        return self._ws_cols_cache
 
     # ── Legacy compat: company_id <-> workspace_id aliases ─────
 
@@ -1476,6 +1667,49 @@ class Repo:
             raise NotFound(f"job {job_id} not found")
         return self._row_job(row)
 
+    def count_jobs_since(self, *, workspace_id: str,
+                            since_iso: str) -> int:
+        """Count how many jobs the workspace has submitted at or
+        after ``since_iso`` (inclusive).
+
+        Used by the Wave 6b FREE-tier monthly job quota
+        (``core/quotas.check_job_quota``).  Pure SELECT; no tx
+        required.  ``since_iso`` is the first instant of the
+        current month in the same ISO format produced by
+        ``now_iso`` (``YYYY-MM-%-dTHH:MM:SSZ``); SQLite compares
+        ISO-8601 strings lexicographically and the format sorts
+        chronologically, so ``>= since_iso`` is correct without a
+        datetime cast.
+
+        Cancelled / failed jobs are NOT excluded — the brief counts
+        every job the user submitted, not just successful ones.
+        That matches the operator's mental model: "I burnt my 5
+        attempts on broken bibles" is a real quota cost.
+        """
+        row = self._conn().execute(
+            "SELECT COUNT(*) FROM jobs WHERE workspace_id=? "
+            "AND created_at >= ?",
+            (workspace_id, since_iso),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def count_workspaces_owned_by(self, user_id: str) -> int:
+        """Count how many workspaces the user owns (role='owner').
+
+        Used by the Wave 6b FREE-tier workspace quota
+        (``core/quotas.check_workspace_count``).  The Wave 2
+        membership model grants a user the ``owner`` role only on
+        workspaces they created (or were assigned as the first
+        member of); the brief's "1 workspace per FREE user" limit
+        counts only owner-role workspaces.
+        """
+        row = self._conn().execute(
+            "SELECT COUNT(*) FROM memberships "
+            "WHERE user_id=? AND role='owner'",
+            (user_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def list_jobs(self, *, company_id: Optional[str] = None,
                     workspace_id: Optional[str] = None,
                     state: Optional[str] = None) -> list[dict]:
@@ -1765,11 +1999,23 @@ class Repo:
         the bytes.  Returns the masked surface (NEVER the
         plaintext).
 
+        Wave 5: refuses to write while a master-key rotation is in
+        progress.  The API maps this to HTTP 503 with a clear
+        "rotation in progress" message so the UI can render its
+        banner.
+
         `company_id` is accepted as a backwards-compat alias for
         `workspace_id` so legacy call sites keep working.  Exactly
         one of the two MUST be set; if both are set, `workspace_id`
         wins.
         """
+        # Wave 5: refuse new credentials while a rotation runs.
+        from control_plane import key_rotation
+        if not key_rotation.credential_writes_allowed(self):
+            raise key_rotation.RotationInProgress(
+                "master-key rotation in progress; "
+                "credential writes are paused"
+            )
         if provider not in self.CREDENTIAL_PROVIDERS:
             raise ValueError(f"unknown provider: {provider!r}")
         wid = self._resolve_wid(company_id, workspace_id)
