@@ -275,6 +275,8 @@ class Repo:
         apply_migrations(c)
         # Extend audit_log with user_id + workspace_id + actor if absent.
         self._extend_audit_log_columns()
+        # Wave 6c: extend workspaces with current_period_end if absent.
+        self._extend_workspaces_columns()
         # Run the canonical schema again so anything that the
         # Wave-2 rename removed is recreated with workspace_id FKs.
         c.executescript(SCHEMA)
@@ -319,6 +321,26 @@ class Repo:
             c.execute("ALTER TABLE audit_log ADD COLUMN workspace_id TEXT")
         if "actor" not in cols:
             c.execute("ALTER TABLE audit_log ADD COLUMN actor TEXT")
+        c.commit()
+
+    def _extend_workspaces_columns(self) -> None:
+        """Ensure workspaces has current_period_end column.
+
+        Wave 6c: Stripe webhook handler stores the subscription
+        billing period end on the workspace so the UI can render
+        "renews on <date>".  Idempotent — checks via
+        PRAGMA table_info before ADD COLUMN. Mirrors
+        `_extend_audit_log_columns()` for the same SQLite < 3.35
+        reason.
+        """
+        c = self._conn()
+        if not self._table_exists("workspaces"):
+            return
+        cols = {row[1] for row in
+                c.execute("PRAGMA table_info(workspaces)").fetchall()}
+        if "current_period_end" not in cols:
+            c.execute("ALTER TABLE workspaces "
+                      "ADD COLUMN current_period_end INTEGER")
         c.commit()
 
     def _apply_migration_005(self) -> None:
@@ -956,6 +978,151 @@ class Repo:
                  1 if new_live else 0, now_iso(), workspace_id),
             )
         return self.get_workspace(workspace_id)
+
+    # ── Stripe billing (Wave 6c) ────────────────────────────────
+    # These methods are called by the Stripe webhook handler.
+    # They are intentionally narrow: only the fields the webhook
+    # is allowed to change (plan, stripe_customer_id,
+    # stripe_subscription_id, current_period_end). The handler
+    # MUST compose these inside a single Repo.tx() block so the
+    # plan change and the audit row are atomic.
+
+    def update_workspace_billing(
+        self, workspace_id: str, *,
+        plan: Optional[str] = None,
+        stripe_customer_id: Optional[str] = None,
+        stripe_subscription_id: Optional[str] = None,
+        current_period_end: Optional[int] = None,
+        clear_subscription: bool = False,
+    ) -> dict:
+        """Update billing-related fields on a workspace.
+
+        All updates happen inside a single tx so a partial write
+        never leaks. Pass `clear_subscription=True` to NULL out
+        `stripe_subscription_id` (used on customer.subscription.deleted).
+        """
+        if plan is not None and plan not in ("free", "pro", "enterprise"):
+            raise ValueError(f"invalid plan: {plan!r}")
+        with self.tx() as c:
+            existing = self.get_workspace(workspace_id)
+            new_plan = plan if plan is not None else existing["plan"]
+            new_cid = (stripe_customer_id
+                       if stripe_customer_id is not None
+                       else existing.get("stripe_customer_id"))
+            new_sid = (None if clear_subscription
+                       else (stripe_subscription_id
+                             if stripe_subscription_id is not None
+                             else existing.get("stripe_subscription_id")))
+            new_cpe = (current_period_end
+                       if current_period_end is not None
+                       else existing.get("current_period_end"))
+            c.execute(
+                "UPDATE workspaces SET plan=?, stripe_customer_id=?, "
+                "stripe_subscription_id=?, current_period_end=?, "
+                "updated_at=? WHERE workspace_id=?",
+                (new_plan, new_cid, new_sid, new_cpe,
+                 now_iso(), workspace_id),
+            )
+        return self.get_workspace(workspace_id)
+
+    def find_workspace_by_stripe_customer(self, customer_id: str) -> Optional[dict]:
+        """Look up the workspace bound to a Stripe customer id.
+
+        Used by customer.subscription.* events where the only
+        link back to a tenant is the customer id. Returns None
+        if no workspace has been bound yet.
+        """
+        row = self._conn().execute(
+            "SELECT workspace_id, slug, name, description, plan, status, "
+            "live_enabled, owner_user_id, stripe_customer_id, "
+            "stripe_subscription_id, created_at, updated_at, "
+            "current_period_end "
+            "FROM workspaces WHERE stripe_customer_id=?",
+            (customer_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_workspace_full_v6c(row)
+
+    def _row_workspace_full_v6c(self, row) -> dict:
+        """Workspace row decoder with current_period_end.
+
+        Mirrors `_row_workspace_full` plus the Wave 6c column.
+        Used by `find_workspace_by_stripe_customer`; the
+        `get_workspace` path keeps the older shape for back-compat
+        with Wave 1-5 callers (current_period_end comes through
+        as None for them).
+        """
+        return {
+            "workspace_id": row[0],
+            "slug": row[1],
+            "name": row[2],
+            "description": row[3] or "",
+            "plan": row[4],
+            "status": row[5],
+            "live_enabled": bool(row[6]),
+            "owner_user_id": row[7],
+            "stripe_customer_id": row[8],
+            "stripe_subscription_id": row[9],
+            "created_at": row[10],
+            "updated_at": row[11],
+            "current_period_end": row[12],
+        }
+
+    def insert_stripe_event(self, *, event_id: str, event_type: str,
+                              raw_json: str) -> bool:
+        """Try to record a Stripe event for idempotency.
+
+        Returns True if the event was newly recorded (caller
+        should proceed to process it). Returns False if the
+        event id was already present (caller should treat as
+        duplicate and skip processing).  Race-safe via the
+        PRIMARY KEY on stripe_events.id — concurrent inserts
+        with the same id will see one True and the rest False.
+        """
+        try:
+            with self.tx() as c:
+                c.execute(
+                    "INSERT INTO stripe_events(id, type, received_at, "
+                    "raw_json) VALUES (?,?,?,?)",
+                    (event_id, event_type, int(time.time()), raw_json),
+                )
+            return True
+        except Exception as e:
+            if "UNIQUE constraint failed" in str(e):
+                return False
+            raise
+
+    def mark_stripe_event_processed(self, event_id: str) -> None:
+        """Stamp processed_at on a previously-recorded event.
+
+        Called after the handler successfully applied the event
+        to the workspace. Idempotent — re-stamping a processed
+        event is a no-op.
+        """
+        with self.tx() as c:
+            c.execute(
+                "UPDATE stripe_events SET processed_at=? "
+                "WHERE id=? AND processed_at IS NULL",
+                (int(time.time()), event_id),
+            )
+
+    def get_stripe_event(self, event_id: str) -> Optional[dict]:
+        """Fetch a stored Stripe event (for tests + debugging)."""
+        row = self._conn().execute(
+            "SELECT id, type, received_at, raw_json, processed_at "
+            "FROM stripe_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "type": row[1],
+            "received_at": row[2],
+            "raw_json": row[3],
+            "processed_at": row[4],
+        }
 
     def _row_workspace_full(self, row) -> dict:
         return {
