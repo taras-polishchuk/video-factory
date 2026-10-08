@@ -1,0 +1,88 @@
+# Production docker-compose for Video Factory SaaS.
+#
+# Two services:
+#   - api   — FastAPI on 127.0.0.1:8000 (inside the container). Only
+#             reachable via the Caddy reverse proxy on the host.
+#   - web   — SvelteKit Node server on 127.0.0.1:3000 (inside the
+#             container). Only reachable via Caddy.
+#   - caddy — Caddy with the cloudflare DNS plugin, listening on :80
+#             (redirect-to-https) and :443 (TLS via DNS-01).
+#
+# Secrets come from .env.production (mode 0600), which is generated
+# by systemd/video-factory-load-env.sh from LoadCredential= files.
+# That file is .gitignore'd and never contains literal tokens in
+# this repo.
+
+services:
+  api:
+    image: video-factory-api:${VIDEO_FACTORY_IMAGE_TAG:-dev}
+    container_name: vf-api
+    working_dir: /app
+    command: ["uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1"]
+    restart: unless-stopped
+    init: true
+    environment:
+      PYTHONPATH: /app
+      VIDEO_FACTORY_DB: /data/video_factory.db
+      VIDEO_FACTORY_STORAGE: /data/storage
+      # Secrets from .env.production (NOT from this file)
+      VIDEO_FACTORY_SECRET_KEY: ${VIDEO_FACTORY_SECRET_KEY:?VIDEO_FACTORY_SECRET_KEY must be set}
+      VIDEO_FACTORY_DB_KEY: ${VIDEO_FACTORY_DB_KEY:?VIDEO_FACTORY_DB_KEY must be set}
+      VIDEO_FACTORY_SESSION_SECRET: ${VIDEO_FACTORY_SESSION_SECRET:?VIDEO_FACTORY_SESSION_SECRET must be set}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY must be set}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:?STRIPE_WEBHOOK_SECRET must be set}
+      LIVE_PROVIDER_TESTS: "false"
+      MAX_COST_PER_VIDEO_USD: "5"
+      MAX_COST_PER_BATCH_USD: "20"
+    volumes:
+      - vf_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on: []
+
+  web:
+    image: video-factory-web:${VIDEO_FACTORY_IMAGE_TAG:-dev}
+    container_name: vf-web
+    working_dir: /app
+    command: ["node", "build/index.js"]
+    restart: unless-stopped
+    init: true
+    environment:
+      PORT: "3000"
+      ORIGIN: https://${VIDEO_FACTORY_DOMAIN:?VIDEO_FACTORY_DOMAIN must be set}
+      # Cookies must be Secure + SameSite=None when behind HTTPS
+      COOKIE_SECURE: "true"
+      COOKIE_SAMESITE: "lax"
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2
+    container_name: vf-caddy
+    restart: unless-stopped
+    cap_add:
+        - NET_BIND_SERVICE
+    ports:
+      # 80 is open only for the HTTP→HTTPS redirect; Caddy never
+      # accepts ACME challenges here (DNS-01 instead).
+      - "80:80"
+      - "443:443"
+    environment:
+      # Read the cloudflare token directly from the env file
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN must be set}
+    volumes:
+      - ../Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - web
+
+volumes:
+  vf_data:
+  caddy_data:
+  caddy_config:

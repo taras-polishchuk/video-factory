@@ -1,0 +1,60 @@
+# Caddyfile — Video Factory SaaS production reverse proxy
+#
+# Layout
+#   :443 (TLS via DNS-01, no port-80 needed) → api:8000 (FastAPI)
+#                                       └──→ web:3000 (SvelteKit/Node, optional)
+#
+# Hardening headers applied to BOTH virtual hosts (api + web).
+# These are tested by test_caddyfile_security_headers_present.
+#
+# Replace `video-factory.example.com` with the real domain when running
+# ./scripts/deploy.sh. The deploy script rewrites this file in place
+# before starting caddy.
+
+# ─── Main virtual host (api + web on same origin) ─────────────
+{$VIDEO_FACTORY_DOMAIN:video-factory.example.com} {
+    # DNS-01 challenge is issued by Caddy's on-demand ACME flow.
+    # No port-80 listener is required. The cloudflare DNS plugin is
+    # configured by setting CLOUDFLARE_API_TOKEN in the caddy
+    # environment before launching it.
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+
+    # Forward /api/*, /health*, /metrics*, /openapi.json, /docs,
+    # /redoc, /auth/* to the FastAPI container.
+    @api path /api/* /auth/* /health* /metrics* /openapi.json /docs /redoc
+    reverse_proxy @api api:8000
+
+    # Everything else → SvelteKit Node service (production build)
+    reverse_proxy web:3000
+
+    # ─── Security headers (Wave 7 §3.7) ─────────────────────
+    header {
+        # HSTS — 6 months, include subdomains
+        Strict-Transport-Security "max-age=15768000; includeSubDomains"
+        # Anti-clickjacking
+        X-Frame-Options "DENY"
+        # Prevent MIME sniffing
+        X-Content-Type-Options "nosniff"
+        # Referrer policy — never leak full URL
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Permissions policy — disable unused powerful features
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()"
+        # Strip identifying headers from upstream
+        -Server
+        -X-Powered-By
+    }
+
+    # Compress JSON / text responses
+    encode zstd gzip
+
+    # Forward the real Host to upstream so the FastAPI app sees the
+    # public domain (used for OIDC redirect_uri construction).
+    header_up Host {host}
+}
+
+# ─── Optional: bare-domain redirect ───────────────────────────
+http://{$VIDEO_FACTORY_DOMAIN:video-factory.example.com} {
+    redir https://{host}{uri} 308
+}

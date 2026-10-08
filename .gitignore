@@ -26,6 +26,18 @@ Thumbs.db
 .env
 .env.local
 .env.*.local
+.env.production
+
+# OpenTofu / hosts / caddy runtime state
+infra/opentofu/.terraform/
+infra/opentofu/.terraform.lock.hcl
+infra/opentofu/*.tfstate
+infra/opentofu/*.tfstate.backup
+infra/hosts/
+caddy-data/
+
+# Restic cache
+.restic/
 
 # Logs
 *.log
