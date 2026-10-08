@@ -1,21 +1,27 @@
 """Wave 6a — Stripe SDK + Checkout + Customer Portal + plan column tests.
 
-Ten tests covering:
+Fifteen tests covering:
 
-- Stripe SDK wrapper unit tests (3):
+- Stripe SDK wrapper unit tests (4):
     test_stripe_checkout_session_creation
     test_stripe_customer_portal_session_creation
     test_stripe_checkout_rejects_pro_workspace   (mapped to wrapper's plan gate)
+    test_stripe_checkout_passes_customer_email   (Wave 6a follow-up: F-W6A-003)
 
 - Repo helpers + migration tests (3):
     test_billing_migration_adds_stripe_columns
     test_repo_upsert_stripe_customer
     test_repo_upsert_stripe_subscription
 
-- API integration tests (4):
+- API integration tests (7):
     test_stripe_checkout_returns_url_and_session_id
     test_stripe_checkout_requires_owner_role
     test_stripe_portal_404_when_no_customer_id
+    test_stripe_checkout_502_on_stripe_error     (Wave 6a follow-up: F-W6A-001)
+    test_stripe_checkout_writes_failed_audit_row (Wave 6a follow-up: F-W6A-001)
+    test_stripe_portal_502_on_stripe_error       (Wave 6a follow-up: F-W6A-002)
+    test_stripe_portal_writes_failed_audit_row   (Wave 6a follow-up: F-W6A-002)
+    test_stripe_checkout_passes_workspace_owner_email  (Wave 6a follow-up: F-W6A-003)
     test_existing_273_tests_still_green  (proxy for full-suite green)
 
 The Stripe SDK is patched via
@@ -184,6 +190,45 @@ def test_stripe_checkout_session_creation():
             customer_id="cus_existing",
         )
     assert mc2.call_args.kwargs["customer"] == "cus_existing"
+
+
+def test_stripe_checkout_passes_customer_email():
+    """F-W6A-003: when ``customer_email`` is provided, the wrapper
+    forwards it to the SDK as the ``customer_email`` kwarg.  The
+    API layer (api/main.py) is responsible for sourcing this from
+    the workspace owner; the wrapper just passes it through.
+    """
+    from api.billing import StripeClient
+    client = StripeClient(api_key="sk_test_unit", pro_price_id="price_p")
+    fake = _checkout_response()
+    # 1) With customer_email -> SDK call carries it
+    with patch("stripe.checkout.Session.create", return_value=fake) as mc:
+        client.create_checkout_session(
+            workspace_id="wks_abc", plan="pro",
+            success_url="https://app.example/success",
+            cancel_url="https://app.example/cancel",
+            customer_email="owner@example.com",
+        )
+    assert mc.call_args.kwargs["customer_email"] == "owner@example.com"
+    # 2) Without customer_email -> SDK call has no customer_email key
+    with patch("stripe.checkout.Session.create", return_value=fake) as mc2:
+        client.create_checkout_session(
+            workspace_id="wks_abc", plan="pro",
+            success_url="https://app.example/success",
+            cancel_url="https://app.example/cancel",
+        )
+    assert "customer_email" not in mc2.call_args.kwargs
+    # 3) customer_id + customer_email both flow through
+    with patch("stripe.checkout.Session.create", return_value=fake) as mc3:
+        client.create_checkout_session(
+            workspace_id="wks_abc", plan="pro",
+            success_url="https://app.example/success",
+            cancel_url="https://app.example/cancel",
+            customer_id="cus_existing",
+            customer_email="owner@example.com",
+        )
+    assert mc3.call_args.kwargs["customer"] == "cus_existing"
+    assert mc3.call_args.kwargs["customer_email"] == "owner@example.com"
 
 
 def test_stripe_customer_portal_session_creation():
@@ -504,6 +549,153 @@ def test_stripe_portal_404_when_no_customer_id(billing_env):
     portal_kwargs = mc.call_args.kwargs
     assert portal_kwargs["customer"] == "cus_seeded"
     assert portal_kwargs["return_url"].endswith("/billing")
+
+
+# ── F-W6A-001 / F-W6A-002 / F-W6A-003: failure paths + customer_email ──
+#
+# These four tests are the builder-side guards for the 3 BLOCKER
+# defects flagged by the Wave 6a QA report.  The QA-authored tests
+# in tests/test_wave6a_qa_*.py are independent of this file; the
+# ones here mirror them so a future regression in the API layer
+# is caught by the builder's own suite as well.
+
+
+def test_stripe_checkout_502_on_stripe_error(billing_env):
+    """F-W6A-001 (status half): when ``stripe.checkout.Session.create``
+    raises a StripeError, the API must surface HTTP 502 (NOT 500).
+    """
+    from stripe._error import StripeError
+    client, _ = billing_env
+    fake_error = StripeError("invalid API key")
+    with patch("stripe.checkout.Session.create", side_effect=fake_error):
+        r = client.post("/api/v1/billing/checkout", json={
+            "workspace_id": client.workspace_id,
+            "plan": "pro",
+        })
+    assert r.status_code == 502, (
+        f"expected 502 Bad Gateway, got {r.status_code}: {r.text}"
+    )
+
+
+def test_stripe_checkout_writes_failed_audit_row(billing_env):
+    """F-W6A-001 (audit half): on Stripe error, a
+    ``billing.checkout_failed`` audit row must be written with the
+    workspace_id + plan recorded, and NO Stripe customer/subscription
+    IDs leaked into the audit context.
+    """
+    from stripe._error import StripeError
+    client, repo = billing_env
+    fake_error = StripeError("invalid API key")
+    with patch("stripe.checkout.Session.create", side_effect=fake_error):
+        r = client.post("/api/v1/billing/checkout", json={
+            "workspace_id": client.workspace_id,
+            "plan": "pro",
+        })
+    assert r.status_code == 502, r.text
+    audit_rows = repo.list_audit(workspace_id=client.workspace_id, limit=20)
+    fail_row = next(
+        (row for row in audit_rows
+         if row["event"] == "billing.checkout_failed"),
+        None,
+    )
+    assert fail_row is not None, (
+        f"expected billing.checkout_failed audit row, "
+        f"events found: {[r['event'] for r in audit_rows]}"
+    )
+    # No Stripe customer/subscription IDs leak into the failure audit.
+    assert "stripe_customer_id" not in fail_row["context"]
+    assert "stripe_subscription_id" not in fail_row["context"]
+    # Diagnostic context is recorded for operator triage.
+    assert fail_row["context"]["workspace_id"] == client.workspace_id
+    assert fail_row["context"]["plan"] == "pro"
+    assert "error" in fail_row["context"]
+
+
+def test_stripe_portal_502_on_stripe_error(billing_env):
+    """F-W6A-002 (status half): portal endpoint must surface 502
+    (NOT 500) when the Stripe portal-session SDK call raises.
+    """
+    from stripe._error import StripeError
+    client, _ = billing_env
+    # Seed a customer first so we get past the 404 gate.
+    fake_checkout = _checkout_response(customer_id="cus_portal_err_seed")
+    with patch("stripe.checkout.Session.create", return_value=fake_checkout):
+        client.post("/api/v1/billing/checkout", json={
+            "workspace_id": client.workspace_id,
+            "plan": "pro",
+        })
+    # Now patch the portal SDK to raise.
+    fake_error = StripeError("portal API error")
+    with patch("stripe.billing_portal.Session.create",
+                side_effect=fake_error):
+        r = client.post("/api/v1/billing/portal", json={
+            "workspace_id": client.workspace_id,
+        })
+    assert r.status_code == 502, (
+        f"expected 502 for portal Stripe error, got {r.status_code}: "
+        f"{r.text}"
+    )
+
+
+def test_stripe_portal_writes_failed_audit_row(billing_env):
+    """F-W6A-002 (audit half): on portal Stripe error, a
+    ``billing.portal_failed`` audit row must be written.
+    """
+    from stripe._error import StripeError
+    client, repo = billing_env
+    # Seed a customer.
+    fake_checkout = _checkout_response(customer_id="cus_portal_audit_seed")
+    with patch("stripe.checkout.Session.create", return_value=fake_checkout):
+        client.post("/api/v1/billing/checkout", json={
+            "workspace_id": client.workspace_id,
+            "plan": "pro",
+        })
+    fake_error = StripeError("portal API error")
+    with patch("stripe.billing_portal.Session.create",
+                side_effect=fake_error):
+        r = client.post("/api/v1/billing/portal", json={
+            "workspace_id": client.workspace_id,
+        })
+    assert r.status_code == 502, r.text
+    audit_rows = repo.list_audit(workspace_id=client.workspace_id, limit=20)
+    fail_row = next(
+        (row for row in audit_rows
+         if row["event"] == "billing.portal_failed"),
+        None,
+    )
+    assert fail_row is not None, (
+        f"expected billing.portal_failed audit row, "
+        f"events found: {[r['event'] for r in audit_rows]}"
+    )
+    assert fail_row["context"]["workspace_id"] == client.workspace_id
+    assert "stripe_customer_id" not in fail_row["context"]
+
+
+def test_stripe_checkout_passes_workspace_owner_email(billing_env):
+    """F-W6A-003: the workspace owner's email must be passed as
+    ``customer_email`` to the Stripe Checkout Session SDK call.
+
+    Independent of test_stripe_checkout_passes_customer_email
+    (which tests the wrapper in isolation).  This test exercises
+    the API layer end-to-end: it must source the email from the
+    workspace owner row, not from the request body.
+    """
+    client, _ = billing_env
+    # The _AuthedClient signs up with "billing@example.com" (see
+    # _AuthedClient._ensure_signed_up).  That user is the workspace
+    # owner, so the API layer must pull that email through.
+    fake = _checkout_response()
+    with patch("stripe.checkout.Session.create", return_value=fake) as mc:
+        r = client.post("/api/v1/billing/checkout", json={
+            "workspace_id": client.workspace_id,
+            "plan": "pro",
+        })
+    assert r.status_code == 200, r.text
+    kwargs = mc.call_args.kwargs
+    assert kwargs.get("customer_email") == "billing@example.com", (
+        f"customer_email must be the workspace owner's email, "
+        f"got {kwargs.get('customer_email')!r}"
+    )
 
 
 # ── Existing-suite green gate ─────────────────────────────────

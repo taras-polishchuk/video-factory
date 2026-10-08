@@ -419,15 +419,55 @@ def create_app(*, repo: Optional[Repo] = None,
         existing_customer = (
             repo.get_workspace_billing(workspace_id).get("stripe_customer_id")
         )
+        # Prefill the Checkout form with the workspace owner's
+        # email (per the Wave 6a brief: "customer_email from
+        # workspace owner").  Sourced from the owner row so it
+        # stays accurate even if the user's auth session was
+        # created by an admin acting on their behalf.
+        owner_email: Optional[str] = None
+        try:
+            owner = repo.get_user(ws.get("owner_user_id") or "")
+            owner_email = (owner or {}).get("email") or None
+        except Exception:
+            owner_email = None
         client = _billing.get_stripe_client()
         base = _billing_base_url(request)
-        result = client.create_checkout_session(
-            workspace_id=workspace_id,
-            plan=plan,
-            success_url=f"{base}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{base}/billing/cancel",
-            customer_id=existing_customer,
-        )
+        try:
+            result = client.create_checkout_session(
+                workspace_id=workspace_id,
+                plan=plan,
+                success_url=f"{base}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{base}/billing/cancel",
+                customer_id=existing_customer,
+                customer_email=owner_email,
+            )
+        except _billing.StripeCallError as e:
+            # Brief: failure paths (Stripe API error 4xx/5xx)
+            # surface as 502 Bad Gateway with audit row
+            # `billing.checkout_failed`.  We deliberately do NOT
+            # leak the upstream error message to the client (it
+            # may include the workspace owner's email or a Stripe
+            # request id) — we log the message into the audit
+            # context and return a generic upstream-error detail.
+            # We return JSONResponse directly (instead of raising
+            # HTTPException) so the body shape matches the rest
+            # of the app's error responses: ``{"error": "..."}``
+            # rather than FastAPI's default ``{"detail": "..."}``.
+            repo.append_audit(
+                event="billing.checkout_failed",
+                context={
+                    "workspace_id": workspace_id,
+                    "plan": plan,
+                    "error": str(e),
+                },
+                user_id=ctx.user_id,
+                workspace_id=workspace_id,
+                actor=ctx.email,
+            )
+            return JSONResponse(
+                {"error": "stripe upstream error on checkout"},
+                status_code=502,
+            )
         new_customer_id = result.get("customer_id") or existing_customer
         if new_customer_id and new_customer_id != existing_customer:
             repo.upsert_stripe_customer(workspace_id, new_customer_id)
@@ -473,10 +513,30 @@ def create_app(*, repo: Optional[Repo] = None,
             )
         client = _billing.get_stripe_client()
         base = _billing_base_url(request)
-        result = client.create_portal_session(
-            customer_id=customer_id,
-            return_url=f"{base}/billing",
-        )
+        try:
+            result = client.create_portal_session(
+                customer_id=customer_id,
+                return_url=f"{base}/billing",
+            )
+        except _billing.StripeCallError as e:
+            # Symmetric with the checkout handler: Stripe API
+            # errors become 502 + `billing.portal_failed` audit
+            # row.  Same upstream-error-redaction policy and the
+            # same JSONResponse shape (``{"error": "..."}``).
+            repo.append_audit(
+                event="billing.portal_failed",
+                context={
+                    "workspace_id": workspace_id,
+                    "error": str(e),
+                },
+                user_id=ctx.user_id,
+                workspace_id=workspace_id,
+                actor=ctx.email,
+            )
+            return JSONResponse(
+                {"error": "stripe upstream error on portal"},
+                status_code=502,
+            )
         repo.append_audit(
             event="billing.portal_opened",
             context={

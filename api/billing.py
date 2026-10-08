@@ -127,6 +127,7 @@ class StripeClient:
         success_url: str,
         cancel_url: str,
         customer_id: Optional[str] = None,
+        customer_email: Optional[str] = None,
     ) -> dict:
         """Create a Stripe Checkout Session for a workspace upgrade.
 
@@ -135,6 +136,15 @@ class StripeClient:
         None, the SDK will create a fresh Customer on the session
         (and the response's ``customer`` field will hold the new
         customer id).
+
+        ``customer_email`` (optional) prefills the Checkout form
+        with the workspace owner's email address. The brief
+        requires this so the operator does not have to re-type
+        their email at checkout (and so Stripe can match against
+        an existing Customer by email if the workspace is
+        re-subscribing).  When both ``customer_id`` and
+        ``customer_email`` are passed, the SDK binds the new
+        session to the existing customer.
 
         For testability, this method calls ``stripe.checkout.Session.create``
         with the configured API key. Tests patch that symbol.
@@ -156,6 +166,14 @@ class StripeClient:
         }
         if customer_id:
             params["customer"] = customer_id
+        if customer_email:
+            # Per the Wave 6a brief: "customer_email from workspace
+            # owner". The API layer is responsible for sourcing this
+            # from the workspace owner row; the wrapper just forwards
+            # it. Never logged: this is the same field that lands in
+            # Stripe, so it does not need additional redaction in
+            # the audit row we write in the calling site.
+            params["customer_email"] = customer_email
         try:
             # Pin the API key for this call so tests that patch
             # ``stripe.checkout.Session.create`` don't need to also
