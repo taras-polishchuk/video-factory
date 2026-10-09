@@ -90,6 +90,105 @@ def create_app(*, repo: Optional[Repo] = None,
             "mock_only": True,
         }
 
+    # ── Wave 8: k8s-style probes + Prometheus scrape ───────────
+    # `/healthz` is the liveness probe - it MUST NOT touch the DB
+    # so a wedged DB can never cause the orchestrator to restart
+    # an otherwise-healthy process. `/readyz` is the readiness
+    # probe - it returns 503 when the process cannot serve real
+    # traffic (DB locked, vault key missing, master key
+    # non-functional). `/metrics` is the Prometheus scrape
+    # endpoint, served straight from the observability registry.
+
+    from api.observability import (
+        metrics_response,
+        REQUEST_DURATION,
+    )
+
+    @app.get("/healthz")
+    async def healthz():
+        return {"ok": True}
+
+    @app.get("/readyz")
+    async def readyz():
+        """Readiness check: DB + vault key + master key.
+
+        Each check is independent and isolated; a single failure
+        flips the response to 503 with a JSON body listing which
+        subsystem failed. The DB check is a single ``SELECT 1``
+        so the probe never blocks on a long-running migration.
+        """
+        checks: dict[str, str] = {}
+        ok = True
+        # 1) DB open + responsive.
+        try:
+            row = repo._conn().execute("SELECT 1").fetchone()  # noqa: SLF001
+            if not row or row[0] != 1:
+                checks["db"] = "unhealthy"
+                ok = False
+            else:
+                checks["db"] = "ok"
+        except Exception as e:  # noqa: BLE001
+            checks["db"] = f"error: {type(e).__name__}"
+            ok = False
+        # 2) Vault key (Fernet) present.
+        try:
+            from control_plane import secret_vault
+            secret_vault._key()  # noqa: SLF001
+            checks["vault_key"] = "ok"
+        except Exception as e:  # noqa: BLE001
+            checks["vault_key"] = f"error: {type(e).__name__}"
+            ok = False
+        # 3) Master key (artifact HMAC) functional.
+        try:
+            from control_plane import artifact_hmac
+            artifact_hmac._key_bytes()  # noqa: SLF001
+            checks["master_key"] = "ok"
+        except Exception as e:  # noqa: BLE001
+            checks["master_key"] = f"error: {type(e).__name__}"
+            ok = False
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"ok": ok, "checks": checks},
+            status_code=200 if ok else 503,
+        )
+
+    @app.get("/metrics")
+    async def metrics():
+        from fastapi.responses import Response
+        return Response(
+            content=metrics_response(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    # Request-duration middleware: wraps every request in the
+    # Prometheus histogram using the route template (e.g.
+    # ``/api/v1/workspaces/{wid}``) as the label so cardinality
+    # stays bounded. We do NOT record /metrics itself - the
+    # scrape would otherwise dominate the histogram.
+    @app.middleware("http")
+    async def _prometheus_request_duration(request, call_next):
+        import time as _time
+        start = _time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration = _time.perf_counter() - start
+            route = request.scope.get("route").path \
+                if request.scope.get("route") else request.url.path
+            REQUEST_DURATION.labels(
+                route=route, method=request.method,
+                status="500",
+            ).observe(duration)
+            raise
+        duration = _time.perf_counter() - start
+        route = request.scope.get("route").path \
+            if request.scope.get("route") else request.url.path
+        REQUEST_DURATION.labels(
+            route=route, method=request.method,
+            status=str(response.status_code),
+        ).observe(duration)
+        return response
+
     # Wave 5: surface a startup warning when the artifact HMAC
     # key is missing in env (i.e. we're using the static dev
     # fallback).  This is intentionally informational — the dev
@@ -100,6 +199,13 @@ def create_app(*, repo: Optional[Repo] = None,
     if _warn:
         import logging as _lg
         _lg.getLogger("video_factory.startup").warning(_warn)
+
+    # Wave 8: install the JSON log formatter on the root logger
+    # and (optionally) register Sentry. Both are no-ops when the
+    # relevant env vars are unset, so dev runs are unaffected.
+    from api import observability as _obs
+    _obs.configure_json_logging()
+    _obs.init_sentry()
 
     @app.get("/api/v1/spec")
     async def spec():
