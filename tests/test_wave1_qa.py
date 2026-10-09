@@ -508,7 +508,7 @@ def test_audit_actor_never_null_for_authenticated_events(tmp_path):
 # ── Audit log does not leak secret tokens ────────────────────
 
 
-def test_audit_log_does_not_contain_verification_or_reset_tokens(tmp_path):
+def test_audit_log_does_not_contain_verification_or_reset_tokens(tmp_path, monkeypatch):
     """MAJOR SECURITY DEFECT: signup and forgot endpoints store
     verification_token and reset_token in the audit_log context.
 
@@ -523,6 +523,8 @@ def test_audit_log_does_not_contain_verification_or_reset_tokens(tmp_path):
     log MUST NOT contain them — that surface is the
     compliance/forensics surface, not a secrets store.
     """
+    # Tokens are only returned with the explicit local-dev opt-in.
+    monkeypatch.setenv("VIDEO_FACTORY_DEV_EXPOSE_TOKENS", "1")
     client, repo, _ = _make_app(tmp_path)
     r = client.post("/auth/signup", json={
         "email": "leak@example.com",

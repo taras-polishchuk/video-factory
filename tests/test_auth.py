@@ -405,7 +405,8 @@ def test_session_secret_rotation_invalidates_old_sessions(auth_env, monkeypatch)
 # ── Forgot + verify ───────────────────────────────────────────
 
 
-def test_forgot_password_sends_magic_link(auth_env):
+def test_forgot_password_sends_magic_link(auth_env, monkeypatch):
+    monkeypatch.setenv("VIDEO_FACTORY_DEV_EXPOSE_TOKENS", "1")
     client, repo, _ = auth_env
     _signup(client, email="nina@example.com")
     r = client.post("/auth/forgot", json={"email": "nina@example.com"})
@@ -427,7 +428,8 @@ def test_forgot_password_sends_magic_link(auth_env):
     assert r.status_code == 200
 
 
-def test_verify_email_marks_verified(auth_env):
+def test_verify_email_marks_verified(auth_env, monkeypatch):
+    monkeypatch.setenv("VIDEO_FACTORY_DEV_EXPOSE_TOKENS", "1")
     client, repo, _ = auth_env
     r = _signup(client, email="olive@example.com")
     assert r.status_code == 200

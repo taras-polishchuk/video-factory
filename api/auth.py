@@ -71,6 +71,21 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def _dev_expose_tokens() -> bool:
+    """True only when a local developer explicitly opts in to receiving
+    email-verification / password-reset tokens in API responses.
+
+    Requires `VIDEO_FACTORY_DEV_EXPOSE_TOKENS=1` AND a non-production
+    `VIDEO_FACTORY_ENV`. Default (unset) is secure: tokens are only ever
+    delivered out of band, never in the HTTP response.
+    """
+    flag = os.environ.get("VIDEO_FACTORY_DEV_EXPOSE_TOKENS", "").strip().lower()
+    if flag not in ("1", "true", "yes"):
+        return False
+    env = os.environ.get("VIDEO_FACTORY_ENV", "").strip().lower()
+    return env not in ("production", "prod", "staging")
+
+
 def build_router(repo: Repo) -> APIRouter:
     """Build the /auth/* router bound to the given repo.
 
@@ -187,7 +202,10 @@ def build_router(repo: Repo) -> APIRouter:
             request, session_id=session_id,
             workspace_id=_latest_workspace_id(repo._conn(), user_id),
             user_id=user_id, email=email,
-            extra={"verification_token": token, "workspace_slug": slug},
+            extra=(
+                {"verification_token": token, "workspace_slug": slug}
+                if _dev_expose_tokens() else {"workspace_slug": slug}
+            ),
         )
 
     # ── login ────────────────────────────────────────────────
@@ -308,8 +326,14 @@ def build_router(repo: Repo) -> APIRouter:
                     repo, event="auth.password_reset_requested_unknown",
                     context={"email": email, "ip": ip},
                 )
-        return {"ok": True, "delivery": "logged-in-dev",
-                "reset_token": token_value}
+        # SECURITY: never return the reset token to the caller outside an
+        # explicit local-dev opt-in. Returning it lets anyone who knows an
+        # email take over the account. Identical body for known/unknown
+        # emails so the response does not enumerate accounts.
+        if _dev_expose_tokens():
+            return {"ok": True, "delivery": "dev-response",
+                    "reset_token": token_value}
+        return {"ok": True}
 
     @router.post("/forgot/consume")
     async def forgot_consume(payload: dict):
