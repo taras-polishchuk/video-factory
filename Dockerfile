@@ -34,7 +34,9 @@ RUN pip install --no-cache-dir \
         'fastapi>=0.115' \
         'uvicorn>=0.30' \
         'python-multipart>=0.0.9' \
-        'httpx>=0.27'
+        'httpx>=0.27' \
+        'prometheus-client>=0.20' \
+        'sentry-sdk>=2.0'
 
 # Copy the application source.
 COPY . /app
@@ -63,7 +65,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Use uvicorn directly (no --reload) for production-grade boot. The
 # `--workers 1` setting is intentional: the JobRunner uses a per-process
 # in-memory idempotency map. Scaling workers is a separate V2+ mission.
+# `--log-config` makes every stdout line JSON, including uvicorn's own
+# startup / access / shutdown lines (docs/observability.md).
 CMD ["uvicorn", "api.main:app", \
      "--host", "127.0.0.1", \
      "--port", "8000", \
-     "--workers", "1"]
+     "--workers", "1", \
+     "--log-config", "api/uvicorn_log_config.json"]

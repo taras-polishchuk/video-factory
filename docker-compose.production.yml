@@ -18,7 +18,8 @@ services:
     image: video-factory-api:${VIDEO_FACTORY_IMAGE_TAG:-dev}
     container_name: vf-api
     working_dir: /app
-    command: ["uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1"]
+    # --log-config: JSON-only stdout (docs/observability.md).
+    command: ["uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1", "--log-config", "api/uvicorn_log_config.json"]
     restart: unless-stopped
     init: true
     environment:

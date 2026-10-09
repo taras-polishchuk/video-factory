@@ -145,6 +145,15 @@ def build_clear_cookie_value(*, secure: bool = False) -> str:
     return "; ".join(parts)
 
 
+def is_production() -> bool:
+    """True iff ``VIDEO_FACTORY_ENV=production`` (case-insensitive).
+
+    Single source of truth for the production flag; used by the
+    cookie policy below and by ``/readyz`` (dev HMAC key refusal).
+    """
+    return os.environ.get("VIDEO_FACTORY_ENV", "").strip().lower() == "production"
+
+
 def should_use_secure_cookies() -> bool:
     """Resolve whether to set Secure on the session cookie.
 
@@ -153,6 +162,6 @@ def should_use_secure_cookies() -> bool:
     """
     if os.environ.get("VF_HTTPS", "").strip() == "1":
         return True
-    if os.environ.get("VIDEO_FACTORY_ENV", "").strip().lower() == "production":
+    if is_production():
         return True
     return False

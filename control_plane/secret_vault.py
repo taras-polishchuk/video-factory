@@ -45,6 +45,11 @@ class SecretKeyMissing(RuntimeError):
     pass
 
 
+class SecretKeyInvalid(RuntimeError):
+    """``VIDEO_FACTORY_SECRET_KEY`` is set but is not a usable Fernet key."""
+    pass
+
+
 class SecretReadError(RuntimeError):
     pass
 
@@ -98,6 +103,26 @@ def _fernet():
     # operator enables the live path, cryptography is mandatory.
     from cryptography.fernet import Fernet
     return Fernet(_key())
+
+
+def validate_key() -> None:
+    """Prove the vault key is usable by building the Fernet.
+
+    Raises ``SecretKeyMissing`` when the env var is empty and
+    ``SecretKeyInvalid`` when it is set but is not 32 url-safe
+    base64-encoded bytes (Wave 8 QA D5: /readyz used to accept a
+    too-short key and the failure only surfaced at first
+    ``encrypt()``). The key value never appears in the message.
+    """
+    try:
+        _fernet()
+    except SecretKeyMissing:
+        raise
+    except (ValueError, TypeError) as e:  # binascii.Error is a ValueError
+        raise SecretKeyInvalid(
+            "VIDEO_FACTORY_SECRET_KEY is not a valid Fernet key "
+            "(expected 32 url-safe base64-encoded bytes)."
+        ) from e
 
 
 def _bind_blob(workspace_id: Optional[str], provider: str,
