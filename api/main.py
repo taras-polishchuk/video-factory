@@ -79,6 +79,44 @@ def create_app(*, repo: Optional[Repo] = None,
     async def _ve(request: Request, exc: ValueError):
         return JSONResponse({"error": str(exc)}, status_code=400)
 
+    # Wave 8 follow-up (QA D1): catch-all for unhandled exceptions.
+    # Starlette routes this handler through ServerErrorMiddleware,
+    # so it fires for anything the specific handlers above did not
+    # claim. It (1) counts the error, (2) forwards it to Sentry via
+    # ``sentry_sdk.capture_exception`` when Sentry is initialised
+    # (PII-scrubbed, tagged with the request id), (3) logs one JSON
+    # line with the request id, and (4) returns a generic JSON 500
+    # that never contains the exception text or a stack trace.
+    # Must stay ``async``: a sync handler runs in a threadpool copy
+    # of the context and breaks Sentry's per-request dedupe.
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception):
+        from api import observability as _o
+        rid = _o.request_id_from(request.headers.get("x-request-id"))
+        route = _o.route_label(request.scope)
+        try:
+            _o.ERRORS_TOTAL.labels(**{"class": "runtime"}).inc()
+        except Exception:  # noqa: BLE001 - metrics must never mask the 500
+            pass
+        try:
+            _o.capture_exception(exc, request_id=rid, route=route,
+                                 method=request.method)
+        except Exception:  # noqa: BLE001 - Sentry must never mask the 500
+            pass
+        import logging as _lg
+        _lg.getLogger("video_factory.errors").error(
+            "unhandled exception",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"request_id": rid, "route": route,
+                   "method": request.method,
+                   "error_class": type(exc).__name__},
+        )
+        return JSONResponse(
+            {"error": "internal server error", "request_id": rid},
+            status_code=500,
+            headers={"X-Request-ID": rid},
+        )
+
     # ── health + openapi ───────────────────────────────────────
 
     @app.get("/health")
@@ -112,44 +150,70 @@ def create_app(*, repo: Optional[Repo] = None,
     async def readyz():
         """Readiness check: DB + vault key + master key.
 
+        Body (Wave 8 follow-up, QA D4)::
+
+            {"status": "ready" | "unready",
+             "checks": {"db": bool, "vault_key": bool, "master_key": bool},
+             "errors": {<check>: <reason code>},
+             "warnings": {<check>: <reason code>}}
+
         Each check is independent and isolated; a single failure
-        flips the response to 503 with a JSON body listing which
-        subsystem failed. The DB check is a single ``SELECT 1``
-        so the probe never blocks on a long-running migration.
+        flips the response to 503. Reason codes are exception class
+        names or fixed tokens (``unhealthy``, ``dev_key_in_use``) -
+        never exception messages, so no path or key material can
+        leak through an unauthenticated probe. The DB check is a
+        single ``SELECT 1`` so the probe never blocks on a
+        long-running migration.
         """
-        checks: dict[str, str] = {}
-        ok = True
+        checks: dict[str, bool] = {}
+        errors: dict[str, str] = {}
+        warnings: dict[str, str] = {}
         # 1) DB open + responsive.
         try:
             row = repo._conn().execute("SELECT 1").fetchone()  # noqa: SLF001
-            if not row or row[0] != 1:
-                checks["db"] = "unhealthy"
-                ok = False
-            else:
-                checks["db"] = "ok"
+            checks["db"] = bool(row) and row[0] == 1
+            if not checks["db"]:
+                errors["db"] = "unhealthy"
         except Exception as e:  # noqa: BLE001
-            checks["db"] = f"error: {type(e).__name__}"
-            ok = False
-        # 2) Vault key (Fernet) present.
+            checks["db"] = False
+            errors["db"] = type(e).__name__
+        # 2) Vault key: must build a Fernet, not just be non-empty (D5).
         try:
             from control_plane import secret_vault
-            secret_vault._key()  # noqa: SLF001
-            checks["vault_key"] = "ok"
+            secret_vault.validate_key()
+            checks["vault_key"] = True
         except Exception as e:  # noqa: BLE001
-            checks["vault_key"] = f"error: {type(e).__name__}"
-            ok = False
-        # 3) Master key (artifact HMAC) functional.
+            checks["vault_key"] = False
+            errors["vault_key"] = type(e).__name__
+        # 3) Master key (artifact HMAC). The static dev fallback is
+        #    refused when VIDEO_FACTORY_ENV=production (D6); in dev
+        #    it passes with a warning.
         try:
             from control_plane import artifact_hmac
+            from auth.session import is_production
             artifact_hmac._key_bytes()  # noqa: SLF001
-            checks["master_key"] = "ok"
+            if artifact_hmac.dev_key_in_use():
+                if is_production():
+                    checks["master_key"] = False
+                    errors["master_key"] = "dev_key_in_use"
+                else:
+                    checks["master_key"] = True
+                    warnings["master_key"] = "dev_key_in_use"
+            else:
+                checks["master_key"] = True
         except Exception as e:  # noqa: BLE001
-            checks["master_key"] = f"error: {type(e).__name__}"
-            ok = False
+            checks["master_key"] = False
+            errors["master_key"] = type(e).__name__
+        ready = all(checks.values())
         from fastapi.responses import JSONResponse
         return JSONResponse(
-            {"ok": ok, "checks": checks},
-            status_code=200 if ok else 503,
+            {
+                "status": "ready" if ready else "unready",
+                "checks": checks,
+                "errors": errors,
+                "warnings": warnings,
+            },
+            status_code=200 if ready else 503,
         )
 
     @app.get("/metrics")
@@ -163,28 +227,33 @@ def create_app(*, repo: Optional[Repo] = None,
     # Request-duration middleware: wraps every request in the
     # Prometheus histogram using the route template (e.g.
     # ``/api/v1/workspaces/{wid}``) as the label so cardinality
-    # stays bounded. We do NOT record /metrics itself - the
-    # scrape would otherwise dominate the histogram.
+    # stays bounded. Requests that match no route (404 scans) are
+    # labelled ``unmatched`` - never the raw path - and unknown
+    # HTTP methods collapse to ``OTHER`` (Wave 8 follow-up). We do
+    # NOT record /metrics itself - the scrape would otherwise
+    # dominate the histogram.
+    from api.observability import route_label, method_label
+
     @app.middleware("http")
     async def _prometheus_request_duration(request, call_next):
         import time as _time
+        if request.url.path == "/metrics":
+            return await call_next(request)
         start = _time.perf_counter()
         try:
             response = await call_next(request)
         except Exception:
             duration = _time.perf_counter() - start
-            route = request.scope.get("route").path \
-                if request.scope.get("route") else request.url.path
             REQUEST_DURATION.labels(
-                route=route, method=request.method,
+                route=route_label(request.scope),
+                method=method_label(request.method),
                 status="500",
             ).observe(duration)
             raise
         duration = _time.perf_counter() - start
-        route = request.scope.get("route").path \
-            if request.scope.get("route") else request.url.path
         REQUEST_DURATION.labels(
-            route=route, method=request.method,
+            route=route_label(request.scope),
+            method=method_label(request.method),
             status=str(response.status_code),
         ).observe(duration)
         return response

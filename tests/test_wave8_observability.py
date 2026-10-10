@@ -31,7 +31,14 @@ if REPO_ROOT not in sys.path:
 # ────────────────────────────────────────────────────────────────────
 
 
-def _make_app(monkeypatch, *, secret_key="X" * 44, db_key="Y" * 44, db_path=None):
+# A syntactically valid Fernet key (32 url-safe base64 bytes). Since
+# the Wave 8 follow-up (QA D5) /readyz builds the Fernet, so the old
+# ``"X" * 44`` placeholder (33 decoded bytes) correctly reports
+# ``vault_key: false``. Synthetic test value, not a real secret.
+_VALID_FERNET_KEY = "a" * 43 + "="
+
+
+def _make_app(monkeypatch, *, secret_key=_VALID_FERNET_KEY, db_key="Y" * 44, db_path=None):
     """Build a fresh app with controllable env.
 
     We patch the env BEFORE importing the app modules so the
@@ -95,9 +102,10 @@ def test_readyz_503_when_db_locked(tmp_path, monkeypatch):
         r = client.get("/readyz")
     assert r.status_code == 503
     body = r.json()
-    assert body["ok"] is False
-    assert "db" in body["checks"]
-    assert body["checks"]["db"].startswith("error")
+    # Wave 8 follow-up (QA D4): {"status", "checks": {bool}, "errors"}.
+    assert body["status"] == "unready"
+    assert body["checks"]["db"] is False
+    assert body["errors"]["db"] == "RuntimeError"
 
 
 def test_readyz_200_when_db_open(tmp_path, monkeypatch):
@@ -107,9 +115,10 @@ def test_readyz_200_when_db_open(tmp_path, monkeypatch):
     r = client.get("/readyz")
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is True
+    assert body["status"] == "ready"
     for k in ("db", "vault_key", "master_key"):
-        assert body["checks"][k] == "ok", body
+        assert body["checks"][k] is True, body
+    assert body["errors"] == {}
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -38,6 +38,13 @@ dependencies = [
     # verification.  Pinned >=10 because earlier versions dropped
     # Python 3.11 support.
     "stripe>=10.0",
+    # Wave 8 observability: /metrics is served from a dedicated
+    # prometheus_client registry (api/observability.py).
+    "prometheus-client>=0.20",
+    # Sentry error reporting. Imported lazily, only when SENTRY_DSN
+    # is set; declared here so the Docker image and `pip install .`
+    # can actually honour a configured DSN.
+    "sentry-sdk>=2.0",
 ]
 
 [project.optional-dependencies]

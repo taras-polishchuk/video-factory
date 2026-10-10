@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "json": {
+      "()": "api.observability.JsonLogFormatter"
+    }
+  },
+  "handlers": {
+    "json_stdout": {
+      "class": "api.observability.JsonStdoutHandler",
+      "formatter": "json"
+    }
+  },
+  "root": {
+    "handlers": [
+      "json_stdout"
+    ],
+    "level": "INFO"
+  },
+  "loggers": {
+    "uvicorn": {
+      "handlers": [],
+      "level": "INFO",
+      "propagate": true
+    },
+    "uvicorn.error": {
+      "handlers": [],
+      "level": "INFO",
+      "propagate": true
+    },
+    "uvicorn.access": {
+      "handlers": [],
+      "level": "INFO",
+      "propagate": true
+    }
+  }
+}

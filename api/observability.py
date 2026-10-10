@@ -30,8 +30,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import sys
 import time
+import uuid
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode
 
 from prometheus_client import (
     CollectorRegistry,
@@ -66,9 +70,13 @@ class JsonLogFormatter(logging.Formatter):
         "lineno", "funcName", "created", "msecs", "relativeCreated",
         "thread", "threadName", "processName", "process", "asctime",
         "message", "taskName",
+        # uvicorn attaches an ANSI-coloured duplicate of the message
+        # as ``extra={"color_message": ...}``; it is pure noise in JSON.
+        "color_message",
     })
 
     def format(self, record: logging.LogRecord) -> str:
+        access = _uvicorn_access_fields(record)
         payload: dict[str, Any] = {
             "timestamp": time.strftime(
                 "%Y-%m-%dT%H:%M:%S",
@@ -76,8 +84,10 @@ class JsonLogFormatter(logging.Formatter):
             ) + f".{int(record.msecs):03d}Z",
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": access.pop("_message") if access else record.getMessage(),
         }
+        if access:
+            payload.update(access)
         # Attach any user-supplied extras (logger.info("x", extra={...}))
         for k, v in record.__dict__.items():
             if k in self._RESERVED_ATTRS or k.startswith("_"):
@@ -85,17 +95,117 @@ class JsonLogFormatter(logging.Formatter):
             payload[k] = v
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            payload["stack_info"] = self.formatStack(record.stack_info)
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
-def configure_json_logging(level: int = logging.INFO) -> None:
-    """Install the JSON formatter on the root logger.
+# Query-string keys whose values must never reach logs or Sentry
+# (OIDC ``code``/``state``, password-reset tokens, emails, ...).
+_SENSITIVE_QUERY_KEY_RE = re.compile(
+    r"(token|code|state|password|passwd|secret|key|email|session|auth|sig)",
+    re.IGNORECASE,
+)
 
-    Safe to call multiple times - the handler is replaced in
-    place rather than stacked. We keep ``propagate=True`` so
-    module loggers (api, core, control_plane) flow through the
-    root handler; tests that inspect a specific logger still
-    get the same JSON output.
+
+def redact_query_string(qs: str) -> str:
+    """Return ``qs`` with the values of sensitive keys replaced."""
+    if not qs:
+        return qs
+    try:
+        pairs = parse_qsl(qs, keep_blank_values=True)
+    except Exception:  # noqa: BLE001
+        return "[Filtered]"
+    out = [
+        (k, "[Filtered]" if _SENSITIVE_QUERY_KEY_RE.search(k) else v)
+        for k, v in pairs
+    ]
+    return urlencode(out, safe="[]")
+
+
+def _uvicorn_access_fields(record: logging.LogRecord) -> dict[str, Any]:
+    """Structured fields for a ``uvicorn.access`` record.
+
+    uvicorn logs access lines as
+    ``'%s - "%s %s HTTP/%s" %d'`` with
+    ``(client_addr, method, full_path, http_version, status_code)``.
+    We lift those into top-level JSON keys and redact sensitive
+    query-string values (OIDC ``code``/``state`` etc.) from both
+    the ``path`` field and the rendered message. Returns ``{}``
+    for any other record.
+    """
+    if record.name != "uvicorn.access":
+        return {}
+    args = record.args
+    if not isinstance(args, tuple) or len(args) != 5:
+        return {}
+    client_addr, method, full_path, http_version, status_code = args
+    path = str(full_path)
+    if "?" in path:
+        base, _, qs = path.partition("?")
+        path = base + "?" + redact_query_string(qs)
+    try:
+        status = int(status_code)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        status = status_code
+    return {
+        "_message": f'{client_addr} - "{method} {path} HTTP/{http_version}" {status_code}',
+        "client_addr": client_addr,
+        "method": method,
+        "path": path,
+        "http_version": http_version,
+        "status_code": status,
+    }
+
+
+class JsonStdoutHandler(logging.StreamHandler):
+    """StreamHandler that always writes JSON to the *current* stdout.
+
+    The stream is resolved lazily on every emit (like
+    ``logging.lastResort``) so a handler created while pytest's
+    capture swapped ``sys.stdout`` never ends up writing to a
+    closed buffer. The ``_vf_json`` marker lets
+    ``configure_json_logging`` recognise (and replace) handlers it
+    or the uvicorn ``--log-config`` file installed.
+    """
+
+    _vf_json = True
+
+    def __init__(self, level: int = logging.NOTSET) -> None:
+        logging.Handler.__init__(self, level)
+        self.setFormatter(JsonLogFormatter())
+
+    @property
+    def stream(self):  # type: ignore[override]
+        return sys.stdout
+
+    @stream.setter
+    def stream(self, _value) -> None:  # pragma: no cover - ignored on purpose
+        pass
+
+
+# uvicorn installs its own plaintext console handlers on these
+# loggers (``uvicorn.config.LOGGING_CONFIG``). We strip them and
+# let the records propagate to the root JSON handler.
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi")
+
+
+def configure_json_logging(level: int = logging.INFO) -> None:
+    """Make every log line on stdout a single JSON object.
+
+    * Installs one ``JsonStdoutHandler`` on the root logger
+      (replacing any previous copy, so repeated calls never stack).
+    * Removes uvicorn's own plaintext console handlers from the
+      ``uvicorn`` / ``uvicorn.error`` / ``uvicorn.access`` loggers
+      and makes them propagate to root, so startup, access and
+      shutdown lines are JSON too (Wave 8 QA defect D2).
+
+    Handlers owned by other parties (pytest's capture handlers,
+    an operator's extra file handler) on the root logger are left
+    untouched. For lines uvicorn emits *before* the app module is
+    imported (``--workers N`` supervisor, reloader), start uvicorn
+    with ``--log-config api/uvicorn_log_config.json`` - see
+    ``uvicorn_log_config()`` and ``docs/observability.md``.
     """
     root = logging.getLogger()
     # Drop handlers we previously installed so we never end up
@@ -103,11 +213,42 @@ def configure_json_logging(level: int = logging.INFO) -> None:
     for h in list(root.handlers):
         if getattr(h, "_vf_json", False):
             root.removeHandler(h)
-    h = logging.StreamHandler()
-    h.setFormatter(JsonLogFormatter())
-    h._vf_json = True  # type: ignore[attr-defined]
-    root.addHandler(h)
+    root.addHandler(JsonStdoutHandler())
     root.setLevel(level)
+    for name in UVICORN_LOGGERS:
+        lg = logging.getLogger(name)
+        for h in list(lg.handlers):
+            lg.removeHandler(h)
+        lg.propagate = True
+
+
+def uvicorn_log_config(level: str = "INFO") -> dict[str, Any]:
+    """``logging.config.dictConfig`` schema for ``uvicorn --log-config``.
+
+    ``api/uvicorn_log_config.json`` is the checked-in rendering of
+    ``uvicorn_log_config()``; a test pins the two together. It
+    routes root + every uvicorn logger through ``JsonStdoutHandler``
+    before uvicorn imports the app, so even the very first
+    ``Started server process`` line is JSON.
+    """
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "json": {"()": "api.observability.JsonLogFormatter"},
+        },
+        "handlers": {
+            "json_stdout": {
+                "class": "api.observability.JsonStdoutHandler",
+                "formatter": "json",
+            },
+        },
+        "root": {"handlers": ["json_stdout"], "level": level},
+        "loggers": {
+            name: {"handlers": [], "level": level, "propagate": True}
+            for name in ("uvicorn", "uvicorn.error", "uvicorn.access")
+        },
+    }
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -205,6 +346,34 @@ ERROR_CLASS_LABELS = frozenset({
     "auth", "validation", "quota", "vault", "repo", "runtime",
     "unknown",
 })
+# ``outcome`` on video_factory_live_submits_total.
+LIVE_SUBMIT_OUTCOME_LABELS = frozenset({
+    "ok", "error", "blocked", "unknown",
+})
+# ``method`` on video_factory_request_duration_seconds; anything
+# else (WebDAV verbs, garbage tokens) is folded into ``OTHER``.
+HTTP_METHOD_LABELS = frozenset({
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "OTHER",
+})
+# ``route`` value for requests that matched no FastAPI route.
+UNMATCHED_ROUTE = "unmatched"
+
+
+def route_label(scope: dict) -> str:
+    """Bounded ``route`` label: the route template, or ``unmatched``.
+
+    Using the raw URL path for 404s would mint one series per
+    scanned path (``/wp-login.php``, ``/.env``, ...).
+    """
+    route = scope.get("route") if isinstance(scope, dict) else None
+    path = getattr(route, "path", None)
+    return path if isinstance(path, str) and path else UNMATCHED_ROUTE
+
+
+def method_label(method: str) -> str:
+    """Bounded ``method`` label (see ``HTTP_METHOD_LABELS``)."""
+    m = (method or "").upper()
+    return m if m in HTTP_METHOD_LABELS else "OTHER"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -220,7 +389,7 @@ ERROR_CLASS_LABELS = frozenset({
 SENTRY_ENABLED: bool = False
 
 
-def init_sentry(dsn: Optional[str] = None) -> bool:
+def init_sentry(dsn: Optional[str] = None, *, transport: Any = None) -> bool:
     """Initialize the Sentry SDK if a DSN is present.
 
     * When ``dsn`` is falsy (env var unset / empty), the SDK is
@@ -233,6 +402,16 @@ def init_sentry(dsn: Optional[str] = None) -> bool:
     Importing the SDK lazily is the whole point - the brief
     requires that an unset ``SENTRY_DSN`` env var results in
     zero sentry-sdk import cost.
+
+    PII policy (Wave 8 QA D1/#8): ``send_default_pii=False``, no
+    request bodies (``max_request_body_size="never"``), no frame
+    local variables (a credentials PUT would otherwise ship the
+    plaintext provider secret), and ``scrub_event`` as
+    ``before_send`` for headers, cookies, query strings, user
+    fields and any email / id / token pattern left in messages.
+
+    ``transport`` is a test seam: pass a ``sentry_sdk.transport.Transport``
+    subclass/instance to capture envelopes in-process.
     """
     global SENTRY_ENABLED
     dsn = (dsn if dsn is not None else os.environ.get("SENTRY_DSN", "")).strip()
@@ -242,11 +421,173 @@ def init_sentry(dsn: Optional[str] = None) -> bool:
     # Lazy import - this is the only path that pulls sentry_sdk.
     import sentry_sdk  # type: ignore  # noqa: F401
 
-    sentry_sdk.init(
+    kwargs: dict[str, Any] = dict(
         dsn=dsn,
         # The default integration set is fine; we keep traces_sample_rate
         # at 0 to avoid the perf-cost surprise on first deploy.
         traces_sample_rate=0.0,
+        send_default_pii=False,
+        max_request_body_size="never",
+        include_local_variables=False,
+        before_send=scrub_event,
     )
+    if transport is not None:
+        kwargs["transport"] = transport
+    sentry_sdk.init(**kwargs)
     SENTRY_ENABLED = True
     return True
+
+
+def sentry_active() -> bool:
+    """True iff a Sentry client with a DSN is currently bound.
+
+    Never imports ``sentry_sdk``: if nothing imported it, Sentry
+    cannot be initialised and we return ``False`` for free.
+    """
+    sdk = sys.modules.get("sentry_sdk")
+    if sdk is None:
+        return False
+    try:
+        client = sdk.get_client()
+        return bool(client.is_active() and client.dsn)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def capture_exception(exc: BaseException, *, request_id: Optional[str] = None,
+                      route: Optional[str] = None,
+                      method: Optional[str] = None) -> bool:
+    """Forward ``exc`` to Sentry (if initialised) with request tags.
+
+    Returns ``True`` when ``sentry_sdk.capture_exception`` was
+    called. The scope gets ``scrub_event`` as an event processor
+    too, so the PII policy holds even if the SDK was initialised by
+    something other than ``init_sentry`` (defence in depth).
+    """
+    if not sentry_active():
+        return False
+    import sentry_sdk  # type: ignore
+
+    with sentry_sdk.new_scope() as scope:
+        if request_id:
+            scope.set_tag("request_id", request_id)
+        if route:
+            scope.set_tag("route", route)
+        if method:
+            scope.set_tag("method", method)
+        scope.add_event_processor(scrub_event)
+        sentry_sdk.capture_exception(exc)
+    return True
+
+
+# ── request ids ───────────────────────────────────────────────────
+
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
+
+
+def request_id_from(incoming: Optional[str]) -> str:
+    """Reuse a well-formed inbound ``X-Request-ID``; otherwise mint one."""
+    if incoming and _REQUEST_ID_RE.match(incoming):
+        return incoming
+    return uuid.uuid4().hex
+
+
+# ── PII scrubbing ─────────────────────────────────────────────────
+
+FILTERED = "[Filtered]"
+
+# Header names (lower-case) that are always dropped, plus any
+# header whose name contains one of the substrings below.
+_SENSITIVE_HEADERS = frozenset({
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-forwarded-for", "x-real-ip", "forwarded", "cf-connecting-ip",
+    "true-client-ip", "stripe-signature",
+})
+_SENSITIVE_HEADER_PARTS = ("token", "secret", "signature", "api-key",
+                           "apikey", "auth", "csrf", "session")
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# Video Factory ids: ``wks_<hex>`` / ``usr_<hex>`` / ``ses_<hex>`` /
+# ``cred_<hex>`` (core.repo.new_id), plus the short ``ws_`` / ``u_``
+# forms used in docs and tests. At least one digit is required so
+# Python identifiers like ``ws_list_jobs`` in stack frames survive.
+_ID_RE = re.compile(
+    r"\b(?:wks|ws|usr|u|ses|cred|oauth)_(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{1,64}\b"
+)
+_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
+# Stripe keys / webhook secrets / Fernet tokens.
+_SECRET_RE = re.compile(
+    r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]+|\bwhsec_[A-Za-z0-9]+"
+    r"|\bgAAAAA[A-Za-z0-9_-]{20,}={0,2}"
+)
+
+
+def scrub_text(s: str) -> str:
+    """Redact emails, VF ids, bearer tokens and known secret shapes."""
+    s = _EMAIL_RE.sub("[email]", s)
+    s = _BEARER_RE.sub(lambda m: f"{m.group(1)} {FILTERED}", s)
+    s = _SECRET_RE.sub(FILTERED, s)
+    s = _ID_RE.sub("[id]", s)
+    return s
+
+
+def _scrub_value(v: Any, depth: int = 0) -> Any:
+    if depth > 32:
+        return v
+    if isinstance(v, str):
+        return scrub_text(v)
+    if isinstance(v, dict):
+        return {k: _scrub_value(x, depth + 1) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_scrub_value(x, depth + 1) for x in v]
+    if isinstance(v, tuple):
+        return tuple(_scrub_value(x, depth + 1) for x in v)
+    return v
+
+
+def _scrub_headers(headers: Any) -> Any:
+    if not isinstance(headers, dict):
+        return headers
+    out = {}
+    for k, v in headers.items():
+        lk = str(k).lower()
+        if lk in _SENSITIVE_HEADERS or any(p in lk for p in _SENSITIVE_HEADER_PARTS):
+            out[k] = FILTERED
+        else:
+            out[k] = v
+    return out
+
+
+def scrub_event(event: dict, hint: Any = None) -> dict:
+    """Sentry ``before_send`` / event processor enforcing the PII policy.
+
+    * request: drop body (``data``), cookies and ``env`` (client IP);
+      filter auth/cookie/signature/forwarding headers; redact
+      sensitive query-string values.
+    * user: keep only the opaque ``id``.
+    * everything else: recursively redact emails, workspace/user
+      ids, bearer tokens, Stripe keys and Fernet tokens from every
+      string (exception values, messages, breadcrumbs, source
+      context lines).
+    """
+    if not isinstance(event, dict):
+        return event
+    req = event.get("request")
+    if isinstance(req, dict):
+        req.pop("data", None)
+        req.pop("cookies", None)
+        req.pop("env", None)
+        if "headers" in req:
+            req["headers"] = _scrub_headers(req["headers"])
+        qs = req.get("query_string")
+        if isinstance(qs, str) and qs:
+            req["query_string"] = redact_query_string(qs)
+    user = event.get("user")
+    if isinstance(user, dict):
+        # Opaque id only; email / username / ip_address never leave.
+        event["user"] = {"id": user["id"]} if "id" in user else {}
+    for key in list(event.keys()):
+        if key == "user":
+            continue
+        event[key] = _scrub_value(event[key])
+    return event

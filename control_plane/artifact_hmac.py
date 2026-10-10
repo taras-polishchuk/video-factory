@@ -77,6 +77,11 @@ def _static_dev_key_marker() -> bytes:
     return b"video-factory-dev-key-DO-NOT-USE-IN-PROD"
 
 
+def dev_key_in_use() -> bool:
+    """True iff the static dev fallback HMAC key is active."""
+    return _key_bytes() == _static_dev_key_marker()
+
+
 def warn_if_dev_key_in_use() -> str | None:
     """Return a warning string iff the dev fallback key is in use.
 
@@ -84,7 +89,7 @@ def warn_if_dev_key_in_use() -> str | None:
     forgot to set `VIDEO_FACTORY_DB_KEY` see a clear log line at
     boot instead of a quiet binding failure months later.
     """
-    if _key_bytes() == _static_dev_key_marker():
+    if dev_key_in_use():
         return (
             "VIDEO_FACTORY_DB_KEY and VIDEO_FACTORY_SECRET_KEY are "
             "both unset.  Falling back to a static dev HMAC key.  "
@@ -164,6 +169,7 @@ def rekey_sidecar(*, storage_root: str, storage_key: str,
 
 __all__ = [
     "compute_hmac",
+    "dev_key_in_use",
     "rekey_sidecar",
     "verify_sidecar",
     "warn_if_dev_key_in_use",
