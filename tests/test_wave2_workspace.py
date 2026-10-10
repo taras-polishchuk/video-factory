@@ -834,8 +834,9 @@ def test_cross_workspace_path_traversal_rejection_still_works(tmp_path):
                  workspace_name="Path")
     wid = r.json()["workspace_id"]
     files = {"file": ("../escape.txt", io.BytesIO(b"x"), "text/plain")}
+    csrf = client.get("/auth/csrf").json()["csrf_token"]
     r2 = client.post(f"/api/v1/workspaces/{wid}/assets",
-                      files=files)
+                      files=files, headers={"X-CSRF-Token": csrf})
     assert r2.status_code == 400, r2.text
     assert "traversal" in r2.json()["detail"].lower() or \
         "invalid filename" in r2.json()["detail"].lower()

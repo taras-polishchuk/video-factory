@@ -13,6 +13,13 @@ export default defineConfig({
       '/api': {
         target: apiTarget,
         changeOrigin: false
+      },
+      // /auth/csrf (CSRF token for browser-side writes) and the
+      // /auth/oauth/* links live on FastAPI too; Caddy already
+      // forwards /auth/* in production.
+      '/auth': {
+        target: apiTarget,
+        changeOrigin: false
       }
     }
   }
