@@ -60,10 +60,15 @@
 # DB key rotation
 # ---------------
 # VIDEO_FACTORY_DB_KEY rotation is NOT handled by this file. It is a
-# stateful change that requires running
-# scripts/rotate_master_key.sh (Wave 5 deliverable, idempotent).
-# Once the rotation finishes, restart the service so all processes see
-# the new key.
+# stateful change that re-encrypts the DB through the owner-only admin
+# endpoint (Wave 5, control_plane/key_rotation.py):
+#   GET  /api/v1/admin/keys/status   rotation state
+#   POST /api/v1/admin/keys/rotate   {"old_key": ..., "new_key": ...}
+# Step-by-step (curl + owner session cookie): docs/operations-prod.md,
+# "Rotate the DB master key (VIDEO_FACTORY_DB_KEY)". There is no scripts/rotate_master_key.sh.
+# After a successful rotation write the new value into
+# /etc/video-factory/credentials/video_factory_db_key (atomic rename)
+# and restart the service so all processes see the new key.
 #
 # Audit
 # -----
