@@ -1,0 +1,17 @@
+# Video Factory - one retention sweep (JOBS S3, F-07 / F-42).
+#
+# Deletes job artifacts older than ARTIFACTS_RETENTION_DAYS and audit
+# rows older than AUDIT_LOG_RETENTION_DAYS (both read from the api
+# container env; 0 = off). Triggered daily by
+# video-factory-retention.timer. See docs/operations-prod.md
+# "Retention". Safe to run while the api serves traffic.
+
+[Unit]
+Description=Video Factory retention sweep
+After=video-factory.service
+Requires=video-factory.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/video-factory
+ExecStart=/usr/bin/docker compose -f /opt/video-factory/docker-compose.production.yml exec -T api python -m cli.maintenance retention

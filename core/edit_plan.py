@@ -142,12 +142,11 @@ _MOCK_X264_PRESET = "ultrafast"
 
 # Memory bound (JOBS S3 item 4). Without -threads, libx264 and the
 # lavfi/filter graph size their thread pools from the host CPU count;
-# each thread holds its own frame buffers, and a single 1080x1920
-# synthetic-clip encode peaked at ~640 MB RSS on an 8-core host
-# (measured with /usr/bin/time -v; see docs/operations-prod.md
-# "Per-job memory budget"). Two encoder threads and a single filter
-# thread bring the peak under ~100 MB at a modest wall-clock cost.
-# Override with VIDEO_FACTORY_FFMPEG_THREADS (>= 1).
+# each thread holds its own frame buffers. On an 8-core host one mock
+# assembly peaked at 750-1019 MB RSS (single encode); with two encoder
+# threads and one filter thread every encode stayed under 170 MB
+# (/usr/bin/time -v, see docs/operations-prod.md "Per-job memory
+# budget"). Override with VIDEO_FACTORY_FFMPEG_THREADS (>= 1).
 FFMPEG_THREADS_ENV = "VIDEO_FACTORY_FFMPEG_THREADS"
 DEFAULT_FFMPEG_THREADS = 2
 
