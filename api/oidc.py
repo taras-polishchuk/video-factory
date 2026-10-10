@@ -880,7 +880,7 @@ def _first_workspace_for_user(conn, user_id: str) -> Optional[dict]:
     cur = conn.execute(
         "SELECT m.workspace_id, w.slug FROM memberships m "
         "JOIN workspaces w ON w.workspace_id = m.workspace_id "
-        "WHERE m.user_id=? ORDER BY m.created_at ASC LIMIT 1",
+        "WHERE m.user_id=? ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1",
         (user_id,),
     )
     row = cur.fetchone()

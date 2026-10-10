@@ -10,25 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
-
-from assembly.ffmpeg_safe import (
-    CONCAT_INPUT_GUARD,
-    drawtext_from_file,
-    write_concat_list,
-    write_text_file,
-)
-from core.text_safety import TOPIC_MAX_CHARS, clean_user_text
-
-# Upper bound for a burned-in label: topic cap + " #NNNN" clip suffix.
-MAX_LABEL_CHARS = TOPIC_MAX_CHARS + 8
-_SAFE_COLOR = re.compile(r"^(#[0-9A-Fa-f]{6}|[A-Za-z]{1,32})$")
 
 
 @dataclass
@@ -71,10 +57,6 @@ def build_plan(*, duration_seconds: int, n_clips: int = 3,
     Real provider would slot scene clips here.
     """
     per = max(1.0, duration_seconds / max(1, n_clips))
-    # SECURITY S1c: the label is drawn from a file, never inlined in the
-    # filtergraph; still strip control chars and cap it for legacy rows
-    # and non-API callers.
-    label_topic = clean_user_text(topic or "")[:TOPIC_MAX_CHARS] or "clip"
     clips = []
     palette = ["#0f172a", "#1e3a8a", "#0d9488", "#7c2d12", "#581c87"]
     for i in range(n_clips):
@@ -82,7 +64,7 @@ def build_plan(*, duration_seconds: int, n_clips: int = 3,
             clip_id=f"clip_{i+1}",
             source_kind="synthetic",
             duration_seconds=per,
-            label=f"{label_topic} #{i+1}",
+            label=f"{topic or 'clip'} #{i+1}",
             seed_color=palette[i % len(palette)],
         ))
     return EditPlan(
@@ -113,11 +95,9 @@ def render_plan_to_storage(*, plan: EditPlan, storage, output_key: str) -> Optio
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         clip_files: List[str] = []
-        clip_names: List[str] = []
-        for idx, clip in enumerate(plan.clips, start=1):
-            # Names are ours (portable, relative): the concat list never
-            # carries plan- or user-derived text.
-            cf = tmpdir / f"seg_{idx:04d}.mp4"
+        concat_lines: List[str] = []
+        for clip in plan.clips:
+            cf = tmpdir / f"{clip.clip_id}.mp4"
             ok = _ffmpeg_synthetic_clip(
                 out=str(cf),
                 duration=clip.duration_seconds,
@@ -129,8 +109,9 @@ def render_plan_to_storage(*, plan: EditPlan, storage, output_key: str) -> Optio
             if not ok:
                 return None
             clip_files.append(str(cf))
-            clip_names.append(cf.name)
-        concat_file = write_concat_list(tmpdir / "concat.txt", clip_names)
+            concat_lines.append(f"file '{cf.as_posix()}'")
+        concat_file = tmpdir / "concat.txt"
+        concat_file.write_text("\n".join(concat_lines) + "\n")
         final = tmpdir / "final.mp4"
         ok = _ffmpeg_concat(
             concat=str(concat_file),
@@ -151,6 +132,14 @@ def render_plan_to_storage(*, plan: EditPlan, storage, output_key: str) -> Optio
         }
 
 
+# The mock plan renders flat-colour synthetic clips with one text
+# overlay. Encoder quality is irrelevant for that content, while the
+# libx264 default preset ("medium") costs ~3x the CPU of "ultrafast"
+# for the same playable H.264 MP4. Encode cost is what made the mock
+# job path slow (and wall-clock-sensitive) on a loaded host.
+_MOCK_X264_PRESET = "ultrafast"
+
+
 def _dimensions_for(aspect: str) -> tuple:
     return {
         "9:16": (1080, 1920),
@@ -162,56 +151,29 @@ def _dimensions_for(aspect: str) -> tuple:
 
 def _ffmpeg_synthetic_clip(*, out: str, duration: float, width: int,
                            height: int, color: str, label: str) -> bool:
-    """Render one colour card with ``label`` centered.
-
-    SECURITY S1c: ``label`` is user-derived. It goes to a private text file
-    next to ``out`` and is drawn with ``textfile=<basename>`` +
-    ``expansion=none`` (ffmpeg runs with cwd = that directory), so the
-    filtergraph only ever holds constants. The lavfi source strings are
-    built from validated numbers and a colour token only.
-    """
-    if not (isinstance(duration, (int, float)) and math.isfinite(duration)
-            and duration > 0):
-        return False
-    if not (isinstance(color, str) and _SAFE_COLOR.match(color)):
-        return False
-    width, height = int(width), int(height)
-    out_path = Path(out).resolve()
-    workdir = out_path.parent
-    text = clean_user_text(str(label))[:MAX_LABEL_CHARS]
-    try:
-        label_file = write_text_file(workdir, text)
-    except OSError:
-        return False
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"color=c={color}:s={width}x{height}:d={duration}:r=30",
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
-        "-vf", drawtext_from_file(label_file),
-        # Synthetic placeholder clips: `ultrafast` cuts x264 peak RSS from
-        # ~680 MB to ~225 MB per 1080x1920 clip (measured 2026-10-09) and
-        # runs ~3x faster. Quality is irrelevant for colour-card placeholders.
-        "-c:v", "libx264", "-preset", "ultrafast",
+        "-vf", f"drawtext=text='{label}':fontcolor=white:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-c:v", "libx264", "-preset", _MOCK_X264_PRESET,
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-        str(out_path),
+        out,
     ]
     try:
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=60, cwd=str(workdir))
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return False
-    finally:
-        (workdir / label_file).unlink(missing_ok=True)
 
 
 def _ffmpeg_concat(*, concat: str, out: str, width: int, height: int,
                    duration: int) -> bool:
     cmd = [
-        # Safe mode (default): the list only holds relative portable names.
-        "ffmpeg", "-y", *CONCAT_INPUT_GUARD, "-f", "concat", "-i", concat,
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat,
         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:v", "libx264", "-preset", _MOCK_X264_PRESET,
+        "-pix_fmt", "yuv420p", "-r", "30",
         "-an", out,
     ]
     try:

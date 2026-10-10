@@ -1663,7 +1663,7 @@ def create_app(*, repo: Optional[Repo] = None,
                     "FROM sessions s "
                     "LEFT JOIN memberships m ON m.user_id = s.user_id "
                     "WHERE s.session_id=? "
-                    "ORDER BY m.created_at ASC LIMIT 1",
+                    "ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1",
                     (sid,),
                 ).fetchone()
                 if row:

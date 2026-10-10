@@ -285,53 +285,32 @@ def test_live_gate_requires_workspace_live_enabled():
 # ── Full-suite guard (proxy for the brief's "250 green" claim) ─
 
 
-def test_existing_tests_still_green():
+@pytest.mark.suite_guard
+def test_existing_tests_still_green(full_suite_run):
     """Spawn a fresh subprocess and confirm the full pytest
-    suite still passes (with the inter-suite gates deselected,
-    same as Wave 6a).
+    suite still passes.
 
     This is a slow guard — the focused tests above pin the
     specific behaviour; this one catches the case where my
     repo or API edits broke a test elsewhere in the repo.
 
-    RECURSION GUARD: when pytest itself is already running the
-    full suite and reaches this test, the subprocess below
-    would itself run the same test, which would run the
-    subprocess, which would...  we set a sentinel env var and
-    skip the subprocess when we detect it (so the test is
-    essentially a no-op when nested, and a real subprocess
-    spawn when called directly).
+    CI-only meta test (t_cfd27f30): deselected by default, enabled
+    with ``--run-suite-guard``. The subprocess runs once per session
+    in the ``full_suite_run`` conftest fixture (shared with the other
+    suite guards, run with the project interpreter = sys.executable,
+    cwd pinned to the repo root).
+
+    RECURSION GUARD: the child run sets VF_SUITE_GUARD_CHILD=1, which
+    makes conftest deselect every suite_guard test inside it, so the
+    child can never spawn another child. The historical
+    WAVE6B_SUITE_GUARD_ACTIVE sentinel is still honoured.
     """
     if os.environ.get("WAVE6B_SUITE_GUARD_ACTIVE") == "1":
-        # We're already inside the suite-guard subprocess; do
+        # We're already inside a legacy suite-guard subprocess; do
         # not recurse.
         return
-    repo_root = Path(__file__).resolve().parent.parent
-    env = os.environ.copy()
-    env["VIDEO_FACTORY_SECRET_KEY"] = (
-        env.get("VIDEO_FACTORY_SECRET_KEY")
-        or "X" * 44  # valid Fernet-key shape
-    )
-    env["WAVE6B_SUITE_GUARD_ACTIVE"] = "1"
-    # Use the project venv (3.12, has the right fastapi/pydantic)
-    venv_py = "/home/taras/projects/video-factory/.venv/bin/python3"
-    if not Path(venv_py).exists():
-        venv_py = sys.executable
-    result = subprocess.run(
-        [venv_py, "-m", "pytest", "-q", "--no-header",
-         "--deselect",
-         "tests/test_wave4_oidc.py::test_existing_211_tests_still_green",
-         "--deselect",
-         "tests/test_wave6_billing.py::test_existing_273_tests_still_green",
-         "--deselect",
-         "tests/test_wave6_billing.py::test_existing_279_tests_still_green",
-         "--deselect",
-         "tests/test_wave6b_quotas.py::test_existing_tests_still_green",
-         ],
-        env=env, cwd=str(repo_root),
-        capture_output=True, text=True, timeout=600,
-    )
-    assert result.returncode == 0, (
-        f"full suite failed:\nSTDOUT:\n{result.stdout}\n"
-        f"STDERR:\n{result.stderr}"
+    result = full_suite_run
+    assert result["returncode"] == 0, (
+        f"full suite failed:\nSTDOUT:\n{result['stdout']}\n"
+        f"STDERR:\n{result['stderr']}"
     )

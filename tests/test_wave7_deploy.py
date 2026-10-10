@@ -285,111 +285,202 @@ def test_backup_script_dry_run():
 # ────────────────────────────────────────────────────────────────────
 # 5) restore.sh — restores to a known checksum
 # ────────────────────────────────────────────────────────────────────
-def test_restore_script_restores_to_known_checksum(tmp_path):
-    """restore.sh --to <dir> against a fabricated restic repo
-    restores the same bytes we wrote in. Uses `--help` first to
-    confirm exit code path; then exercises the real path with a
-    fake restic binary on PATH that pretends to restore a fixture
-    file.
-    """
-    fake_restic = tmp_path / "restic"
-    # The fake restic accepts arbitrary args in any order; it picks
-    # the subcommand by walking argv for the first non-flag token
-    # that is NOT a value to a known -r / --repo flag.
-    fake_restic.write_text(
-        "#!/usr/bin/env bash\n"
-        "# Stand-in for `restic`. Recognises: snapshots, restore.\n"
-        "SUBCMD=\"\"\n"
-        "prev_was_repo=0\n"
-        "for arg in \"$@\"; do\n"
-        "  case \"$arg\" in\n"
-        "    -r|--repo|--repository) prev_was_repo=1; continue;;\n"
-        "    --*=*) ;;\n"
-        "    -*) prev_was_repo=0;;\n"
-        "    *)\n"
-        "      if [ \"$prev_was_repo\" -eq 1 ]; then\n"
-        "        prev_was_repo=0\n"
-        "        continue\n"
-        "      fi\n"
-        "      SUBCMD=\"$arg\"\n"
-        "      break\n"
-        "      ;;\n"
-        "  esac\n"
-        "done\n"
-        "case \"$SUBCMD\" in\n"
-        "  snapshots)\n"
-        "    if echo \"$*\" | grep -q -- '--json'; then\n"
-        "      echo '{\"id\":\"abc12345def67890\",\"short_id\":\"abc12345\",\"time\":\"2026-10-08T12:00:00.000000000Z\",\"hostname\":\"host\",\"paths\":[\"/data\"],\"tags\":[\"video-factory\"]}'\n"
-        "    else\n"
-        "      echo 'ID                   Time                 Host    Tags'\n"
-        "      echo '----------------------------------------------------------------------'\n"
-        "      echo 'abc12345  2026-10-08 12:00:00  host    video-factory'\n"
-        "    fi\n"
-        "    exit 0\n"
-        "    ;;\n"
-        "  restore)\n"
-        "    TARGET=\"\"\n"
-        "    SNAP=\"\"\n"
-        "    while [ \"$#\" -gt 0 ]; do\n"
-        "      case \"$1\" in\n"
-        "        --target) TARGET=\"$2\"; shift 2;;\n"
-        "        *) if [ -z \"$SNAP\" ] && [ \"${1#-}\" = \"$1\" ]; then SNAP=\"$1\"; fi; shift;;\n"
-        "      esac\n"
-        "    done\n"
-        "    mkdir -p \"$TARGET\"\n"
-        "    printf 'fixture content\\n' > \"$TARGET/video_factory.db\"\n"
-        "    exit 0\n"
-        "    ;;\n"
-        "  *)\n"
-        "    exit 0\n"
-        "    ;;\n"
-        "esac\n"
-    )
-    fake_restic.chmod(0o755)
+# Hermetic stand-in for `restic` (t_cfd27f30). It lives in its own
+# bin dir that is FIRST on PATH, so a real restic on the host can never
+# shadow it, and it appends every invocation to $RESTIC_SHIM_LOG so the
+# tests can prove scripts/restore.sh really drove it.
+#   RESTIC_SHIM_JSON=object  one JSON object per line (legacy shim shape)
+#   RESTIC_SHIM_JSON=array   one JSON array, the shape real restic prints
+_FAKE_RESTIC = r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${RESTIC_SHIM_LOG:-/dev/null}"
+SUBCMD=""
+prev_was_repo=0
+for arg in "$@"; do
+  case "$arg" in
+    -r|--repo|--repository) prev_was_repo=1; continue;;
+    --*=*) ;;
+    -*) prev_was_repo=0;;
+    *)
+      if [ "$prev_was_repo" -eq 1 ]; then
+        prev_was_repo=0
+        continue
+      fi
+      SUBCMD="$arg"
+      break
+      ;;
+  esac
+done
+SNAP_JSON='{"id":"abc12345def67890","short_id":"abc12345","time":"2026-10-08T12:00:00.000000000Z","hostname":"host","paths":["/data"],"tags":["video-factory"]}'
+case "$SUBCMD" in
+  snapshots)
+    if echo "$*" | grep -q -- '--json'; then
+      if [ "${RESTIC_SHIM_JSON:-object}" = "array" ]; then
+        echo "[$SNAP_JSON]"
+      else
+        echo "$SNAP_JSON"
+      fi
+    else
+      echo 'ID        Time                 Host    Tags'
+      echo '----------------------------------------------------------------------'
+      echo 'abc12345  2026-10-08 12:00:00  host    video-factory'
+    fi
+    exit 0
+    ;;
+  restore)
+    TARGET=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --target) TARGET="$2"; shift 2;;
+        *) shift;;
+      esac
+    done
+    mkdir -p "$TARGET"
+    printf 'fixture content\n' > "$TARGET/video_factory.db"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"""
 
-    checksum = tmp_path / "sha256sum.txt"
-    # Compute the actual sha256 of 'fixture content\n' (echo adds newline)
-    import hashlib
-    fixture_hash = hashlib.sha256(b"fixture content\n").hexdigest()
-    checksum.write_text(f"{fixture_hash}  video_factory.db\n")
 
+def _install_fake_restic(tmp_path: Path) -> tuple[dict, Path, Path]:
+    """Return (env, shim_path, shim_log) for running restore.sh
+    against the fake restic."""
+    shim_dir = tmp_path / "shim-bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "restic"
+    shim.write_text(_FAKE_RESTIC)
+    shim.chmod(0o755)
+    log = tmp_path / "restic-shim.log"
     env = {
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        # The shim dir goes first. The rest of PATH stays so bash,
+        # python3 and sha256sum resolve. PATH is passed via env only:
+        # the old test interpolated it unquoted into `bash -c`, which
+        # broke on any PATH entry with a space (WSL: "/mnt/c/Program
+        # Files/...") and failed the sanity check.
+        "PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
         "RESTIC_REPOSITORY": "s3:fake/repo",
         "RESTIC_PASSWORD": "test-password",
+        "RESTIC_SHIM_LOG": str(log),
     }
-    # Sanity-check: the fake restic must be reachable via the test env.
-    sanity = subprocess.run(
-        ["bash", "-c", f'PATH={env["PATH"]} command -v restic'],
+    which = subprocess.run(
+        ["bash", "-c", "command -v restic"],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert which.stdout.strip() == str(shim), (
+        f"fake restic must win PATH lookup: got {which.stdout!r} "
+        f"stderr={which.stderr!r}"
+    )
+    return env, shim, log
+
+
+def _run_restore(env: dict, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "restore.sh"), *args],
         capture_output=True, text=True, env=env,
+        cwd=str(REPO_ROOT), timeout=120,
     )
-    assert sanity.stdout.strip(), (
-        f"fake restic not on PATH inside test env: PATH={env['PATH']!r}"
-    )
-    # Also sanity-check the fake responds to snapshots/latest/--json
-    sanity2 = subprocess.run(
-        ["bash", "-c", f'PATH={env["PATH"]} restic -r s3:fake/repo snapshots latest --json'],
-        capture_output=True, text=True, env=env,
-    )
-    assert sanity2.stdout.strip(), (
-        f"fake restic returned empty for snapshots latest --json: "
-        f"stdout={sanity2.stdout!r} stderr={sanity2.stderr!r}"
-    )
-    r = subprocess.run(
-        ["bash", str(SCRIPTS_DIR / "restore.sh"),
-         "--snapshot", "latest",
-         "--to", str(tmp_path / "restored"),
-         "--verify-checksum", str(checksum)],
-        capture_output=True, text=True, env=env,
-        cwd=str(REPO_ROOT), timeout=30,
-    )
+
+
+def test_restore_script_restores_to_known_checksum(tmp_path):
+    """restore.sh --to <dir> against a fabricated restic repo
+    restores the same bytes we wrote in. Always runs: it uses the
+    hermetic fake restic (no real binary or network needed) and
+    proves restore.sh drove it (snapshot lookup, then restore of the
+    resolved id into --to)."""
+    import hashlib
+    env, _shim, log = _install_fake_restic(tmp_path)
+    fixture_hash = hashlib.sha256(b"fixture content\n").hexdigest()
+    checksum = tmp_path / "sha256sum.txt"
+    checksum.write_text(f"{fixture_hash}  video_factory.db\n")
+    target = tmp_path / "restored"
+
+    r = _run_restore(env, "--snapshot", "latest", "--to", str(target),
+                     "--verify-checksum", str(checksum))
     assert r.returncode == 0, (
         f"restore.sh failed:\nstdout={r.stdout}\nstderr={r.stderr}"
     )
-    # The restored file must exist and match.
-    restored = tmp_path / "restored" / "video_factory.db"
+    restored = target / "video_factory.db"
     assert restored.exists(), f"expected {restored} to exist"
     assert hashlib.sha256(restored.read_bytes()).hexdigest() == fixture_hash
+    assert "video_factory.db: OK" in r.stdout
+    assert "restore: complete" in r.stdout
+    calls = log.read_text().splitlines()
+    assert calls[0] == "-r s3:fake/repo snapshots latest --json", calls
+    assert f"-r s3:fake/repo restore abc12345def67890 --target {target}" in calls, calls
+
+
+def test_restore_script_resolves_latest_from_real_restic_json_array(tmp_path):
+    """Real restic prints `snapshots --json` as ONE JSON array. The
+    old parser only understood one object per line, silently fell
+    back to the table output and restored the SHORT id. It must use
+    the full id from the JSON path."""
+    env, _shim, log = _install_fake_restic(tmp_path)
+    env["RESTIC_SHIM_JSON"] = "array"
+    target = tmp_path / "restored"
+    r = _run_restore(env, "--snapshot", "latest", "--to", str(target))
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+    calls = log.read_text().splitlines()
+    # JSON path only: no table-output fallback call.
+    assert "-r s3:fake/repo snapshots latest" not in calls, calls
+    assert f"-r s3:fake/repo restore abc12345def67890 --target {target}" in calls, calls
+
+
+def test_restore_script_fails_on_checksum_mismatch(tmp_path):
+    """--verify-checksum is a real gate: a wrong manifest fails the
+    drill with a non-zero exit and no 'complete' line."""
+    env, _shim, _log = _install_fake_restic(tmp_path)
+    checksum = tmp_path / "sha256sum.txt"
+    checksum.write_text(f"{'0' * 64}  video_factory.db\n")
+    r = _run_restore(env, "--snapshot", "latest",
+                     "--to", str(tmp_path / "restored"),
+                     "--verify-checksum", str(checksum))
+    assert r.returncode != 0, f"mismatch must fail:\nstdout={r.stdout}"
+    assert "restore: complete" not in r.stdout
+    assert "FAILED" in r.stdout
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("restic") is None,
+    reason="real restic binary not on PATH; the shim-based restore tests "
+           "above always run",
+)
+def test_restore_script_round_trip_with_real_restic(tmp_path):
+    """Real-binary drill (runs only where restic is installed, e.g.
+    the production image): back up a file into a local restic repo,
+    then restore it with scripts/restore.sh and verify the checksum."""
+    import hashlib
+    import shutil as _shutil
+    repo_dir = tmp_path / "restic-repo"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    payload = b"real restic round trip\n"
+    src = data_dir / "video_factory.db"
+    src.write_bytes(payload)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "RESTIC_REPOSITORY": str(repo_dir),
+        "RESTIC_PASSWORD": "test-password",
+        "RESTIC_CACHE_DIR": str(tmp_path / "restic-cache"),
+    }
+    restic = _shutil.which("restic")
+    for cmd in (["init"], ["backup", str(src)]):
+        rc = subprocess.run([restic, "-r", str(repo_dir), *cmd],
+                            capture_output=True, text=True, env=env,
+                            timeout=300)
+        assert rc.returncode == 0, rc.stdout + rc.stderr
+    # restic restores absolute paths below --target.
+    rel = str(src).lstrip("/")
+    checksum = tmp_path / "sha256sum.txt"
+    checksum.write_text(f"{hashlib.sha256(payload).hexdigest()}  {rel}\n")
+    target = tmp_path / "restored"
+    r = _run_restore(env, "--snapshot", "latest", "--to", str(target),
+                     "--verify-checksum", str(checksum))
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+    assert (target / rel).read_bytes() == payload
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -564,7 +655,8 @@ def test_provision_and_deploy_sh_syntax():
 # ────────────────────────────────────────────────────────────────────
 # 12) Baseline tests — pre-Wave-7 count is still green
 # ────────────────────────────────────────────────────────────────────
-def test_existing_270_tests_still_green():
+@pytest.mark.suite_guard
+def test_existing_270_tests_still_green(full_suite_run):
     """The full pytest suite still passes (minus pre-existing env-only skips).
 
     The historical name references 270 (Wave 5.6 baseline). Today's
@@ -572,44 +664,26 @@ def test_existing_270_tests_still_green():
     for back-compat but assert a count that includes the 12 new
     Wave 7 tests.
 
-    We skip if pytest is unavailable (CI may have a venv quirk).
+    CI-only meta test (t_cfd27f30): deselected by default, enabled
+    with ``--run-suite-guard``. The full-suite subprocess runs once
+    per session in the ``full_suite_run`` conftest fixture. The child
+    run deselects every suite_guard test (VF_SUITE_GUARD_CHILD=1), so
+    it no longer needs ``--ignore=tests/test_wave7_deploy.py`` to
+    avoid recursion and the other Wave 7 tests are covered too.
+
+    Tightened vs. the original: the child must exit 0. The old
+    version tolerated failures (it only parsed a "N passed ...
+    warnings" line, which also broke when a run had no warnings).
     """
-    # Run the suite excluding this file (to avoid recursion).
-    args = [
-        sys.executable, "-m", "pytest",
-        "tests/", "-q", "--tb=line",
-        "--ignore=tests/test_wave7_deploy.py",
-    ]
-    r = subprocess.run(
-        args, capture_output=True, text=True,
-        cwd=str(REPO_ROOT), timeout=900,
-        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+    r = full_suite_run
+    assert r["returncode"] == 0, (
+        f"full suite failed: {r['summary']}\n"
+        f"stdout={r['stdout'][-4000:]}\nstderr={r['stderr'][-2000:]}"
     )
-    # We accept the pre-existing failure of
-    # tests/test_wave4_oidc.py::test_existing_211_tests_still_green
-    # (it shells out to `pytest` directly, which goes to system pytest
-    # in this env). See progress.md Wave 4 follow-up notes.
-    summary_line = next((l for l in r.stdout.splitlines()
-                         if "passed" in l and "warnings" in l), "")
-    # If pytest was not importable, surface the error.
-    assert "passed" in summary_line, (
-        f"pytest did not run cleanly:\nstdout={r.stdout[-2000:]}\nstderr={r.stderr[-2000:]}"
-    )
-    # Count must include the new 12 Wave 7 tests.
-    m = re.search(r"(\d+)\s+passed", summary_line)
-    assert m, f"could not parse pytest summary: {summary_line}"
-    passed = int(m.group(1))
+    passed = r["counts"].get("passed", 0)
     # The brief says "270+ existing tests must remain green"; the
-    # actual current count is whatever pytest reports (including
-    # env-skipped tests). The pre-existing failure of
-    # tests/test_wave4_oidc.py::test_existing_211_tests_still_green
-    # is unrelated to Wave 7 (it shells out to the system `pytest`
-    # binary which lacks the project's venv).
-    #
-    # We assert >= 230 to leave headroom for the historical
-    # pre-existing failure plus any test we haven't accounted for.
-    # Wave 7's contribution is verified by the 11 other tests in
-    # this file all passing.
+    # actual current count is whatever pytest reports. We assert
+    # >= 230 to leave headroom for env-only skips.
     assert passed >= 230, (
-        f"only {passed} tests passed (expected >= 230). summary={summary_line}"
+        f"only {passed} tests passed (expected >= 230). summary={r['summary']}"
     )

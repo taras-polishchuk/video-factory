@@ -128,15 +128,24 @@ def env(tmp_path, monkeypatch):
     yield _AuthedClient(TestClient(app)), repo, storage
 
 
-def _wait_done(client, job_id, timeout_s=60):
-    import time
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        j = client.get(f"/api/v1/jobs/{job_id}").json()
-        if j["state"] in ("done", "failed"):
-            return j
-        time.sleep(0.1)
-    raise AssertionError(f"job did not finish in {timeout_s}s")
+# Hang guard only. Completion is signalled by the runner thread
+# finishing (JobRunner.wait), not by polling the job row against a
+# short wall clock: the old 60 s poll failed whenever the host was
+# loaded (CPU-bound ffmpeg encodes under pytest-xdist). t_cfd27f30.
+JOB_HANG_GUARD_S = 600
+
+
+def _wait_done(client, job_id, timeout_s=JOB_HANG_GUARD_S):
+    from core.runners import Singleton
+    finished = Singleton.get().wait(job_id, timeout=timeout_s)
+    j = client.get(f"/api/v1/jobs/{job_id}").json()
+    if not finished:
+        raise AssertionError(
+            f"job pipeline thread still running after {timeout_s}s "
+            f"(state={j['state']!r})"
+        )
+    assert j["state"] in ("done", "failed"), j
+    return j
 
 
 def test_health(env):
@@ -267,7 +276,7 @@ def test_publishing_intents(env):
 
 
 def test_publish_requires_done_state(env):
-    client, _, _ = env
+    client, repo, _ = env
     cid = client.post("/api/v1/companies", json={"slug": "a", "name": "A"}).json()["company_id"]
     bid = client.post(f"/api/v1/companies/{cid}/bibles",
                        json={"payload": {"name": "A", "audience": "x"}}).json()["bible_id"]
@@ -276,6 +285,12 @@ def test_publish_requires_done_state(env):
         "company_id": cid, "bible_id": bid, "topic": "t",
         "language": "en-US", "duration_seconds": 6, "platforms": ["tiktok"],
     }).json()["job_id"]
+    # Determinism (t_cfd27f30): the background pipeline could finish
+    # before the publish call on a fast host. Let it finish, then pin
+    # a non-terminal state so the guard is exercised every time.
+    from core.runners import Singleton
+    assert Singleton.get().wait(jid, timeout=JOB_HANG_GUARD_S)
+    repo.update_job(jid, state="running")
     r = client.post(f"/api/v1/jobs/{jid}/publish", json={"action": "draft", "platforms": ["tiktok"]})
     assert r.status_code == 400
 

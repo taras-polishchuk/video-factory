@@ -701,28 +701,21 @@ def test_stripe_checkout_passes_workspace_owner_email(billing_env):
 # ── Existing-suite green gate ─────────────────────────────────
 
 
-def test_existing_273_tests_still_green():
+@pytest.mark.suite_guard
+def test_existing_273_tests_still_green(full_suite_run):
     """Run the full suite and confirm no regression.  This is a
     slow guard — the rest of the file is the focused tests; this
     one catches the case where my Repo.column additions broke a
-    test elsewhere that hardcoded the old 12-column shape."""
-    import subprocess
-    env = os.environ.copy()
-    env["VIDEO_FACTORY_SECRET_KEY"] = (
-        env.get("VIDEO_FACTORY_SECRET_KEY")
-        or "X" * 44  # valid Fernet key shape
-    )
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--no-header",
-         "--deselect", "tests/test_wave4_oidc.py::test_existing_211_tests_still_green",
-         "--deselect", "tests/test_wave6_billing.py::test_existing_273_tests_still_green",
-         ],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert result.returncode == 0, (
-        f"full suite failed:\nSTDOUT:\n{result.stdout}\n"
-        f"STDERR:\n{result.stderr}"
+    test elsewhere that hardcoded the old 12-column shape.
+
+    CI-only meta test (t_cfd27f30): deselected by default, enabled
+    with ``--run-suite-guard``. The full-suite subprocess runs once
+    per session in the ``full_suite_run`` conftest fixture (shared by
+    all suite guards, cwd pinned to the repo root); the child run
+    never contains suite guards, so it cannot recurse.
+    """
+    result = full_suite_run
+    assert result["returncode"] == 0, (
+        f"full suite failed:\nSTDOUT:\n{result['stdout']}\n"
+        f"STDERR:\n{result['stderr']}"
     )

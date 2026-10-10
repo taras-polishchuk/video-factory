@@ -303,14 +303,14 @@ def test_hooks_server_allows_webhooks():
 # ────────────────────────────────────────────────────────────────────
 
 
-def test_workspace_switcher_lists_only_memberships():
+def test_workspace_switcher_lists_only_memberships(auth_env_inline):
     """The switcher is a server-rendered component: the source
     iterates the memberships list provided by the layout server
     loader. The /auth/me endpoint returns exactly the user's
     memberships — never every workspace in the system. (This is
     the Wave 2 MAJOR #2 fix; we re-verify here so a UI drift
     can't regress it.)"""
-    client = auth_env_inline()
+    client = auth_env_inline
     # Anonymous enumeration must be blocked.
     r = client.get("/auth/me")
     assert r.status_code == 401
@@ -380,25 +380,24 @@ def test_workspace_switcher_updates_active_workspace(auth_env):
 
 
 # Inline fixture (parametrize-friendly wrapper around auth_env).
-def auth_env_inline():
-    """Same as auth_env but usable as a regular function-call
-    for the few tests that don't want pytest's fixture injection
-    (e.g. inside one-line TestClient composition)."""
-    db = "/tmp/wave3_inline.db"
-    storage = "/tmp/wave3_inline_storage"
-    if os.path.exists(db):
-        os.unlink(db)
+@pytest.fixture()
+def auth_env_inline(tmp_path, monkeypatch, secret_env):
+    """Same as auth_env but yields only the TestClient, for the tests
+    that only need the HTTP surface.
+
+    Determinism fix (t_cfd27f30): this used to be a plain function on
+    a FIXED path (/tmp/wave3_inline.db) that also wrote os.environ
+    without restoring it. Under `pytest -n 6` (or two checkouts
+    running the suite at once) workers unlinked each other's DB while
+    its -wal/-shm files were live, which surfaced as
+    `sqlite3.OperationalError: disk I/O error`. It now uses the
+    test's own tmp_path and monkeypatch.
+    """
+    db = str(tmp_path / "wave3_inline.db")
+    storage = str(tmp_path / "wave3_inline_storage")
     os.makedirs(storage, exist_ok=True)
-    os.environ["VIDEO_FACTORY_DB"] = db
-    os.environ["VIDEO_FACTORY_STORAGE"] = storage
-    os.environ.setdefault("VIDEO_FACTORY_SESSION_SECRET", "x" * 64)
-    os.environ.setdefault("VIDEO_FACTORY_SECRET_KEY", Fernet.generate_key().decode())
-    os.environ.setdefault("VF_LOGIN_IP_WINDOW_SEC", "60")
-    os.environ.setdefault("VF_LOGIN_IP_LIMIT", "5")
-    os.environ.setdefault("VF_LOGIN_EMAIL_WINDOW_SEC", "60")
-    os.environ.setdefault("VF_LOGIN_EMAIL_LIMIT", "10")
-    os.environ.pop("VF_HTTPS", None)
-    os.environ.pop("VIDEO_FACTORY_ENV", None)
+    monkeypatch.setenv("VIDEO_FACTORY_DB", db)
+    monkeypatch.setenv("VIDEO_FACTORY_STORAGE", storage)
     from api.main import create_app
     from core.repo import Repo
     from core.runners import JobRunner, Singleton
@@ -516,10 +515,10 @@ def _run_svelte_action(action_path: pathlib.Path, form: dict):
     return src
 
 
-def test_signup_form_validation_password_too_short():
+def test_signup_form_validation_password_too_short(auth_env_inline):
     """The signup action rejects passwords < 8 chars. The upstream
     API does the same (see tests/test_auth.py::test_signup_weak_password)."""
-    client = auth_env_inline()
+    client = auth_env_inline
     r = client.post("/auth/signup", json={
         "email": "x@example.com", "password": "short", "workspace_name": "X Co",
     })
@@ -529,8 +528,8 @@ def test_signup_form_validation_password_too_short():
     assert "PASSWORD_MIN" in page or "minlength=\"8\"" in (WEB_ROOT / "src/routes/signup/+page.svelte").read_text()
 
 
-def test_signup_form_validation_email_invalid():
-    client = auth_env_inline()
+def test_signup_form_validation_email_invalid(auth_env_inline):
+    client = auth_env_inline
     r = client.post("/auth/signup", json={
         "email": "not-an-email", "password": "Password12345!", "workspace_name": "X Co",
     })
@@ -539,8 +538,8 @@ def test_signup_form_validation_email_invalid():
     assert "EMAIL_RE" in page or "email" in page
 
 
-def test_signup_form_validation_workspace_name_required():
-    client = auth_env_inline()
+def test_signup_form_validation_workspace_name_required(auth_env_inline):
+    client = auth_env_inline
     r = client.post("/auth/signup", json={
         "email": "y@example.com", "password": "Password12345!", "workspace_name": "",
     })
@@ -549,8 +548,8 @@ def test_signup_form_validation_workspace_name_required():
     assert "workspace_name" in page
 
 
-def test_login_form_validation_empty_fields():
-    client = auth_env_inline()
+def test_login_form_validation_empty_fields(auth_env_inline):
+    client = auth_env_inline
     r = client.post("/auth/login", json={"email": "", "password": ""})
     # The upstream API returns 400 for missing fields.
     assert r.status_code in (400, 401, 422), r.text
@@ -706,20 +705,70 @@ def test_ssr_no_localStorage_fallback_in_any_component():
 # ────────────────────────────────────────────────────────────────────
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _web_tree_lock():
+    """Serialise the tests that run SvelteKit tooling in ``web/``.
+
+    t_cfd27f30: ``svelte-kit sync`` (run by ``vite dev`` at startup and
+    by the svelte-check test below) writes ``web/.svelte-kit/``. Under
+    pytest-xdist the two web tests can land on different workers at
+    the same moment; on a fresh checkout one could read
+    ``.svelte-kit/tsconfig.json`` while the other was still writing
+    it. An exclusive flock keyed by the web root path makes the two
+    tests take turns (also across concurrent suites in the SAME
+    checkout) without affecting any other test.
+    """
+    import fcntl
+    import hashlib
+    import tempfile
+    digest = hashlib.sha256(str(WEB_ROOT.resolve()).encode()).hexdigest()[:16]
+    lock_path = pathlib.Path(tempfile.gettempdir()) / f"vf-web-tree-{digest}.lock"
+    with open(lock_path, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def test_svelte_check_zero_errors():
     """The DoD requires npx svelte-check exit 0. We run it as a
     subprocess with a generous timeout (the first run can take
-    a few seconds)."""
+    a few seconds).
+
+    t_cfd27f30: ``jsconfig.json`` extends the GENERATED
+    ``.svelte-kit/tsconfig.json``. On a fresh checkout (CI, git
+    worktree) that file only existed if ``vite dev`` happened to run
+    earlier in the same session, so this test was order dependent
+    (``Cannot read file .svelte-kit/tsconfig.json`` -> 1 error). We
+    now run ``svelte-kit sync`` first, exactly like ``npm run check``
+    (package.json) does.
+    """
     node_modules = WEB_ROOT / "node_modules"
     if not (node_modules / ".bin/svelte-check").exists():
         pytest.skip("svelte-check not installed (no node_modules)")
-    proc = subprocess.run(
-        ["npx", "--no-install", "svelte-check", "--tsconfig", "./jsconfig.json"],
-        cwd=str(WEB_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
+    with _web_tree_lock():
+        sync = subprocess.run(
+            ["npx", "--no-install", "svelte-kit", "sync"],
+            cwd=str(WEB_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert sync.returncode == 0, (
+            f"svelte-kit sync failed:\n{sync.stdout}\n{sync.stderr}"
+        )
+        assert (WEB_ROOT / ".svelte-kit" / "tsconfig.json").is_file()
+        proc = subprocess.run(
+            ["npx", "--no-install", "svelte-check", "--tsconfig", "./jsconfig.json"],
+            cwd=str(WEB_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
     out = proc.stdout + proc.stderr
     # The "found N errors and M warnings" line is the canonical
     # summary svelte-check prints on completion. 0 errors = pass.
@@ -772,51 +821,85 @@ def test_signup_form_ssr_matches_client_hydration():
     env = os.environ.copy()
     env["VIDEO_FACTORY_API_URL"] = "http://127.0.0.1:65535"
     env["VIDEO_FACTORY_SESSION_SECRET"] = "x" * 64
-    proc = subprocess.Popen(
-        ["npx", "--no-install", "vite", "dev", "--port", "5174", "--host", "127.0.0.1"],
-        cwd=str(WEB_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    try:
-        # Wait for the dev server to come up. SvelteKit prints
-        # "Local:   http://127.0.0.1:5174/" when ready; we poll
-        # the port instead because the message format drifts.
-        deadline = time.time() + 60
-        last_err = None
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(
-                    "http://127.0.0.1:5174/login", timeout=2,
-                ) as r:
-                    if r.status == 200:
-                        body_a = r.read()
-                        break
-            except Exception as e:
-                last_err = e
-                time.sleep(0.5)
-        else:
-            stderr = proc.stderr.read(2000).decode(errors="ignore") if proc.stderr else ""
-            pytest.skip(f"vite dev did not start in 60s: {last_err}\n{stderr}")
-        # Second fetch should match the first.
-        with urllib.request.urlopen(
-            "http://127.0.0.1:5174/login", timeout=5,
-        ) as r:
-            body_b = r.read()
-        # Both responses should be the same SSR HTML — SvelteKit
-        # never varies the markup based on the request identity
-        # for a no-cookie GET. (Even with hydration enabled, the
-        # first GET is the SSR HTML.)
-        assert body_a == body_b
-        # The body must contain the login form + fields.
-        assert b'name="email"' in body_a
-        assert b'name="password"' in body_a
-        # And the signup link.
-        assert b'href="/signup"' in body_a
-    finally:
-        proc.terminate()
+    # t_cfd27f30: the port used to be hard-coded to 5174. Two suites
+    # running at once (xdist workers of another checkout, QA, CI) then
+    # collided, and the loser either skipped or fetched the OTHER
+    # checkout's dev server. Ask the OS for a free port and make vite
+    # fail instead of silently moving to a different one.
+    import socket
+    with socket.socket() as _s:
+        _s.bind(("127.0.0.1", 0))
+        port = _s.getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    # stderr goes to a temp file, not a PIPE: nobody drains the pipe
+    # while the server runs, and reading it on the failure path used
+    # to block until vite exited.
+    import tempfile
+    vite_log = tempfile.TemporaryFile()
+    # Hold the web-tree lock for the dev server's lifetime: its startup
+    # runs `svelte-kit sync` into web/.svelte-kit (t_cfd27f30).
+    with _web_tree_lock():
+        proc = subprocess.Popen(
+            ["npx", "--no-install", "vite", "dev", "--port", str(port),
+             "--strictPort", "--host", "127.0.0.1"],
+            cwd=str(WEB_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=vite_log,
+            env=env,
+            # Own process group so teardown also stops the node child
+            # that npx spawns (no orphaned dev servers).
+            start_new_session=True,
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            # Wait for the dev server to come up. SvelteKit prints
+            # "Local:   http://127.0.0.1:<port>/" when ready; we poll
+            # the port instead because the message format drifts.
+            # Startup window is a hang guard; 60 s was too tight for a cold
+            # SSR compile on a loaded host (t_cfd27f30).
+            deadline = time.time() + 180
+            last_err = None
+            while time.time() < deadline:
+                try:
+                    with urllib.request.urlopen(
+                        f"{base}/login", timeout=2,
+                    ) as r:
+                        if r.status == 200:
+                            body_a = r.read()
+                            break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.5)
+            else:
+                vite_log.seek(0)
+                stderr = vite_log.read(2000).decode(errors="ignore")
+                pytest.skip(f"vite dev did not start in 180s: {last_err}\n{stderr}")
+            # Second fetch should match the first.
+            with urllib.request.urlopen(
+                f"{base}/login", timeout=5,
+            ) as r:
+                body_b = r.read()
+            # Both responses should be the same SSR HTML — SvelteKit
+            # never varies the markup based on the request identity
+            # for a no-cookie GET. (Even with hydration enabled, the
+            # first GET is the SSR HTML.)
+            assert body_a == body_b
+            # The body must contain the login form + fields.
+            assert b'name="email"' in body_a
+            assert b'name="password"' in body_a
+            # And the signup link.
+            assert b'href="/signup"' in body_a
+        finally:
+            import signal
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+            vite_log.close()

@@ -744,15 +744,25 @@ def test_existing_211_tests_still_green():
     D-W4-QA-M1 fix: shell out via sys.executable (the venv python) so
     the subprocess picks up the project's pinned deps; bare `pytest`
     falls back to a system interpreter that may not have pydantic.
+
+    t_cfd27f30: the list used to include `tests/test_wave3_qa.py`,
+    which never existed in this repo, so collect-only always exited 4
+    ("file or directory not found") and this test could never pass.
+    The Wave 3 suite is `tests/test_wave3_ui.py` (already listed). We
+    now assert every listed file exists first so a future rename
+    fails with a clear message instead of a collect error.
     """
     import subprocess
     import sys
+    targets = ["tests/test_auth.py", "tests/test_wave3_ui.py"]
+    missing = [t for t in targets if not (REPO_ROOT / t).is_file()]
+    assert not missing, f"suite files referenced by this guard are gone: {missing}"
     r = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q",
-         "tests/test_auth.py", "tests/test_wave3_ui.py",
-         "tests/test_wave3_qa.py"],
+         "-p", "no:cacheprovider", *targets],
         capture_output=True, text=True, cwd=str(REPO_ROOT),
         env={**os.environ, "PYTHONPATH": "."},
+        timeout=600,
     )
     assert r.returncode == 0, (
         f"collect-only failed:\n{r.stdout}\n{r.stderr}"

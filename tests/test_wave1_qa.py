@@ -309,12 +309,12 @@ def test_rate_limit_lockout_writes_audit_row(tmp_path):
     assert ctx.get("ip"), "ip missing from lockout audit row"
 
 
-def test_login_after_lockout_returns_423_locked(tmp_path):
+def test_login_after_lockout_returns_423_locked(tmp_path, monkeypatch):
     """After 10 email failures within an hour, the 11th attempt
     returns 423 (email_lockout). Distinct from 429 (ip_lockout)."""
     client, _, _ = _make_app(tmp_path)
     # Raise the IP limit so the email limit is the binding signal.
-    os.environ["VF_LOGIN_IP_LIMIT"] = "100"
+    monkeypatch.setenv("VF_LOGIN_IP_LIMIT", "100")  # t_cfd27f30: no env leak
     importlib.reload(importlib.import_module("auth.ratelimit"))
     _signup(client, email="manyfails@example.com")
     for _ in range(10):

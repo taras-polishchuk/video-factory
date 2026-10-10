@@ -405,11 +405,11 @@ def test_workspace_status_disabled_blocks_even_owner(env):
 # ── Check 7b: vault HMAC binds to workspace_id ─────────────────────
 
 
-def test_credential_vault_hmac_tag_binds_to_workspace(env):
+def test_credential_vault_hmac_tag_binds_to_workspace(env, monkeypatch):
     """A blob encrypted under workspace A must not decrypt under B
     even with the same Fernet key."""
     client, repo, _ = env
-    os.environ["VIDEO_FACTORY_SECRET_KEY"] = Fernet.generate_key().decode()
+    monkeypatch.setenv("VIDEO_FACTORY_SECRET_KEY", Fernet.generate_key().decode())
     from control_plane.secret_vault import encrypt, decrypt, WorkspaceMismatch
     blob = encrypt("wks_A", "heygen_direct", "secret_alpha")
     with pytest.raises(WorkspaceMismatch):

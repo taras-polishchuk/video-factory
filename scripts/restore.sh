@@ -58,12 +58,16 @@ if ! command -v restic >/dev/null 2>&1; then
 fi
 
 if [ "$SNAPSHOT" = "latest" ]; then
-  # `restic snapshots --latest 1 --json` is the robust path across
-  # restic 0.13+. We grep the id from the JSON line. Fall back to
-  # parsing the table output if json isn't available.
+  # `restic snapshots latest --json` is the robust path across
+  # restic 0.13+. Real restic prints ONE JSON array
+  # (`[{"id": ..., "short_id": ...}]`); some wrappers print one object
+  # per line. Accept both and take the last snapshot listed (restic
+  # sorts oldest -> newest). Fall back to parsing the table output if
+  # json isn't available.
   JSON_OUT="$(restic -r "$RESTIC_REPOSITORY" snapshots latest --json 2>/dev/null || true)"
   SNAPSHOT_ID="$(echo "$JSON_OUT" | python3 -c '
 import json, sys
+found = None
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -72,9 +76,12 @@ for line in sys.stdin:
         obj = json.loads(line)
     except Exception:
         continue
-    if isinstance(obj, dict) and "id" in obj and obj.get("short_id"):
-        print(obj["id"])
-        break
+    items = obj if isinstance(obj, list) else [obj]
+    for item in items:
+        if isinstance(item, dict) and item.get("id") and item.get("short_id"):
+            found = item["id"]
+if found:
+    print(found)
 ' 2>/dev/null | head -n 1)"
   if [ -z "$SNAPSHOT_ID" ]; then
     # Fallback: parse the table output (3rd line after the dashed
