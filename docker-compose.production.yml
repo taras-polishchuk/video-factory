@@ -35,6 +35,11 @@ services:
       LIVE_PROVIDER_TESTS: "false"
       MAX_COST_PER_VIDEO_USD: "5"
       MAX_COST_PER_BATCH_USD: "20"
+      # S1b / A2 F-05: production mode = Secure session cookie and
+      # Origin required on the pre-session /auth/* routes; the public
+      # origin is the allow-listed one.
+      VIDEO_FACTORY_ENV: production
+      VIDEO_FACTORY_PUBLIC_BASE_URL: https://${VIDEO_FACTORY_DOMAIN:?VIDEO_FACTORY_DOMAIN must be set}
     volumes:
       - vf_data:/data
     healthcheck:
@@ -58,6 +63,9 @@ services:
       # Cookies must be Secure + SameSite=None when behind HTTPS
       COOKIE_SECURE: "true"
       COOKIE_SAMESITE: "lax"
+      # S1b: the SvelteKit server signs its calls to the pre-session
+      # /auth/* routes (X-VF-Internal-Token) with the session secret.
+      VIDEO_FACTORY_SESSION_SECRET: ${VIDEO_FACTORY_SESSION_SECRET:?VIDEO_FACTORY_SESSION_SECRET must be set}
     depends_on:
       - api
 
