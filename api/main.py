@@ -121,11 +121,16 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.get("/health")
     async def health():
+        # A2 F-17: report the real gate state instead of a constant.
+        # The live path is unlocked only when BOTH
+        # LIVE_PROVIDER_TESTS=true and SMOKE_TEST_PASSED=true
+        # (control_plane.budget.live_path_unlocked, read per call).
+        from control_plane.budget import live_path_unlocked
         return {
             "ok": True,
             "version": app.version,
             "ffmpeg": bool(shutil.which("ffmpeg")),
-            "mock_only": True,
+            "mock_only": not live_path_unlocked(),
         }
 
     # ── Wave 8: k8s-style probes + Prometheus scrape ───────────
@@ -280,21 +285,136 @@ def create_app(*, repo: Optional[Repo] = None,
     async def spec():
         return {"openapi_url": "/openapi.json", "docs_url": "/docs"}
 
+    # ── S1a: tenant authorization helpers ─────────────────────
+    # Every route that reads or writes tenant data resolves the
+    # resource's workspace_id FROM THE DB (never from the caller)
+    # and requires a membership.  Resource-id keyed routes (job,
+    # output, asset, bible) answer 404 for "does not exist" AND
+    # for "exists in a workspace you are not a member of", with the
+    # same body, so ids cannot be probed.  State-changing routes
+    # check X-CSRF-Token before any lookup.  Roles follow
+    # auth/roles.py: viewer reads, editor creates/submits jobs,
+    # admin manages credentials.
+
+    from auth.roles import has_min_role as _has_role
+    from control_plane import artifact_hmac as _artifact_hmac
+    from api import upload_policy as _upload_policy
+
+    _NOT_FOUND = "not found"
+
+    def _check_csrf(request: Request) -> None:
+        from auth.dependencies import require_csrf as _require_csrf
+        _require_csrf(request,
+                      x_csrf_token=request.headers.get("X-CSRF-Token"))
+
+    def _member_or_404(ctx, workspace_id: Optional[str], *,
+                       min_role: str = "viewer") -> dict:
+        if not workspace_id:
+            raise HTTPException(404, _NOT_FOUND)
+        m = repo.get_membership(ctx.user_id, workspace_id)
+        if not m:
+            raise HTTPException(404, _NOT_FOUND)
+        if not _has_role(m["role"], min_role):
+            raise HTTPException(403, f"requires role >= {min_role}")
+        ctx.workspace_id = workspace_id
+        ctx.role = m["role"]
+        return m
+
+    def _job_for(ctx, job_id: str, *, min_role: str = "viewer") -> dict:
+        try:
+            job = repo.get_job(job_id)
+        except NotFound:
+            raise HTTPException(404, _NOT_FOUND)
+        _member_or_404(ctx, job.get("workspace_id"), min_role=min_role)
+        return job
+
+    def _serve_blob(*, storage_key: str, workspace_id: str,
+                    mime_type: str, filename: str) -> FileResponse:
+        """Serve a stored blob only if its HMAC sidecar binds it to
+        ``workspace_id`` (Wave 5 control, A1 F17).  Fails closed:
+        missing blob, missing/forged sidecar, or a key that escapes
+        the storage root all give the same 404.
+        """
+        root = Path(storage_root).resolve()
+        path = (root / storage_key).resolve()
+        if root not in path.parents or not path.is_file():
+            raise HTTPException(404, _NOT_FOUND)
+        if not _artifact_hmac.verify_sidecar(
+            storage_root=str(root), storage_key=storage_key,
+            workspace_id=workspace_id,
+        ):
+            raise HTTPException(404, _NOT_FOUND)
+        return FileResponse(
+            str(path),
+            media_type=_upload_policy.safe_download_type(mime_type),
+            filename=filename,
+            content_disposition_type="attachment",
+            headers=_upload_policy.download_headers(),
+        )
+
+    async def _store_asset(file: UploadFile, *, kind: str, wid: str,
+                           key_prefix: str) -> dict:
+        """Shared upload path for both asset routes: filename
+        check, kind/content-type allow-list (415), magic bytes
+        (415), size cap (413), HMAC sidecar, DB row.
+        """
+        from core.repo import new_id
+        raw_filename = file.filename or "upload"
+        safe_name = Path(raw_filename).name
+        if ".." in raw_filename.replace("\\", "/").split("/"):
+            raise HTTPException(400, "invalid filename: path traversal")
+        if not safe_name or safe_name in (".", ".."):
+            raise HTTPException(400, "invalid filename")
+        asset_id = new_id("ast")
+        storage_key = f"{key_prefix}/{asset_id}_{safe_name}"
+        target = Path(storage_root) / storage_key
+        content_type, size, checksum = await _upload_policy.save_upload(
+            file, kind=kind, target=target,
+        )
+        _artifact_hmac.write_sidecar(
+            storage_root=storage_root,
+            storage_key=storage_key,
+            workspace_id=wid,
+        )
+        return repo.create_asset(
+            workspace_id=wid,
+            kind=kind,
+            filename=safe_name,
+            storage_key=storage_key,
+            mime_type=content_type,
+            size_bytes=size,
+            checksum=checksum,
+        )
+
     # ── Wave 2: workspace-scoped routes ───────────────────────
     # These mirror the legacy /api/v1/companies/{cid}/* routes
     # but bind the workspace_id from the URL path and enforce
     # workspace membership via the auth context.
 
-    def _resolve_ws(request: Request, wid: str):
-        """Resolve a workspace from a path param, with 401/403/404."""
+    def _resolve_ws(request: Request, wid: str, *,
+                    min_role: str = "viewer", csrf: bool = False):
+        """Resolve a workspace from a path param, with 401/403/404.
+
+        S1a: state-changing callers pass ``csrf=True`` (X-CSRF-Token
+        checked right after the session, before any lookup) and a
+        ``min_role`` from the owner > admin > editor > viewer model.
+        A non-member gets 403 whether or not the workspace exists,
+        so the response is not an existence oracle.
+        """
         try:
             ctx = get_current_user(request)
         except HTTPException as e:
             raise HTTPException(e.status_code,
                                 "authentication required for workspace access")
+        if csrf:
+            _check_csrf(request)
         m = repo.get_membership(ctx.user_id, wid)
         if not m:
             raise HTTPException(403, "not a member of this workspace")
+        if not _has_role(m["role"], min_role):
+            raise HTTPException(403, f"requires role >= {min_role}")
+        ctx.workspace_id = wid
+        ctx.role = m["role"]
         try:
             ws = repo.get_workspace(wid)
         except Exception:
@@ -347,7 +467,7 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.post("/api/v1/workspaces/{wid}/jobs")
     async def ws_create_job(request: Request, wid: str, payload: dict):
-        _ctx, _ws = _resolve_ws(request, wid)
+        _ctx, _ws = _resolve_ws(request, wid, min_role="editor", csrf=True)
         required = ("topic", "language", "duration_seconds", "platforms")
         for f in required:
             if f not in payload:
@@ -452,7 +572,7 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.post("/api/v1/workspaces/{wid}/bibles")
     async def ws_create_bible(request: Request, wid: str, payload: dict):
-        _ctx, _ws = _resolve_ws(request, wid)
+        _ctx, _ws = _resolve_ws(request, wid, min_role="editor", csrf=True)
         return repo.create_bible(
             workspace_id=wid,
             payload=payload.get("payload", {}),
@@ -468,44 +588,13 @@ def create_app(*, repo: Optional[Repo] = None,
     async def ws_create_asset(request: Request, wid: str,
                                 kind: str = "misc",
                                 file: UploadFile = File(...)):
-        _ctx, ws = _resolve_ws(request, wid)
-        from core.repo import new_id
-        import hashlib
-        raw_filename = file.filename or "upload"
-        safe_name = Path(raw_filename).name
-        if ".." in raw_filename.replace("\\", "/").split("/"):
-            raise HTTPException(400, "invalid filename: path traversal")
-        if not safe_name or safe_name in (".", ".."):
-            raise HTTPException(400, "invalid filename")
-        asset_dir = (Path(storage_root) / "workspaces" / ws["slug"]
-                     / "assets")
-        asset_dir.mkdir(parents=True, exist_ok=True)
-        asset_id = new_id("ast")
-        storage_key = f"workspaces/{ws['slug']}/assets/{asset_id}_{safe_name}"
-        data = await file.read()
-        if len(data) > 50 * 1024 * 1024:
-            raise HTTPException(413, "asset exceeds 50MB cap (mock mode)")
-        target = Path(storage_root) / storage_key
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        checksum = hashlib.sha256(data).hexdigest()
-        # Wave 5: bind this blob to its workspace via an HMAC
-        # sidecar so a workspace cannot read another workspace's
-        # blobs even with shell access to artifacts/storage/.
-        from control_plane import artifact_hmac
-        artifact_hmac.write_sidecar(
-            storage_root=storage_root,
-            storage_key=storage_key,
-            workspace_id=wid,
-        )
-        return repo.create_asset(
-            workspace_id=wid,
-            kind=kind,
-            filename=safe_name,
-            storage_key=storage_key,
-            mime_type=file.content_type or "application/octet-stream",
-            size_bytes=len(data),
-            checksum=checksum,
+        _ctx, ws = _resolve_ws(request, wid, min_role="editor", csrf=True)
+        # S1a (A1 F16): kind/content-type allow-list + magic bytes
+        # (415), VIDEO_FACTORY_MAX_UPLOAD_MB cap (413), streamed to
+        # disk; Wave 5 HMAC sidecar binds the blob to `wid`.
+        return await _store_asset(
+            file, kind=kind, wid=wid,
+            key_prefix=f"workspaces/{ws['slug']}/assets",
         )
 
     @app.get("/api/v1/workspaces/{wid}/credentials")
@@ -523,7 +612,7 @@ def create_app(*, repo: Optional[Repo] = None,
         request: Request, wid: str, provider: str, payload: dict,
         x_operator: Optional[str] = Header(default=None),
     ):
-        _ctx, _ws = _resolve_ws(request, wid)
+        _ctx, _ws = _resolve_ws(request, wid, min_role="editor", csrf=True)
         plaintext = payload.get("value")
         if not isinstance(plaintext, str) or not plaintext.strip():
             raise HTTPException(400, "value required (non-empty string)")
@@ -562,7 +651,7 @@ def create_app(*, repo: Optional[Repo] = None,
         request: Request, wid: str, provider: str,
         x_operator: Optional[str] = Header(default=None),
     ):
-        _ctx, _ws = _resolve_ws(request, wid)
+        _ctx, _ws = _resolve_ws(request, wid, min_role="admin", csrf=True)
         operator = (x_operator or "operator").strip()[:64]
         try:
             repo.delete_credential(workspace_id=wid, provider=provider)
@@ -1012,10 +1101,14 @@ def create_app(*, repo: Optional[Repo] = None,
         bible_id: str,
         ctx: AuthContext = Depends(get_current_user),
     ):
-        bible = repo.get_bible(bible_id)
-        wid = bible.get("workspace_id")
-        if wid and not repo.get_membership(ctx.user_id, wid):
-            raise HTTPException(403, "not a member of this workspace")
+        # S1a: fail closed (a bible with no workspace_id used to be
+        # served to anyone logged in) and answer 404 for both
+        # "missing" and "not yours".
+        try:
+            bible = repo.get_bible(bible_id)
+        except NotFound:
+            raise HTTPException(404, _NOT_FOUND)
+        _member_or_404(ctx, bible.get("workspace_id"))
         return bible
 
     @app.post("/api/v1/bibles/{bible_id}/approve")
@@ -1025,10 +1118,11 @@ def create_app(*, repo: Optional[Repo] = None,
         ctx: AuthContext = Depends(get_current_user),
     ):
         require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
-        bible = repo.get_bible(bible_id)
-        wid = bible.get("workspace_id")
-        if not wid or not repo.get_membership(ctx.user_id, wid):
-            raise HTTPException(403, "not a member of this workspace")
+        try:
+            bible = repo.get_bible(bible_id)
+        except NotFound:
+            raise HTTPException(404, _NOT_FOUND)
+        _member_or_404(ctx, bible.get("workspace_id"), min_role="editor")
         return repo.approve_bible(bible_id)
 
     # ── assets ─────────────────────────────────────────────────
@@ -1049,39 +1143,15 @@ def create_app(*, repo: Optional[Repo] = None,
             raise HTTPException(403, "not a member of this workspace")
         if not _has_min_role(m["role"], "editor"):
             raise HTTPException(403, "requires editor role")
-        # Safe filename. We check the raw upload filename (not Path().name) so
-        # that uploads named like "../escape.txt" are rejected even though
-        # Path normalization would have masked them downstream.
-        from core.repo import new_id, now_iso
-        import hashlib
-        raw_filename = file.filename or "upload"
-        safe_name = Path(raw_filename).name
-        if ".." in raw_filename.replace("\\", "/").split("/"):
-            raise HTTPException(400, "invalid filename: path traversal")
-        if not safe_name or safe_name in (".", ".."):
-            raise HTTPException(400, "invalid filename")
+        # Same pipeline as the workspace route (S1a): filename check,
+        # type allow-list + magic bytes (415), size cap (413), and
+        # the Wave 5 HMAC sidecar this legacy route never wrote
+        # (without it the fail-closed download would 404).
         company = repo.get_company(company_id)
-        asset_dir = Path(storage_root) / "companies" / company["slug"] / "assets"
-        asset_dir.mkdir(parents=True, exist_ok=True)
-        asset_id = new_id("ast")
-        storage_key = f"companies/{company['slug']}/assets/{asset_id}_{safe_name}"
-        data = await file.read()
-        if len(data) > 50 * 1024 * 1024:
-            raise HTTPException(413, "asset exceeds 50MB cap (mock mode)")
-        target = Path(storage_root) / storage_key
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        checksum = hashlib.sha256(data).hexdigest()
-        asset = repo.create_asset(
-            company_id=company_id,
-            kind=kind,
-            filename=safe_name,
-            storage_key=storage_key,
-            mime_type=file.content_type or "application/octet-stream",
-            size_bytes=len(data),
-            checksum=checksum,
+        return await _store_asset(
+            file, kind=kind, wid=wid,
+            key_prefix=f"companies/{company['slug']}/assets",
         )
-        return asset
 
     @app.get("/api/v1/companies/{company_id}/assets")
     async def list_assets(
@@ -1095,18 +1165,35 @@ def create_app(*, repo: Optional[Repo] = None,
         return repo.list_assets(company_id)
 
     @app.get("/api/v1/assets/{asset_id}/download")
-    async def download_asset(asset_id: str):
-        asset = repo.get_asset(asset_id)
-        path = Path(storage_root) / asset["storage_key"]
-        if not path.exists():
-            raise HTTPException(404, "asset bytes missing")
-        return FileResponse(str(path), media_type=asset["mime_type"],
-                            filename=asset["filename"])
+    async def download_asset(
+        asset_id: str,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # S1a (A1 F1/F3/F17): session + membership of the asset's
+        # workspace (from the DB row) + HMAC sidecar, else 404.
+        try:
+            asset = repo.get_asset(asset_id)
+        except NotFound:
+            raise HTTPException(404, _NOT_FOUND)
+        _member_or_404(ctx, asset.get("workspace_id"))
+        return _serve_blob(
+            storage_key=asset["storage_key"],
+            workspace_id=asset["workspace_id"],
+            mime_type=asset["mime_type"],
+            filename=asset["filename"],
+        )
 
     # ── jobs ───────────────────────────────────────────────────
 
     @app.post("/api/v1/jobs")
-    async def create_job(payload: dict):
+    async def create_job(
+        request: Request,
+        payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # S1a (A1 F10): session + CSRF + editor membership of the
+        # target workspace.  Non-member -> 404 (same as unknown id).
+        _check_csrf(request)
         company_id = payload.get("company_id")
         if not company_id:
             raise HTTPException(400, "company_id required")
@@ -1120,6 +1207,7 @@ def create_app(*, repo: Optional[Repo] = None,
         # route.  Without this lookup the legacy route would
         # silently bypass both gates.
         wid = repo.workspace_id_for_company(company_id) or company_id
+        _member_or_404(ctx, wid, min_role="editor")
         try:
             _ws = repo.get_workspace(wid)
         except Exception:
@@ -1207,24 +1295,47 @@ def create_app(*, repo: Optional[Repo] = None,
         return job
 
     @app.get("/api/v1/jobs")
-    async def list_jobs(company_id: Optional[str] = None, state: Optional[str] = None):
-        return repo.list_jobs(company_id=company_id, state=state)
+    async def list_jobs(
+        company_id: Optional[str] = None,
+        state: Optional[str] = None,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # S1a (A1 F2/F13): never list across tenants.  With
+        # company_id: that workspace only, member or 404.  Without:
+        # the union of the caller's own workspaces.
+        if company_id:
+            wid = repo.workspace_id_for_company(company_id) or company_id
+            _member_or_404(ctx, wid)
+            return repo.list_jobs(workspace_id=wid, state=state)
+        rows: list[dict] = []
+        for m in repo.list_workspaces_for_user(ctx.user_id):
+            rows.extend(repo.list_jobs(workspace_id=m["workspace_id"],
+                                       state=state))
+        rows.sort(key=lambda j: j.get("created_at") or "", reverse=True)
+        return rows
 
     @app.get("/api/v1/jobs/{job_id}")
-    async def get_job(job_id: str):
-        return repo.get_job(job_id)
+    async def get_job(job_id: str,
+                      ctx: AuthContext = Depends(get_current_user)):
+        return _job_for(ctx, job_id)
 
     @app.get("/api/v1/jobs/{job_id}/stages")
-    async def list_stages(job_id: str):
+    async def list_stages(job_id: str,
+                          ctx: AuthContext = Depends(get_current_user)):
+        _job_for(ctx, job_id)
         return repo.list_stages(job_id)
 
     @app.get("/api/v1/jobs/{job_id}/outputs")
-    async def list_outputs(job_id: str):
+    async def list_outputs(job_id: str,
+                           ctx: AuthContext = Depends(get_current_user)):
+        _job_for(ctx, job_id)
         return repo.list_outputs(job_id)
 
     @app.post("/api/v1/jobs/{job_id}/retry")
-    async def retry_job(job_id: str):
-        job = repo.get_job(job_id)
+    async def retry_job(request: Request, job_id: str,
+                        ctx: AuthContext = Depends(get_current_user)):
+        _check_csrf(request)
+        job = _job_for(ctx, job_id, min_role="editor")
         if job["state"] == "done":
             raise HTTPException(400, "job already done")
         # Wave 6b: live-provider gate re-checked at retry time
@@ -1267,21 +1378,34 @@ def create_app(*, repo: Optional[Repo] = None,
         return repo.get_job(job_id)
 
     @app.get("/api/v1/jobs/{job_id}/outputs/{output_id}/download")
-    async def download_output(job_id: str, output_id: str):
-        output = repo.get_output(output_id)
+    async def download_output(job_id: str, output_id: str,
+                              ctx: AuthContext = Depends(get_current_user)):
+        # S1a (A1 F4/F17): membership of the job's workspace, the
+        # output must belong to that job, HMAC sidecar must bind the
+        # blob to that workspace.  Every failure is the same 404.
+        job = _job_for(ctx, job_id)
+        try:
+            output = repo.get_output(output_id)
+        except NotFound:
+            raise HTTPException(404, _NOT_FOUND)
         if output["job_id"] != job_id:
-            raise HTTPException(404, "output does not belong to job")
-        path = Path(storage_root) / output["storage_key"]
-        if not path.exists():
-            raise HTTPException(404, "output bytes missing")
-        return FileResponse(str(path), media_type=output["mime_type"],
-                            filename=output["filename"])
+            raise HTTPException(404, _NOT_FOUND)
+        return _serve_blob(
+            storage_key=output["storage_key"],
+            workspace_id=job["workspace_id"],
+            mime_type=output["mime_type"],
+            filename=output["filename"],
+        )
 
     # ── publishing (mock) ──────────────────────────────────────
 
     @app.post("/api/v1/jobs/{job_id}/publish")
-    async def create_publish_intent(job_id: str, payload: dict):
-        job = repo.get_job(job_id)
+    async def create_publish_intent(
+        request: Request, job_id: str, payload: dict,
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        _check_csrf(request)
+        job = _job_for(ctx, job_id, min_role="editor")
         if job["state"] != "done":
             raise HTTPException(400, "job must be in done state")
         action = payload.get("action")
@@ -1312,13 +1436,20 @@ def create_app(*, repo: Optional[Repo] = None,
         return repo.get_publish_intent(intent["intent_id"])
 
     @app.get("/api/v1/jobs/{job_id}/publish")
-    async def list_publish_intents(job_id: str):
+    async def list_publish_intents(
+        job_id: str, ctx: AuthContext = Depends(get_current_user),
+    ):
+        _job_for(ctx, job_id)
         return repo.list_publish_intents(job_id)
 
     # ── integrations ───────────────────────────────────────────
 
     @app.get("/api/v1/integrations")
-    async def list_integrations():
+    async def list_integrations(
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        # Deployment-wide provider table (no tenant rows), but it
+        # describes the deployment: logged-in users only (S1a).
         return repo.list_integrations()
 
     # ── schemas (Bible JSON Schema) ────────────────────────────

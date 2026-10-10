@@ -167,7 +167,60 @@ def rekey_sidecar(*, storage_root: str, storage_key: str,
     return True
 
 
+def backfill_missing_sidecars(repo, *, storage_root: str,
+                              apply: bool = False) -> dict:
+    """Write sidecars for DB-tracked blobs that have none.
+
+    The "migration helper" referred to in ``verify_sidecar``.
+    Blobs written before every write path tagged them (legacy
+    ``/api/v1/companies/{cid}/assets`` uploads, final MP4s from the
+    assembly stage before SECURITY S1a) are refused by the
+    fail-closed download routes.  This binds each such blob to the
+    workspace the DB row says owns it.
+
+    Only MISSING sidecars are written.  A sidecar that exists but
+    does not verify is reported as ``mismatched`` and left alone:
+    that is the tamper case the check exists for.  ``apply=False``
+    (the default) only counts.
+    """
+    stats = {"ok": 0, "missing": 0, "mismatched": 0,
+             "blob_missing": 0, "unsafe_key": 0, "written": 0}
+    rows = repo._conn().execute(  # noqa: SLF001
+        "SELECT storage_key, workspace_id FROM assets "
+        "UNION ALL "
+        "SELECT o.storage_key, j.workspace_id FROM job_outputs o "
+        "JOIN jobs j ON j.job_id = o.job_id"
+    ).fetchall()
+    root = Path(storage_root)
+    real_root = root.resolve()
+    for storage_key, workspace_id in rows:
+        if not storage_key or not workspace_id:
+            continue
+        if real_root not in (real_root / storage_key).resolve().parents:
+            stats["unsafe_key"] += 1
+            continue
+        if not (root / storage_key).is_file():
+            stats["blob_missing"] += 1
+            continue
+        if not (root / (storage_key + _SIDECAR_SUFFIX)).exists():
+            stats["missing"] += 1
+            if apply:
+                write_sidecar(storage_root=storage_root,
+                              storage_key=storage_key,
+                              workspace_id=workspace_id)
+                stats["written"] += 1
+            continue
+        if verify_sidecar(storage_root=storage_root,
+                          storage_key=storage_key,
+                          workspace_id=workspace_id):
+            stats["ok"] += 1
+        else:
+            stats["mismatched"] += 1
+    return stats
+
+
 __all__ = [
+    "backfill_missing_sidecars",
     "compute_hmac",
     "dev_key_in_use",
     "rekey_sidecar",
