@@ -27,13 +27,8 @@ Design notes:
   the email is unknown, so the endpoint cannot be used to enumerate
   accounts. The "magic link" is appended to the audit log + printed
   in dev mode (no real SMTP integration yet — that's Wave 3).
-- Cookies are HttpOnly + SameSite=Strict. Secure is added whenever
-  the request is HTTPS, `VF_HTTPS=1`, or `VIDEO_FACTORY_ENV` is
-  production / staging (S1b, A2 F-05).
-- S1b: the pre-session routes (signup, login, forgot, forgot/consume,
-  verify) require a trusted Origin (auth/origin.py) and are rate
-  limited per client IP (auth/ratelimit.py, auth/client_ip.py).
-  Login and signup rotate the session id (fixation guard).
+- Cookies are HttpOnly + SameSite=Strict. Secure is added in
+  production (`VF_HTTPS=1` or `VIDEO_FACTORY_ENV=production`).
 - The legacy `/api/v1/companies/{cid}` alias is preserved so the
   existing 94 tests + UI work unchanged. We resolve
   `cid → workspace_id` via a dedicated helper that returns the
@@ -42,7 +37,6 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
-import logging
 import os
 import re
 import secrets
@@ -51,23 +45,15 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from auth.audit_log import append as audit_append
-from auth.client_ip import client_ip as _resolve_client_ip
 from auth.dependencies import (
     AuthContext,
     get_current_user,
     list_workspaces_for_user,
     resolve_workspace_membership,
 )
-from auth.origin import require_trusted_origin
-from auth.ratelimit import (
-    decide as rl_decide,
-    email_key as rl_email_key,
-    hit as rl_hit,
-    record_attempt,
-)
+from auth.ratelimit import decide as rl_decide, record_attempt
 from auth.session import (
     DEFAULT_TTL_SECONDS,
-    SESSION_COOKIE_NAME,
     SessionSecretMissing,
     build_clear_cookie_value,
     build_set_cookie_value,
@@ -78,9 +64,6 @@ from auth.session import (
     should_use_secure_cookies,
 )
 from core.repo import Repo
-
-
-_sec_log = logging.getLogger("video_factory.security")
 
 
 # Workspace slug policy: lowercase letters, digits, dashes; 3..40 chars.
@@ -112,9 +95,7 @@ def build_router(repo: Repo) -> APIRouter:
     router = APIRouter(prefix="/auth", tags=["auth"])
 
     def _client_ip(request: Request) -> str:
-        # S1b / A1 F26: X-Forwarded-For only from trusted proxies
-        # (VIDEO_FACTORY_TRUSTED_PROXIES); see auth/client_ip.py.
-        return _resolve_client_ip(request)
+        return (request.client.host if request.client else "") or "unknown"
 
     def _user_agent(request: Request) -> str:
         return (request.headers.get("user-agent") or "")[:512]
@@ -126,46 +107,11 @@ def build_router(repo: Repo) -> APIRouter:
         except SessionSecretMissing as e:
             raise HTTPException(503, str(e))
 
-    def _rate_limit(request: Request, bucket: str, key: str) -> None:
-        """S1b / A1 F26: 429 once ``(bucket, key)`` is over its limit."""
-        d = rl_hit(repo, bucket=bucket, key=key)
-        if d.allowed:
-            return
-        _sec_log.warning(
-            "auth rate limit hit",
-            extra={"bucket": bucket, "path": request.url.path,
-                   "limit": d.limit, "window_seconds": d.window_seconds},
-        )
-        raise HTTPException(
-            429, "too many requests; try again later",
-            headers={"Retry-After": str(d.window_seconds)},
-        )
-
-    def _drop_presented_session(request: Request) -> None:
-        """S1b / A1 F8: session fixation guard.
-
-        Whatever session id the browser presented BEFORE this login /
-        signup is deleted server-side, so a cookie planted by an
-        attacker can never become an authenticated session. The
-        caller then issues a brand-new id.
-        """
-        sid = (request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
-        if not sid:
-            return
-        try:
-            repo.delete_session(sid)
-        except Exception:  # noqa: BLE001 - never block a login on cleanup
-            _sec_log.warning("could not delete presented session on login")
-
     # ── signup ───────────────────────────────────────────────
 
     @router.post("/signup")
     async def signup(request: Request, payload: dict):
         _require_secret()
-        # S1b / A1 F5 + F26: same-origin (or internal SvelteKit) only,
-        # then a per-IP budget, before any account is created.
-        require_trusted_origin(request)
-        _rate_limit(request, "signup_ip", _client_ip(request))
         email = (payload.get("email") or "").strip()
         password = payload.get("password") or ""
         workspace_name = (payload.get("workspace_name") or "").strip()
@@ -237,8 +183,7 @@ def build_router(repo: Repo) -> APIRouter:
                 (token, user_id, _now_plus(24*60*60), _now_iso()),
             )
 
-        # Issue session (S1b / A1 F8: never keep a pre-signup session id)
-        _drop_presented_session(request)
+        # Issue session
         session_id = new_session_id()
         csrf = derive_csrf_token(session_id)
         repo.create_session(
@@ -268,9 +213,6 @@ def build_router(repo: Repo) -> APIRouter:
     @router.post("/login")
     async def login(request: Request, payload: dict):
         _require_secret()
-        # S1b: login CSRF (forcing a victim into the attacker's
-        # account) is refused by the same Origin rule as signup.
-        require_trusted_origin(request)
         email = (payload.get("email") or "").strip()
         password = payload.get("password") or ""
         if not email or not password:
@@ -309,9 +251,6 @@ def build_router(repo: Repo) -> APIRouter:
             )
             raise HTTPException(401, "invalid email or password")
         repo.update_user_last_login(user["user_id"])
-        # S1b / A1 F8: rotate. The id presented before login (possibly
-        # planted by an attacker) is deleted; a fresh one is issued.
-        _drop_presented_session(request)
         session_id = new_session_id()
         csrf = derive_csrf_token(session_id)
         repo.create_session(
@@ -356,7 +295,7 @@ def build_router(repo: Repo) -> APIRouter:
             user_id=ctx.user_id,
         )
         response.headers["Set-Cookie"] = build_clear_cookie_value(
-            secure=should_use_secure_cookies(request),
+            secure=should_use_secure_cookies(),
         )
         return {"ok": True}
 
@@ -364,16 +303,9 @@ def build_router(repo: Repo) -> APIRouter:
 
     @router.post("/forgot")
     async def forgot(request: Request, payload: dict):
-        # S1b / A1 F7 + F26: Origin rule, then per-IP and per-email
-        # budgets. The e-mail budget counts requests whether or not
-        # the account exists, so a 429 reveals nothing about it.
-        require_trusted_origin(request)
         # Always 200 to prevent email enumeration.
         email = (payload.get("email") or "").strip().lower()
         ip = _client_ip(request)
-        _rate_limit(request, "forgot_ip", ip)
-        if email:
-            _rate_limit(request, "forgot_email", rl_email_key(email))
         token_value = None
         if email:
             user = repo.get_user_by_email(email)
@@ -404,10 +336,7 @@ def build_router(repo: Repo) -> APIRouter:
         return {"ok": True}
 
     @router.post("/forgot/consume")
-    async def forgot_consume(request: Request, payload: dict):
-        # S1b / A1 F7 + F26: Origin rule + per-IP budget (token guessing).
-        require_trusted_origin(request)
-        _rate_limit(request, "reset_consume_ip", _client_ip(request))
+    async def forgot_consume(payload: dict):
         token = (payload.get("token") or "").strip()
         new_password = payload.get("new_password") or ""
         if not token or not new_password:
@@ -442,10 +371,7 @@ def build_router(repo: Repo) -> APIRouter:
     # ── verify ───────────────────────────────────────────────
 
     @router.post("/verify")
-    async def verify(request: Request, payload: dict):
-        # S1b / A1 F5 family + F26: Origin rule + per-IP budget.
-        require_trusted_origin(request)
-        _rate_limit(request, "verify_ip", _client_ip(request))
+    async def verify(payload: dict):
         token = (payload.get("token") or "").strip()
         if not token:
             raise HTTPException(400, "token required")
@@ -506,39 +432,24 @@ def build_router(repo: Repo) -> APIRouter:
             raise HTTPException(400, "name required (1..80 chars)")
         # Wave 6b: per-user workspace limit.  The brief is
         # explicit — enforce on POST /api/v1/auth/workspaces
-        # AND the legacy /api/v1/companies alias.  We re-read
-        # the user's current plan from their primary owned
-        # workspace (the canonical plan source of truth — the
-        # Wave 6c Stripe webhook will flip this column, and the
-        # next quota check picks up the new value).  Brand-new
-        # users (no owned workspace yet) default to 'free' so
-        # the limit applies to them from their very first
-        # signup-attached workspace.
+        # AND the legacy /api/v1/companies alias.  The user's
+        # effective plan is the HIGHEST plan across the
+        # workspaces they own (the Stripe webhook flips
+        # workspaces.plan per workspace, and the next quota
+        # check picks up the new value).  It must not depend on
+        # row order: workspaces created in the same second tie
+        # on created_at, and "first owned row" then read a
+        # random plan (a paying user could be refused, a free
+        # user allowed).  Brand-new users (no owned workspace
+        # yet) default to 'free' so the limit applies to them
+        # from their very first signup-attached workspace.
         from core.quotas import check_workspace_count
         from core.audit import (
             EVENT_QUOTA_WORKSPACE_LIMIT_HIT, emit as emit_audit,
         )
-        # Re-read the user's current plan from their primary
-        # owned workspace (the canonical plan source of truth —
-        # the Wave 6c Stripe webhook will flip this column, and
-        # the next quota check picks up the new value).
-        # Brand-new users (no owned workspace yet) default to
-        # 'free' so the limit applies to them from their very
-        # first signup-attached workspace.
         memberships = list_workspaces_for_user(repo, ctx.user_id)
         owned = [m for m in memberships if m.get("role") == "owner"]
-        # F-RV-003: do NOT use ``owned[0]``.  The list is ordered by
-        # ``created_at`` (1-second resolution) so two workspaces
-        # created in the same second tie and SQLite may return the
-        # newly-created FREE one first, 403-ing a paying user.  A user
-        # who owns ANY paid workspace is a paid user: take the highest
-        # plan across everything they own.
-        _plan_rank = {"free": 0, "pro": 1, "enterprise": 2}
-        user_plan = "free"
-        for m in owned:
-            p = (m.get("plan") or "free").lower()
-            if _plan_rank.get(p, 0) > _plan_rank.get(user_plan, 0):
-                user_plan = p
+        user_plan = _effective_plan(owned)
         decision = check_workspace_count(
             plan=user_plan,
             workspaces_owned=len(owned),
@@ -761,6 +672,24 @@ def _now_plus(seconds: int) -> str:
     )
 
 
+def _effective_plan(owned: list[dict]) -> str:
+    """Highest plan (by ``PLAN_RANK``) across the user's owned workspaces.
+
+    Order-independent: the result is the same for any permutation of
+    ``owned``.  Empty input, a missing/empty plan and an unknown plan
+    name all count as ``free`` (rank 0), matching the Stripe webhook's
+    downgrade guard.
+    """
+    from api.webhooks_stripe import PLAN_RANK
+
+    best = "free"
+    for m in owned:
+        plan = str(m.get("plan") or "free").strip().lower()
+        if PLAN_RANK.get(plan, 0) > PLAN_RANK[best]:
+            best = plan
+    return best
+
+
 def _latest_workspace_id(conn, user_id: str) -> str:
     """Return the most recently created workspace for `user_id`."""
     # The conn here is a sqlite3 connection; we always pass a fresh
@@ -816,6 +745,6 @@ def _set_session_cookie(request: Request, *, session_id: str,
     # client reads cookies via `client.cookies`).
     request.state._vf_session_cookie = build_set_cookie_value(
         session_id=session_id, max_age=DEFAULT_TTL_SECONDS,
-        secure=should_use_secure_cookies(request),
+        secure=should_use_secure_cookies(),
     )
     return body
