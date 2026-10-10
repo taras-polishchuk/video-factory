@@ -13,6 +13,7 @@ import json
 import os
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -884,3 +885,163 @@ def test_oidc_signature_failure_triggers_jwks_refresh(auth_env, monkeypatch):
     r = client.get(
         f"/auth/oauth/google/callback?code=valid&state={state_blob}")
     assert r.status_code == 400, r.text
+
+
+# ────────────────────────────────────────────────────────────────────
+# QA-S1b-06: GitHub /user/emails non-list response handling
+# ────────────────────────────────────────────────────────────────────
+
+def _github_state_blob_from_start(client):
+    """Drive /auth/oauth/github/start to obtain a state blob + nonce."""
+    r = client.get("/auth/oauth/github/start", follow_redirects=False)
+    assert r.status_code == 302, r.text
+    qs = _parse_qs(r.headers["Location"])
+    state_blob = qs["state"][0]
+    nonce = state_blob.split(".", 1)[1]
+    return state_blob, nonce
+
+
+def _patch_github_user_emails(emails_payload, *, user_payload=None):
+    """Patch httpx.get so _github_claims_from_access_token sees
+    the given /user and /user/emails payloads. Returns the patcher
+    so the test can use it as a context manager.
+    """
+    fake_user = user_payload or {
+        "id": 4242, "login": "taras",
+        "name": "Taras", "avatar_url": "https://example.com/p.png",
+    }
+
+    def _fake_get(url, headers=None, timeout=None, **kw):
+        m = MagicMock()
+        if "user/emails" in url:
+            m.json.return_value = emails_payload
+        else:
+            m.json.return_value = fake_user
+        return m
+
+    import httpx
+    return patch.object(httpx, "get", side_effect=_fake_get)
+
+
+def test_github_user_emails_error_object_returns_400(auth_env):
+    """GitHub /user/emails can return a dict error body (e.g. when
+    the token lacks user:email, or hits a rate-limit). The
+    _github_claims_from_access_token helper used to iterate the
+    payload as a list and 500 with
+    ``AttributeError: 'str' object has no attribute 'get'`` when
+    iterating dict keys. Must now return a clean 400.
+    """
+    client, _ = auth_env
+    state_blob, _ = _github_state_blob_from_start(client)
+    import api.oidc as _oidc
+    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+        "access_token": "stub-access-token",
+    }
+    with _patch_github_user_emails(
+        {"message": "Bad credentials", "documentation_url": "https://x"},
+    ):
+        r = client.get(
+            f"/auth/oauth/github/callback?code=valid&state={state_blob}")
+    assert r.status_code == 400, (
+        f"expected 400 on /user/emails dict error body, got "
+        f"{r.status_code}: {r.text}"
+    )
+    assert "no verified primary email" in r.text.lower(), r.text
+
+
+def test_github_user_emails_string_returns_400(auth_env):
+    """GitHub /user/emails can return a plain-text / string payload
+    on edge cases (proxies return text). Same outcome as the dict
+    error body: clean 400, not a 500 AttributeError.
+    """
+    client, _ = auth_env
+    state_blob, _ = _github_state_blob_from_start(client)
+    import api.oidc as _oidc
+    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+        "access_token": "stub-access-token",
+    }
+    with _patch_github_user_emails("rate limit exceeded"):
+        r = client.get(
+            f"/auth/oauth/github/callback?code=valid&state={state_blob}")
+    assert r.status_code == 400, (
+        f"expected 400 on /user/emails string body, got "
+        f"{r.status_code}: {r.text}"
+    )
+    assert "no verified primary email" in r.text.lower(), r.text
+
+
+def test_github_user_emails_empty_list_returns_400(auth_env):
+    """An empty list from /user/emails means "no verified primary
+    email" — a legitimate, expected 400 (no user-friendly fallback
+    exists). The handler must NOT 500 in this case either.
+    """
+    client, _ = auth_env
+    state_blob, _ = _github_state_blob_from_start(client)
+    import api.oidc as _oidc
+    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+        "access_token": "stub-access-token",
+    }
+    with _patch_github_user_emails([]):
+        r = client.get(
+            f"/auth/oauth/github/callback?code=valid&state={state_blob}")
+    assert r.status_code == 400, (
+        f"expected 400 on empty /user/emails list, got "
+        f"{r.status_code}: {r.text}"
+    )
+    assert "no verified primary email" in r.text.lower(), r.text
+
+
+def test_github_user_emails_happy_path_still_works(auth_env):
+    """The happy path must still extract the primary verified
+    email and create the user (acceptance regression guard for
+    the new shape-validation guard).
+    """
+    client, _ = auth_env
+    state_blob, _ = _github_state_blob_from_start(client)
+    import api.oidc as _oidc
+    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+        "access_token": "stub-access-token",
+    }
+    emails_payload = [
+        {"email": "secondary@example.com",
+         "primary": False, "verified": True},
+        {"email": "primary@example.com",
+         "primary": True, "verified": True},
+        {"email": "unverified@example.com",
+         "primary": False, "verified": False},
+    ]
+    with _patch_github_user_emails(emails_payload):
+        r = client.get(
+            f"/auth/oauth/github/callback?code=valid&state={state_blob}")
+    assert r.status_code == 200, (
+        f"happy path should succeed; got {r.status_code}: {r.text}"
+    )
+    body = r.json()
+    assert body["provider"] == "github"
+    assert body["email"] == "primary@example.com"
+    assert body["new_user_created"] is True
+
+
+def test_github_user_emails_list_with_non_dict_returns_400(auth_env):
+    """A list that contains non-dict elements (e.g. one item is a
+    string) used to crash the iteration with AttributeError. The
+    new guard catches it and refuses sign-in cleanly.
+    """
+    client, _ = auth_env
+    state_blob, _ = _github_state_blob_from_start(client)
+    import api.oidc as _oidc
+    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+        "access_token": "stub-access-token",
+    }
+    with _patch_github_user_emails([
+        {"email": "ok@example.com",
+         "primary": True, "verified": True},
+        "oops",
+    ]):
+        r = client.get(
+            f"/auth/oauth/github/callback?code=valid&state={state_blob}")
+    assert r.status_code == 400, (
+        f"expected 400 on /user/emails list with non-dict element, "
+        f"got {r.status_code}: {r.text}"
+    )
+    assert "no verified primary email" in r.text.lower(), r.text

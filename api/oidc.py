@@ -479,6 +479,26 @@ def _github_claims_from_access_token(*, provider: str, token: dict) -> dict:
                            headers=headers, timeout=8.0).json()
     except Exception as e:
         raise OIDCCallbackError(f"github /user fetch failed: {e}") from e
+    # GitHub /user/emails normally returns a list of {email, primary,
+    # verified, ...} dicts. When the token lacks user:email (or GitHub
+    # serves a rate-limit / error page), the body can be a non-list
+    # payload (dict, string, None). Iterating that with ``.get()`` then
+    # raises AttributeError and the handler 500s on a sign-in the user
+    # could not possibly fix. Validate the shape explicitly: a wrong
+    # shape is the same user-facing outcome as "no verified primary
+    # email" — refuse the sign-in cleanly with a 400.
+    if not isinstance(emails, list) or not all(
+        isinstance(e, dict) for e in emails
+    ):
+        import logging
+        logging.getLogger("video_factory.api.oidc").warning(
+            "github /user/emails returned unexpected shape type=%s; "
+            "refusing sign-in",
+            type(emails).__name__,
+        )
+        raise OIDCCallbackError(
+            "github: no verified primary email — sign-in refused"
+        )
     primary = next(
         (e for e in emails if e.get("primary") and e.get("verified")),
         None,
