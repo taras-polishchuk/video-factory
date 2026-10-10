@@ -516,9 +516,10 @@ def test_app_fails_loud_without_stripe_webhook_secret(tmp_path, monkeypatch):
     """When STRIPE_WEBHOOK_SECRET is unset, create_app() still
     succeeds (the app can serve other routes) BUT the
     ``/_stripe_init_error`` debug endpoint surfaces the missing
-    config and the ``/api/v1/webhooks/stripe`` route is NOT
-    registered (Stripe's traffic gets a 404 from us rather than
-    a misleading 503).
+    config and ``/api/v1/webhooks/stripe`` answers 503 (BILLING B1:
+    it used to be unregistered, i.e. 404, which looks like a wrong
+    URL to the operator reading Stripe's delivery log; 503 says
+    "not configured" and Stripe retries until it is).
     """
     db = tmp_path / "vf_no_secret.db"
     storage = tmp_path / "storage"
@@ -543,6 +544,6 @@ def test_app_fails_loud_without_stripe_webhook_secret(tmp_path, monkeypatch):
     assert r.status_code == 200
     assert r.json()["ok"] is False
     assert "STRIPE_WEBHOOK_SECRET" in r.json()["error"]
-    # Webhook route is NOT registered.
+    # Webhook route refuses with 503 (B1), never 404, never 2xx.
     r2 = client.post("/api/v1/webhooks/stripe", content=b"{}")
-    assert r2.status_code == 404
+    assert r2.status_code == 503
