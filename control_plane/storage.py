@@ -74,7 +74,15 @@ class Storage:
 class LocalDiskStorage(Storage):
     """Filesystem-backed storage. Default for offline demo + tests."""
 
-    def __init__(self, root: str = "./artifacts") -> None:
+    def __init__(self, root: Optional[str] = None) -> None:
+        # No explicit root: honour VIDEO_FACTORY_STORAGE (the configured
+        # storage root in containers) before the ./artifacts dev default.
+        # Callers such as MockRenderer() build a default storage before
+        # the runner swaps in its own; with a read-only image filesystem
+        # (OPS S2, docker-compose.production.yml) a hard-coded
+        # ./artifacts made every job fail with EROFS on /app/artifacts.
+        if root is None:
+            root = os.environ.get("VIDEO_FACTORY_STORAGE", "").strip() or "./artifacts"
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 

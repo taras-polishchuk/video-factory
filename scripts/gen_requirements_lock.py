@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Generate requirements.lock: the pinned runtime closure of pyproject.toml.
+
+The Docker image installs ONLY from this file
+(`pip install --no-deps --require-hashes -r requirements.lock` followed
+by `pip check`), so the image runs the exact package set the test suite
+runs against.
+
+How it works:
+  1. Read `[project].dependencies` from pyproject.toml.
+  2. Walk the dependency closure in the CURRENT interpreter's installed
+     distributions (run it with the project venv, e.g.
+     `.venv/bin/python scripts/gen_requirements_lock.py`). Environment
+     markers are evaluated for this interpreter (Linux, CPython 3.12,
+     same as the image).
+  3. Pin every distribution to the installed version.
+  4. Unless --no-hashes: fetch the sha256 of every file PyPI publishes
+     for that exact version (https://pypi.org/pypi/<name>/<version>/json)
+     so pip can run in --require-hashes mode.
+
+Usage:
+  .venv/bin/python scripts/gen_requirements_lock.py            # rewrite requirements.lock
+  .venv/bin/python scripts/gen_requirements_lock.py --check    # exit 1 if the lock is stale
+  .venv/bin/python scripts/gen_requirements_lock.py --no-hashes --stdout
+
+--check compares names + versions only (no network).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import tomllib
+import urllib.request
+from importlib import metadata
+from pathlib import Path
+
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
+ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = ROOT / "pyproject.toml"
+LOCK = ROOT / "requirements.lock"
+
+PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\;]+)")
+
+
+def declared_requirements(pyproject: Path = PYPROJECT) -> list[Requirement]:
+    data = tomllib.loads(pyproject.read_text())
+    return [Requirement(s) for s in data["project"]["dependencies"]]
+
+
+def _marker_ok(req: Requirement, extra: str) -> bool:
+    if req.marker is None:
+        return True
+    env: dict[str, str] = {k: str(v) for k, v in default_environment().items()}
+    env["extra"] = extra
+    return req.marker.evaluate(env)
+
+
+def resolve_closure(roots: list[Requirement]) -> dict[str, tuple[str, str]]:
+    """Return {canonical_name: (project_name, installed_version)}.
+
+    Visits each (distribution, extra) pair once. extra "" = the base
+    dependency set; a named extra adds the deps gated on it.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    visited: set[tuple[str, str]] = set()
+    queue: list[Requirement] = list(roots)
+    while queue:
+        req = queue.pop()
+        if not _marker_ok(req, ""):
+            continue
+        key = canonicalize_name(req.name)
+        try:
+            dist = metadata.distribution(req.name)
+        except metadata.PackageNotFoundError:
+            raise SystemExit(
+                f"ERROR: {req.name} is required but not installed in "
+                f"{sys.executable}; install the project deps first"
+            )
+        version = dist.version
+        if req.specifier and not req.specifier.contains(version, prereleases=True):
+            raise SystemExit(
+                f"ERROR: installed {req.name}=={version} does not satisfy {req}"
+            )
+        out[key] = (str(dist.metadata["Name"]), version)
+        children = [Requirement(raw) for raw in (dist.requires or [])]
+        for extra in ["", *sorted(req.extras)]:
+            if (key, extra) in visited:
+                continue
+            visited.add((key, extra))
+            for child in children:
+                gated = child.marker is not None and "extra" in str(child.marker)
+                if extra == "" and gated:
+                    continue
+                if extra and not gated:
+                    continue
+                if _marker_ok(child, extra):
+                    # Strip the marker: it was evaluated in the
+                    # parent's context (it may mention `extra`).
+                    child = Requirement(str(child).split(";")[0])
+                    queue.append(child)
+    return out
+
+
+def fetch_hashes(name: str, version: str) -> list[str]:
+    url = f"https://pypi.org/pypi/{name}/{version}/json"
+    req = urllib.request.Request(url, headers={"User-Agent": "video-factory-lockgen/1"})
+    with urllib.request.urlopen(req, timeout=30) as r:  # noqa: S310 (fixed https host)
+        data = json.load(r)
+    hashes = sorted({u["digests"]["sha256"] for u in data.get("urls", [])})
+    if not hashes:
+        raise SystemExit(f"ERROR: PyPI lists no files for {name}=={version}")
+    return hashes
+
+
+def render(closure: dict[str, tuple[str, str]], *, hashes: bool) -> str:
+    py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    lines = [
+        "# requirements.lock: pinned runtime closure of pyproject.toml [project].dependencies.",
+        "# GENERATED by scripts/gen_requirements_lock.py. Do not edit by hand.",
+        f"# Resolved against the project venv (CPython {py}, linux). Regenerate after",
+        "# changing pyproject.toml dependencies:",
+        "#   .venv/bin/python scripts/gen_requirements_lock.py",
+        "# Used by Dockerfile: pip install --no-deps --require-hashes -r requirements.lock && pip check",
+    ]
+    for key in sorted(closure):
+        name, version = closure[key]
+        if hashes:
+            hs = fetch_hashes(name, version)
+            lines.append(f"{name}=={version} \\")
+            for i, h in enumerate(hs):
+                tail = " \\" if i < len(hs) - 1 else ""
+                lines.append(f"    --hash=sha256:{h}{tail}")
+        else:
+            lines.append(f"{name}=={version}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_lock(text: str) -> dict[str, str]:
+    """Return {canonical_name: version} for every `name==version` line."""
+    pins: dict[str, str] = {}
+    for line in text.splitlines():
+        m = PIN_RE.match(line.strip())
+        if m:
+            pins[canonicalize_name(m.group(1))] = m.group(2)
+    return pins
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Generate or check requirements.lock")
+    ap.add_argument("--check", action="store_true", help="fail if requirements.lock is stale")
+    ap.add_argument("--no-hashes", action="store_true", help="skip PyPI hash lookup")
+    ap.add_argument("--stdout", action="store_true", help="print instead of writing the file")
+    args = ap.parse_args(argv)
+
+    closure = resolve_closure(declared_requirements())
+    if args.check:
+        want = {k: v for k, (_, v) in closure.items()}
+        have = parse_lock(LOCK.read_text()) if LOCK.exists() else {}
+        if want != have:
+            missing = sorted(set(want) - set(have))
+            extra = sorted(set(have) - set(want))
+            changed = sorted(k for k in set(want) & set(have) if want[k] != have[k])
+            print("requirements.lock is stale:", file=sys.stderr)
+            for k in missing:
+                print(f"  missing  {k}=={want[k]}", file=sys.stderr)
+            for k in extra:
+                print(f"  extra    {k}=={have[k]}", file=sys.stderr)
+            for k in changed:
+                print(f"  version  {k}: lock {have[k]} != venv {want[k]}", file=sys.stderr)
+            return 1
+        print(f"requirements.lock OK ({len(want)} pins)")
+        return 0
+
+    text = render(closure, hashes=not args.no_hashes)
+    if args.stdout:
+        sys.stdout.write(text)
+    else:
+        tmp = LOCK.with_suffix(".lock.tmp")
+        tmp.write_text(text)
+        tmp.replace(LOCK)
+        print(f"wrote {LOCK.relative_to(ROOT)} ({len(closure)} pins)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
