@@ -140,7 +140,7 @@ fi
 # ─── Smoke check (only meaningful after a real apply) ──────────
 if [ "${APPLY:-0}" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
   echo "smoke: GET https://$DOMAIN/health"
-  for i in $(seq 1 30); do
+  for _ in $(seq 1 30); do
     sleep 1
     if curl -fsS -m 3 "https://$DOMAIN/health" >/dev/null 2>&1; then
       echo "smoke: 200 OK"
