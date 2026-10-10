@@ -418,23 +418,33 @@ def auth_env_inline():
 
 
 def test_empty_state_shows_for_first_workspace():
-    """The EmptyState component exists, the layout renders it with
-    the brief's copy ("Welcome — paste your first provider key to
-    get started"), and the CTA points to /credentials."""
+    """The EmptyState component exists, the OVERVIEW page renders it
+    with the brief's copy ("Welcome — paste your first provider key to
+    get started"), and the CTA points to /credentials.
+
+    UI U1 (A-1/A-4) moved the onboarding out of +layout.svelte: the
+    layout used to swap every route for it until a credential existed,
+    which made /credentials itself unreachable. The copy + CTA are
+    unchanged; only the location moved, and the layout must no longer
+    contain it (also pinned in tests/test_u1_ui.py)."""
     comp = (WEB_ROOT / "src/lib/components/EmptyState.svelte").read_text()
     # The component takes the title as a prop. The brief's copy
-    # is supplied by the layout (not duplicated in the component).
+    # is supplied by the page (not duplicated in the component).
     assert "title" in comp
     assert "ctaHref" in comp
-    layout = (WEB_ROOT / "src/routes/+layout.svelte").read_text()
+    overview = (WEB_ROOT / "src/routes/+page.svelte").read_text()
     # Brief copy: "Welcome — paste your first provider key to get started"
-    assert "Welcome" in layout
-    assert "paste your first provider key to get started" in layout
+    assert "Welcome" in overview
+    assert "paste your first provider key to get started" in overview
     # CTA points to /credentials.
-    assert 'ctaHref="/credentials"' in layout
-    # The component is imported + rendered.
-    assert "EmptyState" in layout
-    assert "firstCredentialExists" in layout
+    assert 'ctaHref="/credentials"' in overview
+    # The component is imported + rendered, gated on the loader flag.
+    assert "EmptyState" in overview
+    assert "firstCredentialExists" in overview
+    # The layout must never hijack other routes again.
+    layout = (WEB_ROOT / "src/routes/+layout.svelte").read_text()
+    assert "EmptyState" not in layout
+    assert "firstCredentialExists" not in layout
 
 
 def test_empty_state_hidden_after_first_credential(auth_env):
