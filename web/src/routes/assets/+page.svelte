@@ -1,26 +1,45 @@
 <script>
-  import { api } from '$lib/api-client.js';
+  import { api, describeError } from '$lib/api-client.js';
+  import StatusNote from '$lib/components/StatusNote.svelte';
+  import { untrack } from 'svelte';
 
   let { data } = $props();
 
   // Active workspace comes from the layout's server-loaded data.
   let company = $derived(data.activeWorkspace || null);
   let assets = $state([]);
+  let phase = $state('loading'); // loading | ready | error
+  let loadError = $state('');
   let uploading = $state(false);
   let err = $state('');
   let dragOver = $state(false);
 
+  async function loadAssets() {
+    if (!company) return;
+    phase = 'loading';
+    loadError = '';
+    try {
+      assets = await api.listAssets(company.workspace_id);
+      phase = 'ready';
+    } catch (e) {
+      loadError = describeError(e);
+      phase = 'error';
+    }
+  }
+
   $effect(() => {
-    if (company) api.listAssets(company.workspace_id).then(a => assets = a);
+    if (company) untrack(loadAssets);
   });
 
   async function doUpload(file) {
     if (!file || !company) return;
     uploading = true; err = '';
     try {
-      const a = await api.uploadAsset(company.workspace_id, file, 'misc');
+      // (workspace, file, kind). The old call passed the kind where the
+      // file belongs, so every upload was rejected.
+      const a = await api.uploadAsset(company.workspace_id, file, 'asset');
       assets = [a, ...assets];
-    } catch (e) { err = e.message; }
+    } catch (e) { err = describeError(e); }
     finally { uploading = false; }
   }
 
@@ -55,8 +74,12 @@
     ondragleave={() => dragOver = false}
     ondrop={handleDrop}
   >
+    <!-- Visually hidden, not display:none, so keyboard users can tab to
+         it and the label above is its accessible name. -->
     <input
       type="file"
+      name="file"
+      class="sr-only"
       disabled={uploading || !company}
       onchange={(e) => {
         const inputEl = e.currentTarget;
@@ -64,7 +87,6 @@
         if (f) doUpload(f);
         inputEl.value = '';
       }}
-      hidden
     />
     <div class="dz-icon">↑</div>
     <div class="dz-text">
@@ -72,7 +94,7 @@
     </div>
     <div class="dz-meta">PNG, JPG, MP4, WAV, TTF · up to 50 MB</div>
   </label>
-  {#if err}<div class="alert error">{err}</div>{/if}
+  {#if err}<div class="alert error" role="alert">{err}</div>{/if}
 </section>
 
 <section class="vf-card">
@@ -83,7 +105,13 @@
     </div>
   </header>
 
-  {#if assets.length === 0}
+  {#if !company}
+    <StatusNote kind="empty" title="No workspace yet" message="Assets belong to a workspace. Join or create one first." />
+  {:else if phase === 'loading'}
+    <StatusNote kind="loading" message="Loading assets…" />
+  {:else if phase === 'error'}
+    <StatusNote kind="error" title="Couldn’t load assets" message={loadError} onretry={loadAssets} />
+  {:else if assets.length === 0}
     <div class="empty">
       <p>No assets yet.</p>
       <p class="muted">Upload a logo or an example video to get going.</p>
@@ -134,6 +162,7 @@
     margin-bottom: var(--vf-sp-5);
   }
 
+  .dropzone:focus-within { outline: 2px solid var(--vf-butter-green); outline-offset: 2px; }
   .dropzone {
     display: flex;
     flex-direction: column;

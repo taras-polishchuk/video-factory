@@ -1,12 +1,17 @@
 <script>
-  import { api } from '$lib/api-client.js';
+  import { api, describeError } from '$lib/api-client.js';
+  import StatusNote from '$lib/components/StatusNote.svelte';
   import { goto } from '$app/navigation';
+  import { untrack } from 'svelte';
 
   let { data } = $props();
 
   // Active workspace comes from the layout's server-loaded data.
   let company = $derived(data.activeWorkspace || null);
-  let bibles = $state([]);
+  let bibles = $state([]);       // approved only (selectable)
+  let draftCount = $state(0);    // unapproved ones, for the empty hint
+  let biblesPhase = $state('loading'); // loading | ready | error
+  let biblesError = $state('');
   let form = $state({
     topic: '', language: 'en-US', duration_seconds: 30,
     platforms: 'tiktok,reels', aspect_ratio: '9:16', count: 1,
@@ -16,11 +21,26 @@
   let submitting = $state(false);
   let submittingState = $state('idle'); // idle | submitting | queued | done
 
+  async function loadBibles() {
+    if (!company) return;
+    biblesPhase = 'loading';
+    biblesError = '';
+    try {
+      const all = await api.listBibles(company.workspace_id);
+      bibles = all.filter(b => b.status === 'approved');
+      draftCount = all.length - bibles.length;
+      if (bibles[0] && !form.bible_id) form.bible_id = bibles[0].bible_id;
+      biblesPhase = 'ready';
+    } catch (e) {
+      biblesError = describeError(e);
+      biblesPhase = 'error';
+    }
+  }
+
+  // Re-run only when the active workspace changes, not on every
+  // keystroke / selection inside the form.
   $effect(() => {
-    if (company) api.listBibles(company.workspace_id).then(bs => {
-      bibles = bs.filter(b => b.status === 'approved');
-      if (bibles[0]) form.bible_id = bibles[0].bible_id;
-    });
+    if (company) untrack(loadBibles);
   });
 
   async function submit() {
@@ -45,7 +65,7 @@
       });
       submittingState = 'queued';
       setTimeout(() => goto('/jobs/' + j.job_id), 350);
-    } catch (e) { err = e.message; submittingState = 'idle'; }
+    } catch (e) { err = describeError(e); submittingState = 'idle'; }
     finally { submitting = false; }
   }
 </script>
@@ -68,16 +88,16 @@
   </div>
 {:else}
   <form class="vf-card vf-card-glow" onsubmit={(e) => { e.preventDefault(); submit(); }}>
-    {#if err}<div class="alert error">{err}</div>{/if}
+    {#if err}<div class="alert error" role="alert">{err}</div>{/if}
 
     <div class="vf-row">
       <div class="vf-col" style="flex: 2 1 320px;">
-        <label>Topic / brief</label>
-        <input bind:value={form.topic} placeholder="Why altitude changes your morning coffee" required />
+        <label for="create-topic">Topic / brief</label>
+        <input id="create-topic" name="topic" bind:value={form.topic} placeholder="Why altitude changes your morning coffee" required />
       </div>
       <div class="vf-col">
-        <label>Language</label>
-        <select bind:value={form.language}>
+        <label for="create-language">Language</label>
+        <select id="create-language" name="language" bind:value={form.language}>
           <option value="en-US">English (US)</option>
           <option value="en-GB">English (UK)</option>
           <option value="uk-UA">Ukrainian</option>
@@ -90,12 +110,12 @@
 
     <div class="vf-row">
       <div class="vf-col">
-        <label>Duration (seconds)</label>
-        <input type="number" bind:value={form.duration_seconds} min="3" max="120" />
+        <label for="create-duration">Duration (seconds)</label>
+        <input id="create-duration" name="duration_seconds" type="number" bind:value={form.duration_seconds} min="3" max="120" />
       </div>
       <div class="vf-col">
-        <label>Aspect ratio</label>
-        <select bind:value={form.aspect_ratio}>
+        <label for="create-aspect">Aspect ratio</label>
+        <select id="create-aspect" name="aspect_ratio" bind:value={form.aspect_ratio}>
           <option value="9:16">9:16 (vertical)</option>
           <option value="16:9">16:9 (horizontal)</option>
           <option value="1:1">1:1 (square)</option>
@@ -103,25 +123,32 @@
         </select>
       </div>
       <div class="vf-col">
-        <label>Number of variants</label>
-        <input type="number" bind:value={form.count} min="1" max="10" />
+        <label for="create-count">Number of variants</label>
+        <input id="create-count" name="count" type="number" bind:value={form.count} min="1" max="10" />
       </div>
     </div>
 
-    <label>Target platforms (comma-separated)</label>
-    <input bind:value={form.platforms} placeholder="tiktok, reels, shorts" />
+    <label for="create-platforms">Target platforms (comma-separated)</label>
+    <input id="create-platforms" name="platforms" bind:value={form.platforms} placeholder="tiktok, reels, shorts" />
 
-    <label>Brand Bible version (must be approved)</label>
-    <select bind:value={form.bible_id}>
-      <option value="">— pick one —</option>
+    <label for="create-bible">Brand Bible version (must be approved)</label>
+    <select id="create-bible" name="bible_id" bind:value={form.bible_id} disabled={biblesPhase === 'loading'}>
+      <option value="">{biblesPhase === 'loading' ? 'Loading Bibles…' : '— pick one —'}</option>
       {#each bibles as b}
         <option value={b.bible_id}>{company.name} v{b.version} · {b.status}</option>
       {/each}
     </select>
-    {#if bibles.length === 0}
-      <p class="muted hint">
-        No approved Bible yet.
-        <a href="/bible" class="link">Create + approve one →</a>
+    {#if biblesPhase === 'error'}
+      <StatusNote kind="error" title="Couldn’t load your Bibles" message={biblesError} onretry={loadBibles} />
+    {:else if biblesPhase === 'ready' && bibles.length === 0}
+      <p class="muted hint" data-testid="no-approved-bible">
+        {#if draftCount > 0}
+          You have {draftCount} draft Bible{draftCount === 1 ? '' : 's'} but none is approved yet.
+          <a href="/bible" class="link">Open the Video Bible and approve one →</a>
+        {:else}
+          No approved Bible yet.
+          <a href="/bible" class="link">Create + approve one →</a>
+        {/if}
       </p>
     {/if}
 
@@ -154,7 +181,7 @@
   }
   .sub { color: var(--vf-text-secondary); max-width: 640px; margin-top: var(--vf-sp-3); }
   .muted { color: var(--vf-text-secondary); }
-  .link { color: var(--vf-butter-green); }
+  .link { color: var(--vf-butter-green); text-decoration: underline; text-underline-offset: 3px; }
 
   .empty { text-align: center; padding: var(--vf-sp-7); color: var(--vf-text-secondary); }
 
@@ -170,8 +197,7 @@
 
   form .vf-row { margin-bottom: var(--vf-sp-2); }
   form label + input,
-  form label + select,
-  form label + textarea {
+  form label + select {
     margin-bottom: var(--vf-sp-4);
   }
   form label { margin-top: var(--vf-sp-2); }

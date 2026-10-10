@@ -11,6 +11,7 @@ import type { Actions, PageServerLoad } from "./$types";
 import { env } from "$env/dynamic/private";
 import { upstream_headers } from "$lib/server/upstream";
 import { set_session_cookie, switch_workspace_action } from "$lib/server/auth-cookies";
+import { same_origin_path } from "$lib/server/safe-redirect";
 
 const API_BASE = env.VIDEO_FACTORY_API_URL || "http://127.0.0.1:8000";
 
@@ -22,8 +23,12 @@ export const load: PageServerLoad = async ({ url }) => {
 	};
 };
 
+// NOTE (A-2): SvelteKit forbids a `default` action next to named
+// actions on the same route (POST then 500s with "When using named
+// actions, the default action cannot be used"). Every action on this
+// route is therefore named; the login form posts to `?/login`.
 export const actions: Actions = {
-	default: async ({ request, cookies, url }) => {
+	login: async ({ request, cookies, url }) => {
 		const data = await request.formData();
 		const email = (data.get("email") || "").toString().trim();
 		const password = (data.get("password") || "").toString();
@@ -58,7 +63,7 @@ export const actions: Actions = {
 		}
 
 		// Validate next: only allow same-origin relative paths.
-		const target = next.startsWith("/") && !next.startsWith("//") ? next : "/";
+		const target = next.startsWith("/") && !next.startsWith("//") ? same_origin_path(next) : "/";
 		throw redirect(303, target);
 	},
 

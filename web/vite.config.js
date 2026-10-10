@@ -14,9 +14,9 @@ export default defineConfig({
         target: apiTarget,
         changeOrigin: false
       },
-      // /auth/csrf (CSRF token for browser-side writes) and the
-      // /auth/oauth/* links live on FastAPI too; Caddy already
-      // forwards /auth/* in production.
+      // Production Caddy sends /auth/* (csrf token, OIDC start/callback)
+      // to the API; mirror that in dev so the browser client can fetch
+      // /auth/csrf. SvelteKit has no /auth route of its own.
       '/auth': {
         target: apiTarget,
         changeOrigin: false

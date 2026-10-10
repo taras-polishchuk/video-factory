@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { AuthWorkspace } from '$lib/server/types';
+	import { page } from '$app/stores';
 
 	let { workspaces, active } = $props<{
 		workspaces: AuthWorkspace[];
@@ -11,6 +12,8 @@
 	// HTML <details> element, and switching is a plain POST form
 	// that the +page.server.ts handles.
 	let open = $state(false);
+	// After a switch the action redirects back here, not to the login page.
+	let back = $derived($page.url.pathname + $page.url.search);
 	let switching = $state<string | null>(null);
 
 	function pick(id: string) {
@@ -32,7 +35,7 @@
 		</summary>
 		<div class="ws-menu">
 			{#each workspaces as w}
-				<form method="POST" action="/login?/switch" class="ws-form">
+				<form method="POST" action={`/login?/switch&back=${encodeURIComponent(back)}`} class="ws-form">
 					<input type="hidden" name="workspace_id" value={w.workspace_id} />
 					<button
 						type="submit"
@@ -64,6 +67,7 @@
 		border: 1px solid var(--vf-border);
 	}
 	.ws-static .ws-label { display: inline; }
+	.ws, .ws-static { max-width: 100%; min-width: 0; white-space: nowrap; }
 
 	.ws > summary {
 		display: inline-flex; align-items: center; gap: var(--vf-sp-2);
@@ -76,7 +80,25 @@
 		color: var(--vf-text-secondary);
 		text-transform: uppercase; letter-spacing: 0.06em;
 	}
-	.ws-name { font-size: var(--vf-fs-default); font-weight: var(--vf-fw-medium); }
+	.ws-name {
+		font-size: var(--vf-fs-default); font-weight: var(--vf-fw-medium);
+		max-width: 160px; overflow: hidden; text-overflow: ellipsis;
+	}
+
+	/* The "WORKSPACE" caption is the first thing to go when the topbar
+	   gets tight; it comes back inside the mobile menu. */
+	/* Inside the mobile menu the switcher is a full-width block and its
+	   list opens inline instead of floating over the page. */
+	@media (max-width: 1100px) {
+		.ws, .ws-static { display: flex; width: 100%; }
+		.ws > summary { width: 100%; }
+		.ws-name { max-width: none; flex: 1; }
+		.ws-menu { position: static; min-width: 0; margin-top: var(--vf-sp-2); box-shadow: none; }
+	}
+	@media (max-width: 1400px) and (min-width: 1101px) {
+		.ws-label { display: none !important; }
+		.ws-name { max-width: 110px; }
+	}
 
 	.ws-menu {
 		position: absolute; top: calc(100% + 8px); right: 0;

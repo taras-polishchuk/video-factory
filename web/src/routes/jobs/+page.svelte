@@ -1,18 +1,27 @@
 <script>
-  import { api } from '$lib/api-client.js';
+  import { api, describeError } from '$lib/api-client.js';
+  import StatusNote from '$lib/components/StatusNote.svelte';
   import { onMount } from 'svelte';
 
   let { data } = $props();
 
   let jobs = $state([]);
   let filter = $state({ company: '', state: '' });
-  let loaded = $state(false);
+  let phase = $state('loading'); // loading | ready | error
+  let loadError = $state('');
 
   async function load() {
     if (!data.activeWorkspace) return;
     if (!filter.company) filter.company = data.activeWorkspace.workspace_id;
-    jobs = await api.listJobs(filter.company);
-    loaded = true;
+    phase = 'loading';
+    loadError = '';
+    try {
+      jobs = await api.listJobs(filter.company);
+      phase = 'ready';
+    } catch (e) {
+      loadError = describeError(e);
+      phase = 'error';
+    }
   }
   onMount(load);
 
@@ -46,15 +55,15 @@
 
 <section class="vf-card filters">
   <div class="filter-cell">
-    <span class="muted small">Company</span>
-    <select bind:value={filter.company}>
+    <label class="muted small" for="jobs-filter-company">Company</label>
+    <select id="jobs-filter-company" name="company" bind:value={filter.company}>
       <option value="">All workspaces</option>
       {#each (data.workspaces || []) as c}<option value={c.workspace_id}>{c.name}</option>{/each}
     </select>
   </div>
   <div class="filter-cell">
-    <span class="muted small">State</span>
-    <select bind:value={filter.state}>
+    <label class="muted small" for="jobs-filter-state">State</label>
+    <select id="jobs-filter-state" name="state" bind:value={filter.state}>
       <option value="">All states</option>
       <option value="queued">Queued</option>
       <option value="running">Running</option>
@@ -69,14 +78,24 @@
 </section>
 
 <section class="vf-card">
-  {#if !loaded}
-    <p class="muted">Loading…</p>
+  {#if !data.activeWorkspace}
+    <StatusNote kind="empty" title="No workspace yet" message="Jobs belong to a workspace. Join or create one first." />
+  {:else if phase === 'loading'}
+    <StatusNote kind="loading" message="Loading jobs…" />
+  {:else if phase === 'error'}
+    <StatusNote kind="error" title="Couldn’t load jobs" message={loadError} onretry={load} />
+  {:else if jobs.length === 0}
+    <div class="empty">
+      <p>No jobs yet.</p>
+      <a href="/create" class="vf-btn vf-btn-primary vf-btn-sm">+ Create the first one</a>
+    </div>
   {:else if filtered.length === 0}
     <div class="empty">
       <p>No jobs match.</p>
       <p class="muted">Try clearing the filters above.</p>
     </div>
   {:else}
+    <div class="table-scroll">
     <table>
       <thead>
         <tr>
@@ -107,6 +126,7 @@
         {/each}
       </tbody>
     </table>
+    </div>
   {/if}
 </section>
 
@@ -157,7 +177,7 @@
     font-size: var(--vf-fs-cap-sm);
     background: var(--vf-surface-2);
     border: 1px solid var(--vf-border);
-    border-radius: var(--radius-pill);
+    border-radius: var(--vf-radius-pill);
     padding: 2px 8px;
     color: var(--vf-text-secondary);
   }
