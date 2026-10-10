@@ -1,7 +1,9 @@
 """SQLite migrations for Video Factory.
 
-Each migration is a small, idempotent SQL fragment that the Repo
-applies at bootstrap. Migrations are append-only — never edit a
+Each migration is a small SQL fragment (or a registered Python
+function) that the Repo applies at bootstrap. Applied ids are recorded
+in the `schema_migrations` ledger, so every migration runs exactly
+once per database (F-11). Migrations are append-only — never edit a
 migration that has shipped. To change a table, add a new migration.
 
 Schema invariants enforced here:
@@ -210,7 +212,102 @@ MIGRATIONS: List[Tuple[str, str, str]] = [
             ON stripe_events(received_at);
         """,
     ),
+    (
+        "010",
+        "jobs.recovery_count (restart recovery) + list/pagination indexes",
+        # Python migration (see _migration_010). Gated by the
+        # schema_migrations ledger like every other entry.
+        "python:010",
+    ),
 ]
+
+
+# ── schema_migrations ledger (F-11) ───────────────────────────
+#
+# Every migration id is recorded in `schema_migrations` in the SAME
+# transaction that applies it, so a migration runs exactly once per
+# database. The ledger transaction is opened with BEGIN IMMEDIATE:
+# a second process (or thread) that boots at the same time blocks on
+# SQLite's write lock, then re-reads the ledger and finds nothing left
+# to do. `Repo._bootstrap_schema` additionally holds a cross-process
+# bootstrap lock around the whole bootstrap (see core/repo.py).
+
+LEDGER_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS schema_migrations ("
+    "id TEXT PRIMARY KEY, "
+    "description TEXT NOT NULL, "
+    "applied_at TEXT NOT NULL)"
+)
+
+# Busy timeout (ms) used while the ledger transaction waits for a
+# concurrent booter to finish. Restored to the connection default
+# (sqlite3.connect timeout=5.0 -> 5000 ms) afterwards.
+MIGRATION_BUSY_TIMEOUT_MS = 60_000
+_DEFAULT_BUSY_TIMEOUT_MS = 5_000
+
+
+def _now_iso() -> str:
+    import time
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _split_sql(sql: str) -> List[str]:
+    """Split a SQL script into complete statements.
+
+    `executescript` cannot be used inside the ledger transaction
+    because it issues an implicit COMMIT first, so each statement is
+    executed individually. `sqlite3.complete_statement` handles
+    semicolons inside string literals and trigger bodies.
+    """
+    import sqlite3
+    out: List[str] = []
+    buf = ""
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            stmt = buf.strip()
+            if stmt and stmt != ";":
+                out.append(stmt)
+            buf = ""
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+def _columns(conn, table: str) -> set:
+    return {r[1].lower() for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migration_010(conn) -> None:
+    """jobs.recovery_count + indexes for keyset pagination.
+
+    The ALTER is guarded by PRAGMA table_info as well as the ledger,
+    so a DB whose ledger was lost/restored separately still boots.
+    """
+    if "recovery_count" not in _columns(conn, "jobs"):
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN recovery_count "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    for stmt in (
+        "CREATE INDEX IF NOT EXISTS idx_jobs_workspace_created "
+        "ON jobs(workspace_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_state_updated "
+        "ON jobs(state, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_assets_workspace_uploaded "
+        "ON assets(workspace_id, uploaded_at)",
+        "CREATE INDEX IF NOT EXISTS idx_publish_job_created "
+        "ON publish_intents(job_id, created_at)",
+        # audit_log(workspace_id, created_at) is indexed by
+        # Repo._extend_audit_log_columns: on a fresh DB the
+        # workspace_id column is only added after the ledger runs.
+    ):
+        conn.execute(stmt)
+
+
+PYTHON_MIGRATIONS: dict = {
+    "python:010": _migration_010,
+}
 
 
 def _migrations_dir() -> Path:
@@ -226,16 +323,62 @@ def load_migrations() -> List[Tuple[str, str, str]]:
     return list(MIGRATIONS)
 
 
+def applied_migration_ids(conn) -> List[str]:
+    """Return the ids recorded in the ledger (empty if no ledger)."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='schema_migrations'"
+    ).fetchone()
+    if not row:
+        return []
+    return [r[0] for r in conn.execute(
+        "SELECT id FROM schema_migrations ORDER BY id"
+    ).fetchall()]
+
+
+def _apply_one(conn, sql: str) -> None:
+    fn = PYTHON_MIGRATIONS.get(sql.strip())
+    if fn is not None:
+        fn(conn)
+        return
+    for stmt in _split_sql(sql):
+        conn.execute(stmt)
+
+
 def apply_migrations(conn, *, log: Callable[[str], None] = lambda _msg: None) -> int:
     """Apply all pending migrations to an open SQLite connection.
 
-    Idempotent: re-running is a no-op for already-applied migrations.
-    Returns the number of migrations applied this call (0 if all
-    already applied).
+    Each migration id is applied at most once per database: the id is
+    written to `schema_migrations` in the same transaction as the
+    migration itself. Re-running is a no-op. Returns the number of
+    migrations applied by THIS call (0 when the ledger is complete).
+
+    The connection must be in autocommit mode (``isolation_level=None``,
+    which is how ``core.cipher_db.connect`` opens it).
     """
+    conn.execute(LEDGER_SCHEMA)
+    conn.execute(f"PRAGMA busy_timeout={MIGRATION_BUSY_TIMEOUT_MS}")
     applied = 0
-    for mid, _desc, sql in load_migrations():
-        log(f"migration {mid}: applying")
-        conn.executescript(sql)
-        applied += 1
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            done = set(applied_migration_ids(conn))
+            for mid, desc, sql in load_migrations():
+                if mid in done:
+                    continue
+                log(f"migration {mid}: applying")
+                _apply_one(conn, sql)
+                conn.execute(
+                    "INSERT INTO schema_migrations(id, description, "
+                    "applied_at) VALUES (?,?,?)",
+                    (mid, desc, _now_iso()),
+                )
+                applied += 1
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.execute(f"PRAGMA busy_timeout={_DEFAULT_BUSY_TIMEOUT_MS}")
     return applied

@@ -512,6 +512,10 @@ def _registry_series() -> dict:
         "video_factory_webhook_receipts_total": obs.WEBHOOK_RECEIPTS_TOTAL,
         "video_factory_errors_total": obs.ERRORS_TOTAL,
         "video_factory_request_duration_seconds": obs.REQUEST_DURATION,
+        # JOBS S3 runner gauges (unlabelled, read at scrape time).
+        "video_factory_job_queue_depth": obs.JOB_QUEUE_DEPTH,
+        "video_factory_jobs_active": obs.JOBS_ACTIVE,
+        "video_factory_jobs_concurrency_limit": obs.JOBS_CONCURRENCY_LIMIT,
     }
 
 

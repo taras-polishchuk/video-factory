@@ -226,6 +226,104 @@ docker compose exec caddy caddy list-certs
 
 ---
 
+## Job runner: concurrency, queue, restart recovery
+
+The api process runs jobs on background threads (`core/runners.py`).
+It must stay `--workers 1` (Dockerfile, compose): the queue lives in
+that one process.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `VIDEO_FACTORY_MAX_CONCURRENT_JOBS` | `2` | Jobs that run at the same time. Extra submits are NOT rejected: they stay `queued` and start FIFO when a slot frees. |
+| `VIDEO_FACTORY_STALE_RUNNING_MINUTES` | `30` | On startup, a job still `running` whose row was not updated for this long is re-queued once (`recovery_count` 0 -> 1), and failed with a reason the next time. |
+| `VIDEO_FACTORY_RECOVER_ON_STARTUP` | `1` | `0` disables the startup recovery (stale sweep + re-submit of every `queued` job). |
+| `VIDEO_FACTORY_FFMPEG_THREADS` | `2` | `-threads` for every ffmpeg encode (`-filter_threads 1` is fixed). |
+
+Watch it on `/metrics`:
+
+- `video_factory_jobs_active` (never above the cap),
+- `video_factory_job_queue_depth` (jobs waiting),
+- `video_factory_jobs_concurrency_limit`.
+
+A queue that stays above 0 while `active == limit` means the host is
+saturated: raise the cap only if the memory budget below allows it.
+
+Job submit admission (quota + budget) is atomic: the FREE-plan monthly
+count, the budget preflight and the job INSERT run in one SQLite
+`BEGIN IMMEDIATE` transaction. A refused submit answers 429 (quota) or
+402 (budget, `reason_code` `ceiling` or `unknown_cost`) and writes no
+job row; the audit log gets `quota.exceeded` / `budget.refused`. The
+budget counter itself is per process (in memory), so it resets on
+restart; the quota count is read from the DB every time.
+
+## Per-job memory budget (4 GB host)
+
+Each job runs its ffmpeg encodes one after another (clips, then the
+concat), so a job's ffmpeg footprint is the peak of a single encode.
+Measured with `/usr/bin/time -v` around every ffmpeg call of the mock
+assembly (`render_plan_to_storage`), 8-core host, ffmpeg 9.0.1:
+
+| Plan | Before (main @ 457f8f4, no thread caps) | After (this branch, `-threads 2 -filter_threads 1`) |
+|---|---|---|
+| 30 s, 3 clips, 9:16 | 750.2 MB peak | 166.6 MB peak |
+| 60 s, 4 clips, 16:9 | 1019.1 MB peak | 161.8 MB peak |
+
+Without caps libx264 and the filter graph size their thread pools from
+the CPU count, and every thread holds frame buffers, so the peak grows
+with the core count. With the caps it does not.
+
+Budget: plan 256 MB per running job (measured peak + headroom). With
+the default cap of 2 that is about 512 MB for encodes, next to the api
+process itself, Caddy and the web container. On a 4 GB host keep
+`VIDEO_FACTORY_MAX_CONCURRENT_JOBS` at 4 or below; if you set a
+container memory limit for the api service, size it as
+`api baseline + cap x 256 MB`.
+
+## Retention
+
+Both knobs default to `0` = off.
+
+| Env | Deletes |
+|---|---|
+| `ARTIFACTS_RETENTION_DAYS` | files under `$VIDEO_FACTORY_STORAGE/jobs/` (rendered outputs, mock assets, their sidecars) with mtime older than N days, then the empty dirs. Uploaded workspace/company assets and `idem.db` are never touched. Output rows stay in the DB; their download answers 404 "output bytes missing". |
+| `AUDIT_LOG_RETENTION_DAYS` | `audit_log` and `runner_audit` rows with `created_at` older than N days. |
+
+The api process sweeps once at startup and then every 24 h on a
+daemon thread (only when a knob is > 0). To run it from outside the
+process instead (or in addition):
+
+```bash
+# one sweep, JSON summary on stdout; --dry-run counts only
+docker compose -f /opt/video-factory/docker-compose.production.yml \
+  exec api python -m cli.maintenance retention --dry-run
+docker compose -f /opt/video-factory/docker-compose.production.yml \
+  exec api python -m cli.maintenance retention
+```
+
+systemd timer (host): install `systemd/video-factory-retention.service`
+and `systemd/video-factory-retention.timer`, then
+`systemctl enable --now video-factory-retention.timer`. Cron
+equivalent: `15 3 * * * docker compose -f /opt/video-factory/docker-compose.production.yml exec -T api python -m cli.maintenance retention`.
+
+## Schema migrations
+
+Every migration id is recorded in the `schema_migrations` table in the
+same transaction that applies it, so each runs once per database.
+Startup takes a `BEGIN IMMEDIATE` lock plus a `flock` on the DB
+directory, so two processes booting at once do not race. Inspect:
+
+```bash
+docker compose -f /opt/video-factory/docker-compose.production.yml \
+  exec api python -m cli.maintenance migrations
+```
+
+The oldest DB shape that upgrades is the Wave 1 production snapshot
+(V0 tables with `company_id` + auth migrations 001-004). A pure V0
+DB without the Wave 1 auth tables does not boot (migration 005 needs
+`workspaces`); that was already true before the ledger.
+
+---
+
 ## Common error shapes
 
 | Symptom | Cause | Fix |
@@ -235,6 +333,8 @@ docker compose exec caddy caddy list-certs
 | OIDC callback 400 (state) | clock skew > 10 min | `timedatectl set-ntp true` |
 | /metrics empty | scrape from wrong IP | Use the api container's loopback, port 8000 |
 | `restored DB is unreadable` | VIDEO_FACTORY_DB_KEY changed | Match the key in `/etc/video-factory/credentials/video_factory_db_key` |
+| Job submit 402 `unknown_cost` | live render profile without a known price | Use a priced profile; unknown cost is never auto-approved |
+| Jobs stay `queued` | concurrency cap reached | Check `video_factory_jobs_active` / `video_factory_job_queue_depth`; see "Job runner" |
 
 For anything not listed here: capture the request id from the
 response header `X-Request-Id`, then `journalctl -u video-factory

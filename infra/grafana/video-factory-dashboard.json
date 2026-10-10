@@ -403,6 +403,63 @@
           "placement": "bottom"
         }
       }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Job runner queue",
+      "description": "JobRunner: jobs executing, jobs waiting in the FIFO queue, and the concurrency cap (VIDEO_FACTORY_MAX_CONCURRENT_JOBS). A queue that stays above 0 while active == limit means the host is saturated.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(video_factory_jobs_active)",
+          "legendFormat": "active"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(video_factory_job_queue_depth)",
+          "legendFormat": "queued"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "max(video_factory_jobs_concurrency_limit)",
+          "legendFormat": "limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     }
   ]
 }

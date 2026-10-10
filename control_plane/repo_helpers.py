@@ -76,26 +76,17 @@ def append_runner_audit(
             ),
         )
         # Mirror to audit_log with actor attribution. This is the
-        # cross-actor audit surface (W1 brief §3.1) and is also
-        # used by auth.audit_log for non-job events.
+        # cross-actor audit surface (W1 brief §3.1). MAJ-1: routed
+        # through Repo.append_audit, the single audit_log writer
+        # (best-effort, never raises).
         if user_id is not None or workspace_id is not None:
-            try:
-                conn.execute(
-                    "INSERT INTO audit_log(audit_id, event, context_json, "
-                    "user_id, workspace_id, created_at) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (
-                        f"audlog_{_u.uuid4().hex[:12]}",
-                        event,
-                        json.dumps(context or {}),
-                        user_id,
-                        workspace_id,
-                        _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
-                    ),
+            append_audit = getattr(repo, "append_audit", None)
+            if append_audit is not None:
+                append_audit(
+                    event=event,
+                    context=context or {},
+                    user_id=user_id,
+                    workspace_id=workspace_id,
                 )
-            except Exception:
-                # audit_log might not have the columns if migrations
-                # 003/004 were skipped; never let this propagate.
-                pass
     except Exception:
         pass

@@ -19,7 +19,7 @@ from control_plane.repo_helpers import (
     append_runner_audit,
     bootstrap_runner_audit,
 )
-from core.budget_enforcer import BudgetEnforcer, preflight_or_block
+from control_plane.budget import BudgetGuard, preflight_or_block
 from core.repo import Repo
 from render_plane.gate import ensure_live_unlocked
 from render_plane.heygen_direct import HeyGenDirectAdapter
@@ -36,7 +36,7 @@ from tests.test_api import env as env  # noqa: E402,F401
 
 def test_budget_enforcer_unknown_cost_refused():
     """Real preflight on unknown cost. Closes audit §2.2."""
-    b = BudgetEnforcer(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
+    b = BudgetGuard(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
     d = b.preflight(estimated_cost_usd=None)
     assert d.allowed is False
     assert "unknown cost" in d.reason
@@ -44,7 +44,7 @@ def test_budget_enforcer_unknown_cost_refused():
 
 def test_budget_enforcer_record_spend_after_preflight():
     """Real preflight + record_spend chain. Closes audit §2.3."""
-    b = BudgetEnforcer(max_cost_per_video_usd=10.0, max_cost_per_batch_usd=50.0)
+    b = BudgetGuard(max_cost_per_video_usd=10.0, max_cost_per_batch_usd=50.0)
     d1 = b.preflight(estimated_cost_usd=3.0)
     assert d1.allowed
     assert d1.estimated_cost_usd is not None
@@ -58,7 +58,7 @@ def test_budget_enforcer_record_spend_after_preflight():
 
 
 def test_preflight_or_block_raises_on_refusal():
-    b = BudgetEnforcer(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
+    b = BudgetGuard(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
     with pytest.raises(BudgetExceeded):
         preflight_or_block(b, estimated_cost_usd=None)
 

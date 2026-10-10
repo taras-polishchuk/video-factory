@@ -1,4 +1,4 @@
-"""Tests for core/budget_enforcer and core/idempotency durability."""
+"""Tests for control_plane.budget (BudgetGuard; the core/budget_enforcer shim was removed, MAJ-2) and core/idempotency durability."""
 from __future__ import annotations
 
 import os
@@ -7,34 +7,34 @@ import pathlib
 import pytest
 
 from control_plane.errors import BudgetExceeded
-from core.budget_enforcer import BudgetEnforcer, preflight_or_block
+from control_plane.budget import BudgetGuard, preflight_or_block
 from control_plane.idempotency import (
     DurableIdempotencyStore, IdempotencyStore, ProviderSubmitReceipt,
 )
 
 
 def test_unknown_cost_refused():
-    b = BudgetEnforcer(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
+    b = BudgetGuard(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
     d = b.preflight(estimated_cost_usd=None)
     assert d.allowed is False
     assert "unknown cost" in d.reason
 
 
 def test_known_cost_under_ceiling_allowed():
-    b = BudgetEnforcer(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
+    b = BudgetGuard(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
     d = b.preflight(estimated_cost_usd=3.0)
     assert d.allowed is True
 
 
 def test_over_video_ceiling_refused():
-    b = BudgetEnforcer(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
+    b = BudgetGuard(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
     d = b.preflight(estimated_cost_usd=10.0)
     assert d.allowed is False
     assert "per-video" in d.reason
 
 
 def test_batch_ceiling_tracked():
-    b = BudgetEnforcer(max_cost_per_video_usd=100.0, max_cost_per_batch_usd=10.0)
+    b = BudgetGuard(max_cost_per_video_usd=100.0, max_cost_per_batch_usd=10.0)
     b.record_spend(7.0)
     d = b.preflight(estimated_cost_usd=5.0)  # 7+5 > 10
     assert d.allowed is False
@@ -42,7 +42,7 @@ def test_batch_ceiling_tracked():
 
 
 def test_preflight_or_block_raises():
-    b = BudgetEnforcer(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
+    b = BudgetGuard(max_cost_per_video_usd=5.0, max_cost_per_batch_usd=20.0)
     with pytest.raises(BudgetExceeded):
         preflight_or_block(b, estimated_cost_usd=None)
 

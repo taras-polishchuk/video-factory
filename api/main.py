@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, UploadFile, File
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -59,7 +59,36 @@ def create_app(*, repo: Optional[Repo] = None,
         )
     Singleton.set(runner)
 
+    # JOBS S3: process start-up/shutdown hooks (uvicorn runs the
+    # lifespan; TestClient only when used as a context manager).
+    #  - restart recovery (F-30): stale `running` jobs are re-queued
+    #    once, then failed; every `queued` job (the previous process's
+    #    in-memory FIFO died with it) is handed back to the runner.
+    #    Opt out with VIDEO_FACTORY_RECOVER_ON_STARTUP=0.
+    #  - retention (F-07, F-42): startup + daily sweep thread, a no-op
+    #    unless ARTIFACTS_RETENTION_DAYS / AUDIT_LOG_RETENTION_DAYS > 0.
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        import logging as _lg
+        from core.retention import RetentionSweeper
+        _slog = _lg.getLogger("video_factory.startup")
+        if os.environ.get("VIDEO_FACTORY_RECOVER_ON_STARTUP", "1").strip() != "0":
+            try:
+                _app.state.startup_recovery = runner.recover_on_startup()
+            except Exception as e:  # noqa: BLE001
+                _slog.exception("startup job recovery failed: %s", e)
+        sweeper = RetentionSweeper(repo=repo, storage_root=str(storage_root))
+        _app.state.retention_sweeper = sweeper
+        sweeper.start()
+        try:
+            yield
+        finally:
+            sweeper.stop()
+
     app = FastAPI(
+        lifespan=_lifespan,
         title="Video Factory Control Room API",
         version="0.2.0",
         description=(
@@ -97,6 +126,30 @@ def create_app(*, repo: Optional[Repo] = None,
     @app.exception_handler(ValueError)
     async def _ve(request: Request, exc: ValueError):
         return JSONResponse({"error": str(exc)}, status_code=400)
+
+    # JOBS S3 / BLK-1: a job submit refused by atomic admission
+    # (core/admission.py: 429 quota, 402 budget). No job row was
+    # written; record the audit row and answer with the refusal body.
+    from core.admission import JobAdmissionRefused
+
+    @app.exception_handler(JobAdmissionRefused)
+    async def _admission_refused(request: Request, exc: JobAdmissionRefused):
+        from core.audit import emit as _emit_audit
+        _emit_audit(repo, event=exc.audit_event, context=exc.audit_context,
+                    workspace_id=exc.workspace_id, user_id=exc.user_id,
+                    actor=exc.actor)
+        return JSONResponse(exc.body, status_code=exc.status_code)
+
+    from core.pagination import NEXT_CURSOR_HEADER
+
+    def _page(response: Response, page):
+        """MAJ-4: return a keyset page's items; the next cursor (if
+        any) travels in the X-Next-Cursor header so the body stays the
+        same JSON array the UI already reads."""
+        items, nxt = page
+        if nxt:
+            response.headers[NEXT_CURSOR_HEADER] = nxt
+        return items
 
     # Wave 8 follow-up (QA D1): catch-all for unhandled exceptions.
     # Starlette routes this handler through ServerErrorMiddleware,
@@ -492,10 +545,13 @@ def create_app(*, repo: Optional[Repo] = None,
                  "updated_at": ws["updated_at"]}]
 
     @app.get("/api/v1/workspaces/{wid}/jobs")
-    async def ws_list_jobs(request: Request, wid: str,
-                            state: Optional[str] = None):
+    async def ws_list_jobs(request: Request, response: Response, wid: str,
+                            state: Optional[str] = None,
+                            limit: Optional[int] = None,
+                            cursor: Optional[str] = None):
         _ctx, _ws = _resolve_ws(request, wid)
-        return repo.list_jobs(workspace_id=wid, state=state)
+        return _page(response, repo.list_jobs_page(
+            workspace_id=wid, state=state, limit=limit, cursor=cursor))
 
     @app.post("/api/v1/workspaces/{wid}/jobs")
     async def ws_create_job(request: Request, wid: str, payload: dict):
@@ -540,52 +596,19 @@ def create_app(*, repo: Optional[Repo] = None,
             raise HTTPException(
                 403, f"live providers blocked: {live_decision.reason}",
             )
-        # Wave 6b: FREE-tier monthly job quota (5/month).  Re-reads
-        # plan synchronously on every call (no in-memory cache) so a
-        # Stripe webhook (Wave 6c) can flip plan without race.
-        from datetime import datetime, timezone
-        from core.quotas import check_job_quota
-        quota_decision = check_job_quota(
-            workspace_id=wid,
-            plan=_ws.get("plan", "free"),
-            now=datetime.now(timezone.utc),
-            job_count_for_month=lambda w, s: repo.count_jobs_since(
-                workspace_id=w, since_iso=s,
-            ),
-        )
-        if not quota_decision.allowed:
-            from core.audit import (
-                EVENT_QUOTA_EXCEEDED, emit as emit_quota_audit,
-            )
-            emit_quota_audit(
-                repo,
-                event=EVENT_QUOTA_EXCEEDED,
-                context={
-                    "workspace_id": wid,
-                    "plan": quota_decision.plan,
-                    "jobs_used": quota_decision.jobs_used,
-                    "quota_reset_at": quota_decision.reset_at,
-                    "endpoint": "POST /api/v1/workspaces/{wid}/jobs",
-                },
-                workspace_id=wid,
-                user_id=getattr(_ctx, "user_id", None),
-                actor=getattr(_ctx, "email", None),
-            )
-            return JSONResponse(
-                {
-                    "error": (
-                        f"FREE plan limit {quota_decision.limit} jobs/month "
-                        f"reached; resets at {quota_decision.reset_at}"
-                    ),
-                    "quota_reset_at": quota_decision.reset_at,
-                    "jobs_used": quota_decision.jobs_used,
-                    "jobs_remaining": 0,
-                },
-                status_code=429,
-            )
-        job = repo.create_job(
-            workspace_id=wid,
-            topic=topic,
+        # Wave 6b FREE-tier monthly job quota (5/month) + budget
+        # preflight: JOBS S3 / BLK-1 runs both inside the job INSERT's
+        # BEGIN IMMEDIATE transaction (core/admission.py), so two
+        # concurrent submits cannot both take the last slot. The plan
+        # is re-read on every call (no cache) so a Stripe webhook can
+        # flip it. A refusal raises JobAdmissionRefused (429 / 402,
+        # audited by the exception handler) and writes no job row.
+        job = runner.create_job_admitted(
+            workspace=_ws,
+            endpoint="POST /api/v1/workspaces/{wid}/jobs",
+            user_id=getattr(_ctx, "user_id", None),
+            actor=getattr(_ctx, "email", None),
+            topic=payload["topic"],
             language=payload["language"],
             duration_seconds=int(payload["duration_seconds"]),
             platforms=list(payload["platforms"]),
@@ -613,9 +636,12 @@ def create_app(*, repo: Optional[Repo] = None,
         )
 
     @app.get("/api/v1/workspaces/{wid}/assets")
-    async def ws_list_assets(request: Request, wid: str):
+    async def ws_list_assets(request: Request, response: Response, wid: str,
+                              limit: Optional[int] = None,
+                              cursor: Optional[str] = None):
         _ctx, _ws = _resolve_ws(request, wid)
-        return repo.list_assets(wid)
+        return _page(response, repo.list_assets_page(
+            wid, limit=limit, cursor=cursor))
 
     @app.post("/api/v1/workspaces/{wid}/assets")
     async def ws_create_asset(request: Request, wid: str,
@@ -705,10 +731,13 @@ def create_app(*, repo: Optional[Repo] = None,
                 "workspace_id": wid}
 
     @app.get("/api/v1/workspaces/{wid}/audit")
-    async def ws_audit(request: Request, wid: str, limit: int = 100):
+    async def ws_audit(request: Request, response: Response, wid: str,
+                       limit: Optional[int] = None,
+                       cursor: Optional[str] = None):
         _ctx, _ws = _resolve_ws(request, wid)
-        from auth.audit_log import list_for_workspace
-        return list_for_workspace(repo, workspace_id=wid, limit=limit)
+        # Default page 100 (unchanged), max 200, keyset cursor (MAJ-4).
+        return _page(response, repo.list_audit_page(
+            workspace_id=wid, limit=limit, cursor=cursor))
 
     # ── Wave 6a: Stripe Checkout + Customer Portal ──────────
     #
@@ -1226,13 +1255,17 @@ def create_app(*, repo: Optional[Repo] = None,
     @app.get("/api/v1/companies/{company_id}/assets")
     async def list_assets(
         company_id: str,
+        response: Response,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
         ctx: AuthContext = Depends(get_current_user),
     ):
         wid = _resolve_cid_to_wid(repo, company_id)
         m = repo.get_membership(ctx.user_id, wid)
         if not m:
             raise HTTPException(403, "not a member of this workspace")
-        return repo.list_assets(company_id)
+        return _page(response, repo.list_assets_page(
+            company_id, limit=limit, cursor=cursor))
 
     @app.get("/api/v1/assets/{asset_id}/download")
     async def download_asset(
@@ -1317,40 +1350,11 @@ def create_app(*, repo: Optional[Repo] = None,
             raise HTTPException(
                 403, f"live providers blocked: {live_decision.reason}",
             )
-        quota_decision = check_job_quota(
-            workspace_id=wid,
-            plan=_ws.get("plan", "free"),
-            now=datetime.now(timezone.utc),
-            job_count_for_month=lambda w, s: repo.count_jobs_since(
-                workspace_id=w, since_iso=s,
-            ),
-        )
-        if not quota_decision.allowed:
-            emit_audit(
-                repo,
-                event=EVENT_QUOTA_EXCEEDED,
-                context={
-                    "workspace_id": wid,
-                    "plan": quota_decision.plan,
-                    "jobs_used": quota_decision.jobs_used,
-                    "quota_reset_at": quota_decision.reset_at,
-                    "endpoint": "POST /api/v1/jobs",
-                },
-                workspace_id=wid,
-            )
-            return JSONResponse(
-                {
-                    "error": (
-                        f"FREE plan limit {quota_decision.limit} jobs/month "
-                        f"reached; resets at {quota_decision.reset_at}"
-                    ),
-                    "quota_reset_at": quota_decision.reset_at,
-                    "jobs_used": quota_decision.jobs_used,
-                    "jobs_remaining": 0,
-                },
-                status_code=429,
-            )
-        job = repo.create_job(
+        # Quota + budget preflight: atomic with the INSERT (JOBS S3 /
+        # BLK-1, see the workspace-scoped route above).
+        job = runner.create_job_admitted(
+            workspace=_ws,
+            endpoint="POST /api/v1/jobs",
             company_id=company_id,
             topic=topic,
             language=payload["language"],

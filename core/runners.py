@@ -8,7 +8,10 @@ state required to resume the *runner*).
 """
 from __future__ import annotations
 
+import collections
 import json
+import logging
+import os
 import shutil
 import threading
 import time
@@ -19,7 +22,7 @@ from control_plane.idempotency import IdempotencyStore, ProviderSubmitReceipt
 from control_plane.idempotency import DurableIdempotencyStore
 from control_plane.storage import LocalDiskStorage
 from control_plane.orchestrator import Orchestrator, OrchestratorConfig
-from core.budget_enforcer import BudgetEnforcer, preflight_or_block
+from control_plane.budget import BudgetGuard
 from control_plane.pack_builder import (
     Caption, Concept, PackBuilder, ResearchClaim, SceneSpec, Script, VoiceSpec,
 )
@@ -27,6 +30,44 @@ from render_plane.mock_renderer import MockRenderer
 
 from core.edit_plan import build_plan, render_plan_to_storage
 from core.repo import NotFound, Repo
+
+_log = logging.getLogger("video_factory.runner")
+
+# Concurrency cap (JOBS S3 item 2). Each running job may spawn an
+# ffmpeg process (see core/edit_plan.py for its memory bound), so the
+# cap is what keeps a 4 GB host out of OOM. Excess jobs stay `queued`
+# and start FIFO when a slot frees up.
+MAX_CONCURRENT_JOBS_ENV = "VIDEO_FACTORY_MAX_CONCURRENT_JOBS"
+DEFAULT_MAX_CONCURRENT_JOBS = 2
+
+# Restart recovery (F-30). A job still `running` whose row was not
+# touched for this long, with no live pipeline thread, is re-queued
+# once and failed the second time.
+STALE_RUNNING_MINUTES_ENV = "VIDEO_FACTORY_STALE_RUNNING_MINUTES"
+DEFAULT_STALE_RUNNING_MINUTES = 30.0
+MAX_RECOVERY_REQUEUES = 1
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        _log.warning("ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        _log.warning("ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
 
 
 # Ordered stage sequence. The orchestrator covers the latter half.
@@ -131,20 +172,43 @@ def _build_pack_for_job(job: dict, *, schema: dict, bible: dict) -> dict:
 
 
 class JobRunner:
-    """Runs jobs in a background thread pool. State persists to SQLite."""
+    """Runs jobs on background threads, at most ``max_concurrent_jobs``
+    at a time. State persists to SQLite.
+
+    Scheduling (JOBS S3): ``submit`` puts a job in a FIFO queue and
+    starts a worker thread only while fewer than the cap are running.
+    A worker that finishes a job immediately takes the next queued job
+    on the same thread (renamed ``job-<id>``), so the number of live
+    pipeline threads never exceeds the cap and joining a worker waits
+    for everything it will pick up.
+    """
 
     def __init__(self, *, repo: Repo, storage_root: str, schema: dict,
                  budget_per_video_usd: float = 0.0,
-                 budget_per_batch_usd: float = 0.0) -> None:
+                 budget_per_batch_usd: float = 0.0,
+                 max_concurrent_jobs: Optional[int] = None) -> None:
         self.repo = repo
         self.storage_root = Path(storage_root).resolve()
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self.schema = schema
         self.budget_per_video_usd = budget_per_video_usd
         self.budget_per_batch_usd = budget_per_batch_usd
+        if max_concurrent_jobs is None:
+            max_concurrent_jobs = _env_int(
+                MAX_CONCURRENT_JOBS_ENV, DEFAULT_MAX_CONCURRENT_JOBS,
+            )
+        self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
         self._lock = threading.Lock()
+        # job_id -> worker thread currently executing it.
         self._active_jobs: dict[str, threading.Thread] = {}
-        self._idem: dict[str, IdempotencyStore] = {}
+        # FIFO of job_ids accepted but not started (cap reached).
+        self._queue: collections.deque[str] = collections.deque()
+        # job_id -> Event set when the job leaves the runner (done,
+        # failed, or crashed). Present while queued or running.
+        self._done: dict[str, threading.Event] = {}
+        # job_id -> budget reserved at admission (BLK-1); consumed by
+        # _run so the admitted job is not charged twice.
+        self._reserved: dict[str, float] = {}
         # F8: expose an audit surface so the webhook handler can record
         # receipts. We use the JobRunner's own in-memory audit log;
         # backend persistence lives in Repo (job_stages + runner_audit).
@@ -156,10 +220,154 @@ class JobRunner:
         # Durable idempotency: SQLite-backed so receipts survive restart.
         idem_db = self.storage_root / "idem.db"
         self._idem_store = DurableIdempotencyStore(str(idem_db))
-        self._budget = BudgetEnforcer(
+        # F-10 / MAJ-5 / MAJ-6: ONE in-memory store per runner, built
+        # and seeded eagerly here (deterministic order) instead of
+        # lazily under an id(self)-keyed dict on the first job thread.
+        self._idem_inmem = self._seed_idempotency_store()
+        self._budget = BudgetGuard(
             max_cost_per_video_usd=budget_per_video_usd,
             max_cost_per_batch_usd=budget_per_batch_usd,
         )
+        self._registry = None
+
+    # ── Queue introspection (Prometheus gauges) ───────────────
+
+    def queue_depth(self) -> int:
+        with self._lock:
+            return len(self._queue)
+
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._active_jobs)
+
+    def concurrency_limit(self) -> int:
+        return self.max_concurrent_jobs
+
+    # ── Atomic admission (BLK-1) ──────────────────────────────
+
+    def estimate_cost(self, render_profile: Optional[str]):
+        """Cost estimate for a job with ``render_profile``, computed in
+        the request thread (no provider call: every adapter's
+        ``estimate`` is static). Unknown profiles are treated as an
+        unknown cost, which the budget guard refuses."""
+        from render_plane.provider import CostEstimate
+        profile = (render_profile or "mock").strip() or "mock"
+        try:
+            if self._registry is None:
+                from render_plane.registry import default_registry
+                self._registry = default_registry()
+            return self._registry.resolve(profile).estimate(pack={})
+        except Exception:  # UnknownProfile or adapter error
+            return CostEstimate(amount_usd=None, unknown=True,
+                                assumptions=f"unknown render profile {profile!r}")
+
+    def create_job_admitted(self, *, workspace: dict, endpoint: str,
+                              company_id: Optional[str] = None,
+                              user_id: Optional[str] = None,
+                              actor: Optional[str] = None,
+                              now=None, **job_fields) -> dict:
+        """Create a job only if quota AND budget admit it, atomically.
+
+        One ``BEGIN IMMEDIATE`` transaction (``Repo.create_job`` with
+        an ``admission`` callback) covers: count this workspace's jobs
+        this month -> FREE quota check -> budget reserve -> INSERT.
+        Concurrent submits are serialised by SQLite's write lock, so
+        they cannot exceed the free quota or the budget ceiling.
+        Raises ``core.admission.JobAdmissionRefused`` (no row written)
+        when refused. Does NOT start the job: call ``submit``.
+        """
+        from datetime import datetime, timezone
+        from core.admission import budget_refusal, quota_refusal
+        from core.quotas import check_job_quota
+
+        wid = workspace["workspace_id"]
+        plan = workspace.get("plan", "free")
+        profile = job_fields.get("render_profile", "mock") or "mock"
+        estimate = self.estimate_cost(profile)
+        when = now or datetime.now(timezone.utc)
+        reserved: dict = {}
+
+        def _admit(conn, job_id: str) -> None:
+            quota = check_job_quota(
+                workspace_id=wid, plan=plan, now=when,
+                job_count_for_month=lambda w, s: self.repo.count_jobs_since(
+                    workspace_id=w, since_iso=s, conn=conn,
+                ),
+            )
+            if not quota.allowed:
+                raise quota_refusal(quota, workspace_id=wid, endpoint=endpoint,
+                                    user_id=user_id, actor=actor)
+            decision = self._budget.reserve(
+                estimated_cost_usd=None if estimate.unknown else estimate.amount_usd,
+            )
+            if not decision.allowed:
+                raise budget_refusal(
+                    decision, workspace_id=wid, endpoint=endpoint,
+                    render_profile=profile, unknown=bool(estimate.unknown),
+                    user_id=user_id, actor=actor,
+                )
+            reserved[job_id] = float(estimate.amount_usd or 0.0)
+
+        if company_id is not None:
+            job_fields["company_id"] = company_id
+        else:
+            job_fields["workspace_id"] = wid
+        try:
+            job = self.repo.create_job(admission=_admit, **job_fields)
+        except BaseException:
+            # The INSERT (or anything after the reserve) failed: the
+            # transaction rolled back, so give the reservation back.
+            for amount in reserved.values():
+                self._budget.release(amount)
+            raise
+        with self._lock:
+            self._reserved.update(reserved)
+        return job
+
+    # ── Restart recovery (F-30, F-10) ─────────────────────────
+
+    def recover_stale_jobs(self, *, older_than_seconds: Optional[float] = None
+                             ) -> dict:
+        """Requeue-once / fail jobs stuck in ``running`` (see
+        ``Repo.recover_stale_running_jobs``), skipping jobs this runner
+        is executing right now, and record each decision in
+        runner_audit."""
+        if older_than_seconds is None:
+            older_than_seconds = 60.0 * _env_float(
+                STALE_RUNNING_MINUTES_ENV, DEFAULT_STALE_RUNNING_MINUTES,
+            )
+        with self._lock:
+            live = set(self._active_jobs) | set(self._queue)
+        result = self.repo.recover_stale_running_jobs(
+            older_than_seconds=older_than_seconds,
+            max_requeues=MAX_RECOVERY_REQUEUES,
+            exclude_job_ids=live,
+        )
+        from control_plane.repo_helpers import append_runner_audit
+        for jid in result["requeued"]:
+            append_runner_audit(self.repo, job_id=jid, event="job.recovered_requeued",
+                                context={"older_than_seconds": older_than_seconds})
+        for jid in result["failed"]:
+            append_runner_audit(self.repo, job_id=jid, event="job.recovered_failed",
+                                context={"older_than_seconds": older_than_seconds,
+                                         "max_requeues": MAX_RECOVERY_REQUEUES})
+        if result["requeued"] or result["failed"]:
+            _log.warning("restart recovery: requeued=%s failed=%s",
+                         result["requeued"], result["failed"])
+        return result
+
+    def recover_on_startup(self, *, older_than_seconds: Optional[float] = None
+                             ) -> dict:
+        """Process start-up: recover stale ``running`` jobs, then hand
+        every ``queued`` job (including the ones just requeued and the
+        ones that were waiting in the previous process's in-memory
+        queue) back to the scheduler, oldest first (FIFO)."""
+        result = self.recover_stale_jobs(older_than_seconds=older_than_seconds)
+        queued = self.repo.list_queued_job_ids()
+        for jid in queued:
+            self.submit(jid)
+        result["resubmitted"] = queued
+        return result
 
     def set_actor(self, *, user_id: Optional[str] = None,
                    workspace_id: Optional[str] = None) -> None:
@@ -185,33 +393,41 @@ class JobRunner:
             workspace_id=self._actor_workspace_id,
         )
 
+    def _seed_idempotency_store(self) -> IdempotencyStore:
+        """Build the in-memory store the MockRenderer expects, seeded
+        from the durable store (oldest receipt first, then key).
+
+        Runs once, in ``__init__``, before any job thread exists, so
+        every thread of this runner shares the same fully-seeded store
+        (MAJ-5). A seeding failure is not swallowed silently: it is
+        logged and recorded in runner_audit, and the runner continues
+        with whatever was loaded (the durable store stays the source
+        of truth for ``_write_durable``).
+        """
+        inmem = IdempotencyStore()
+        try:
+            for key, receipt in self._idem_store.all_receipts():
+                inmem.save(key, receipt)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("idempotency seed from durable store failed: %s: %s",
+                         type(e).__name__, e)
+            from control_plane.repo_helpers import append_runner_audit
+            append_runner_audit(
+                self.repo, job_id="_system",
+                event="idempotency.seed_failed",
+                context={"error": f"{type(e).__name__}: {e}"},
+            )
+        return inmem
+
     def _idem_for(self, job_id: str) -> IdempotencyStore:
         """Return the in-memory store the MockRenderer expects.
 
-        We seed it from the durable store at construction time so that
-        on retry/restart the renderer sees prior receipts. New submits
-        write to the in-memory store; we mirror the receipt into the
-        durable store as the source of truth.
+        One store per runner, seeded from the durable store in
+        ``__init__`` (see ``_seed_idempotency_store``). New submits
+        write to it; ``_write_durable`` mirrors each receipt into the
+        durable store, the source of truth across restarts.
         """
-        with self._lock:
-            key = f"_idem_inmem_{id(self)}"
-            if key not in self._idem:
-                inmem = IdempotencyStore()
-                # Seed from durable
-                try:
-                    rows = self._idem_store._conn.execute(
-                        "SELECT idem_key, provider_job_id, metadata_json FROM idem_receipts"
-                    ).fetchall()
-                    for k, pid, meta in rows:
-                        inmem.save(k, ProviderSubmitReceipt(
-                            provider_job_id=pid,
-                            accepted_metadata=json.loads(meta) if meta else {},
-                        ))
-                except Exception:
-                    pass
-                self._idem[key] = inmem
-                self._idem_durable_mirror = self._idem_store  # for _write_durable
-            return self._idem[key]
+        return self._idem_inmem
 
     def _write_durable(self, idem_key: str, receipt, *, job_id: str = "") -> None:
         from control_plane.repo_helpers import append_runner_audit
@@ -245,46 +461,95 @@ class JobRunner:
     def submit(self, job_id: str) -> None:
         """Schedule a job. Returns immediately; runs in background.
 
-        The check-then-start is done under ``self._lock`` so two
-        concurrent submits of the same job (e.g. a double-clicked
-        retry) cannot both start a pipeline thread for it.
+        At most ``max_concurrent_jobs`` jobs run at once. A submit
+        beyond the cap is not rejected: the job stays ``queued`` (DB
+        state) and waits in a FIFO queue until a running job finishes.
+        Re-submitting a job that is already queued or running is a
+        no-op (double-clicked retry). Everything is decided under
+        ``self._lock``.
         """
         with self._lock:
-            existing = self._active_jobs.get(job_id)
-            if existing is not None and existing.is_alive():
-                return
-            t = threading.Thread(target=self._run, args=(job_id,), daemon=True,
-                                 name=f"job-{job_id}")
-            self._active_jobs[job_id] = t
-            t.start()
+            if job_id in self._done:
+                return  # already queued or running
+            self._done[job_id] = threading.Event()
+            if len(self._active_jobs) < self.max_concurrent_jobs:
+                self._start_worker_locked(job_id)
+            else:
+                self._queue.append(job_id)
+
+    def _start_worker_locked(self, job_id: str) -> None:
+        t = threading.Thread(target=self._worker, args=(job_id,),
+                             daemon=True, name=f"job-{job_id}")
+        self._active_jobs[job_id] = t
+        t.start()
+
+    def _worker(self, job_id: str) -> None:
+        """Run ``job_id``, then keep draining the FIFO queue on this
+        same thread until it is empty."""
+        me = threading.current_thread()
+        current: Optional[str] = job_id
+        while current is not None:
+            nxt: Optional[str] = None
+            try:
+                self._run(current)
+            except BaseException as e:  # noqa: BLE001
+                # _run handles its own failures; this only fires for a
+                # bug outside its try (e.g. repo unavailable). Never let
+                # it leak the slot.
+                _log.exception("job %s crashed outside _run: %s", current, e)
+            finally:
+                # F-32: the slot is ALWAYS released, even if _run
+                # raised, so the job can be resubmitted later and the
+                # next queued job can start.
+                with self._lock:
+                    self._active_jobs.pop(current, None)
+                    unspent = self._reserved.pop(current, None)
+                    ev = self._done.pop(current, None)
+                    nxt = self._queue.popleft() if self._queue else None
+                    if nxt is not None:
+                        self._active_jobs[nxt] = me
+                        try:
+                            me.name = f"job-{nxt}"
+                        except Exception:  # noqa: BLE001
+                            pass
+                if unspent:
+                    # Admitted but never reached the provider submit
+                    # (e.g. job row vanished): give the budget back.
+                    self._budget.release(unspent)
+                if ev is not None:
+                    ev.set()
+            current = nxt
 
     def wait(self, job_id: str, timeout: Optional[float] = None) -> bool:
-        """Block until the background thread for ``job_id`` finishes.
+        """Block until ``job_id`` has left the runner (finished,
+        failed, or crashed), including any time spent queued.
 
-        Returns True when no pipeline thread for the job is running
-        any more (finished, or never submitted to this runner) and
-        False if ``timeout`` elapsed first. Callers that need a
-        completion signal (graceful shutdown, CLI, tests) use this
-        instead of polling the job row against a wall-clock deadline.
+        Returns True when the job is no longer queued or running in
+        this runner (or was never submitted to it) and False if
+        ``timeout`` elapsed first. Callers that need a completion
+        signal (graceful shutdown, CLI, tests) use this instead of
+        polling the job row against a wall-clock deadline.
         """
         with self._lock:
-            t = self._active_jobs.get(job_id)
-        if t is None:
+            ev = self._done.get(job_id)
+        if ev is None:
             return True
-        t.join(timeout)
-        return not t.is_alive()
+        return ev.wait(timeout)
 
     def wait_all(self, timeout: Optional[float] = None) -> bool:
-        """Block until every pipeline thread started by this runner
-        has finished. ``timeout`` is a total budget in seconds.
-        Returns True when all threads are done."""
+        """Block until every job submitted to this runner (running or
+        queued) has finished. ``timeout`` is a total budget in seconds.
+        Returns True when all are done."""
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._lock:
-            threads = list(self._active_jobs.values())
-        for t in threads:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            t.join(remaining)
-        return not any(t.is_alive() for t in threads)
+        while True:
+            with self._lock:
+                pending = list(self._done.values())
+            if not pending:
+                return True
+            for ev in pending:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                if not ev.wait(remaining):
+                    return False
 
     def _stage_started(self, job_id: str, key: str, ordinal: int) -> tuple[float, str]:
         from core.repo import now_iso
@@ -342,21 +607,35 @@ class JobRunner:
             pack_id = pack_dict["pack_id"]
             idem_key = pack_id  # content-derived key for the receipt
 
-            # Real BudgetGuard preflight before submit. With mock renderer
-            # (amount_usd=0.0, unknown=False) this always passes when a
-            # ceiling > 0 is configured. With live adapters (unknown=True)
-            # it would refuse. Documented in core/budget_enforcer.py.
+            # Budget (BLK-1). A job admitted through
+            # create_job_admitted already reserved its estimate on
+            # self._budget before the API answered; consume that
+            # reservation instead of charging twice. Jobs that reach
+            # the runner any other way (retry, restart recovery,
+            # direct submit) get an atomic reserve here, before the
+            # provider submit. With the mock renderer the estimate is
+            # 0.0 and always fits; an unknown estimate is refused.
             cost_estimate = renderer.estimate(pack=pack_dict)
-            try:
-                preflight_or_block(self._budget, estimated_cost_usd=cost_estimate.amount_usd)
-            except Exception as e:
-                self._stage_done(job_id, "generate_assets", ordinal, start,
-                                 error=f"budget preflight failed: {e}")
-                self.repo.update_job(job_id, state="failed",
-                                      status_message=f"budget preflight: {e}")
-                return
+            with self._lock:
+                reserved = self._reserved.pop(job_id, None)
+            if reserved is None:
+                decision = self._budget.reserve(
+                    estimated_cost_usd=cost_estimate.amount_usd,
+                )
+                if not decision.allowed:
+                    self._stage_done(job_id, "generate_assets", ordinal, start,
+                                     error=f"budget preflight failed: {decision.reason}")
+                    self.repo.update_job(job_id, state="failed",
+                                          status_message=f"budget preflight: {decision.reason}")
+                    return
+                reserved = float(cost_estimate.amount_usd or 0.0)
 
-            submit = renderer.submit(pack=pack_dict, idempotency_key=pack_id)
+            try:
+                submit = renderer.submit(pack=pack_dict, idempotency_key=pack_id)
+            except BaseException:
+                # Provider never accepted the job: nothing was spent.
+                self._budget.release(reserved)
+                raise
             provider_job_id = submit.provider_job_id
             # Mirror the receipt into the durable store so it survives
             # a process restart and the next run can replay.
@@ -368,8 +647,7 @@ class JobRunner:
                 ),
                 job_id=job_id,
             )
-            # Record the actual spend (mock = 0).
-            self._budget.record_spend(cost_estimate.amount_usd or 0.0)
+            # The reservation above IS the recorded spend (mock = 0).
             status = renderer.status(provider_job_id=provider_job_id)
             outputs = renderer.fetch_outputs(provider_job_id=provider_job_id) or status.outputs
             # Materialize mock assets to durable storage under job_id

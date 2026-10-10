@@ -12,11 +12,8 @@ authentication events are not job-scoped.
 """
 from __future__ import annotations
 
-import json
 import logging
 import sys
-import time
-import uuid
 from typing import Any, Dict, Optional
 
 _logger = logging.getLogger("auth.audit_log")
@@ -30,10 +27,6 @@ if not _logger.handlers:
     _logger.propagate = False
 
 
-def _now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 def append(repo, *, event: str, context: Optional[Dict[str, Any]] = None,
             user_id: Optional[str] = None,
             workspace_id: Optional[str] = None,
@@ -43,21 +36,18 @@ def append(repo, *, event: str, context: Optional[Dict[str, Any]] = None,
     `actor` is the denormalized display name (email or
     'operator') that downstream consumers can read without
     joining the users table.
+
+    MAJ-1: delegates to ``Repo.append_audit``, the single writer of
+    the ``audit_log`` table (which logs a warning on a dropped row).
     """
     try:
-        audit_id = f"audlog_{uuid.uuid4().hex[:12]}"
-        repo._conn().execute(
-            "INSERT INTO audit_log(audit_id, event, context_json, user_id, "
-            "workspace_id, actor, created_at) VALUES (?,?,?,?,?,?,?)",
-            (audit_id, event, json.dumps(context or {}), user_id,
-             workspace_id, actor, _now()),
+        repo.append_audit(
+            event=event, context=context or {}, user_id=user_id,
+            workspace_id=workspace_id, actor=actor,
         )
-        repo._conn().commit()
     except Exception as e:
-        # Surface the failure to stderr instead of silently dropping
-        # the row. We do NOT raise — a missed audit row is better
-        # than a missed login — but the operator now sees the
-        # regression (most commonly: migration 004 not applied yet).
+        # Repo.append_audit never raises; this only fires for a
+        # repo object without that method.
         _logger.warning(
             "audit_append dropped row event=%s user=%s workspace=%s err=%s: %s",
             event, user_id, workspace_id, type(e).__name__, e,
@@ -66,21 +56,4 @@ def append(repo, *, event: str, context: Optional[Dict[str, Any]] = None,
 
 def list_for_workspace(repo, *, workspace_id: str, limit: int = 100) -> list[dict]:
     """Return recent audit rows for a workspace (newest first)."""
-    rows = repo._conn().execute(
-        "SELECT audit_id, event, context_json, user_id, workspace_id, "
-        "actor, created_at FROM audit_log WHERE workspace_id=? "
-        "ORDER BY created_at DESC LIMIT ?",
-        (workspace_id, int(limit)),
-    ).fetchall()
-    return [
-        {
-            "audit_id": r[0],
-            "event": r[1],
-            "context": json.loads(r[2]) if r[2] else {},
-            "user_id": r[3],
-            "workspace_id": r[4],
-            "actor": r[5],
-            "created_at": r[6],
-        }
-        for r in rows
-    ]
+    return repo.list_audit(workspace_id=workspace_id, limit=limit)
