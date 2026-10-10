@@ -198,6 +198,15 @@ uuid4 hex is minted.
 | `SENTRY_ENVIRONMENT` | Read natively by the SDK. Suggest `production` / `staging`. |
 | `SENTRY_RELEASE` | Read natively by the SDK. Suggest the image tag or git SHA. |
 
+Values flow through systemd `LoadCredential=` on the production
+host, not through `.env.production` by hand. Drop the credential file
+(`sentry_dsn`, optionally `sentry_environment` and `sentry_release`)
+into the path described in
+[`systemd/secret-distribution.md`](../systemd/secret-distribution.md)
+("Enable Sentry in production") and restart the service. The loader
+skips absent Sentry credentials, so a host that has not opted in ships
+no `SENTRY_*=` lines and Sentry stays uninitialised.
+
 `init_sentry()` options: `traces_sample_rate=0.0` (errors only),
 `send_default_pii=False`, `max_request_body_size="never"`,
 `include_local_variables=False`, `before_send=scrub_event`.
