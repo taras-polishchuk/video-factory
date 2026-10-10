@@ -148,7 +148,11 @@ def _ffmpeg_synthetic_clip(*, out: str, duration: float, width: int,
         "-f", "lavfi", "-i", f"color=c={color}:s={width}x{height}:d={duration}:r=30",
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
         "-vf", f"drawtext=text='{label}':fontcolor=white:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+        # Synthetic placeholder clips: `ultrafast` cuts x264 peak RSS from
+        # ~680 MB to ~225 MB per 1080x1920 clip (measured 2026-10-09) and
+        # runs ~3x faster. Quality is irrelevant for colour-card placeholders.
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
         out,
     ]
     try:
