@@ -1,60 +1,83 @@
-# Caddyfile — Video Factory SaaS production reverse proxy
+# Caddyfile: Video Factory SaaS production reverse proxy (TEMPLATE)
 #
 # Layout
-#   :443 (TLS via DNS-01, no port-80 needed) → api:8000 (FastAPI)
-#                                       └──→ web:3000 (SvelteKit/Node, optional)
+#   :443 (TLS via Cloudflare DNS-01) -> api:8000 (FastAPI) for API paths
+#                                    -> web:3000 (SvelteKit adapter-node) for the rest
+#   :80  -> 308 redirect to https
 #
-# Hardening headers applied to BOTH virtual hosts (api + web).
-# These are tested by test_caddyfile_security_headers_present.
+# This tracked file is a template. Deploy scripts never edit it (A2 F-33).
+#   - scripts/render_caddyfile.py <domain> writes the per-domain copy to
+#     infra/hosts/<domain>/Caddyfile (gitignored); deploy points compose
+#     at it with VIDEO_FACTORY_CADDYFILE.
+#   - Mounted as-is, Caddy fills the domain placeholder from the
+#     VIDEO_FACTORY_DOMAIN env var of the caddy container.
 #
-# Replace `video-factory.example.com` with the real domain when running
-# ./scripts/deploy.sh. The deploy script rewrites this file in place
-# before starting caddy.
+# `dns cloudflare` needs the custom image infra/caddy/Dockerfile; the stock
+# caddy:2 image has no Cloudflare DNS module (A2 F-27).
+#
+# Security headers are checked by tests/test_wave7_deploy.py.
+{
+	# Admin API on loopback only; the container healthcheck reads it.
+	admin 127.0.0.1:2019
+}
 
 # ─── Main virtual host (api + web on same origin) ─────────────
 {$VIDEO_FACTORY_DOMAIN:video-factory.example.com} {
-    # DNS-01 challenge is issued by Caddy's on-demand ACME flow.
-    # No port-80 listener is required. The cloudflare DNS plugin is
-    # configured by setting CLOUDFLARE_API_TOKEN in the caddy
-    # environment before launching it.
-    tls {
-        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
-    }
+	# DNS-01 via the Cloudflare DNS module; no port-80 ACME listener.
+	# CLOUDFLARE_API_TOKEN comes from the caddy container env.
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
 
-    # Forward /api/*, /health*, /metrics*, /openapi.json, /docs,
-    # /redoc, /auth/* to the FastAPI container.
-    @api path /api/* /auth/* /health* /metrics* /openapi.json /docs /redoc
-    reverse_proxy @api api:8000
+	# Prometheus metrics are internal only (staging VF-STG-07).
+	# Scrape from inside the compose network: http://api:8000/metrics
+	@metrics path /metrics /metrics/*
+	handle @metrics {
+		respond 404
+	}
 
-    # Everything else → SvelteKit Node service (production build)
-    reverse_proxy web:3000
+	# FastAPI paths. /readyz was missing before (staging VF-STG-06).
+	@api path /api/* /auth/* /health /healthz /readyz /openapi.json /docs /docs/* /redoc
+	handle @api {
+		# Asset uploads are capped at 50 MB by the API; refuse bigger
+		# bodies here before they reach Python.
+		request_body {
+			max_size 55MB
+		}
+		reverse_proxy api:8000
+	}
 
-    # ─── Security headers (Wave 7 §3.7) ─────────────────────
-    header {
-        # HSTS — 6 months, include subdomains
-        Strict-Transport-Security "max-age=15768000; includeSubDomains"
-        # Anti-clickjacking
-        X-Frame-Options "DENY"
-        # Prevent MIME sniffing
-        X-Content-Type-Options "nosniff"
-        # Referrer policy — never leak full URL
-        Referrer-Policy "strict-origin-when-cross-origin"
-        # Permissions policy — disable unused powerful features
-        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()"
-        # Strip identifying headers from upstream
-        -Server
-        -X-Powered-By
-    }
+	# Everything else -> SvelteKit Node server.
+	handle {
+		reverse_proxy web:3000
+	}
 
-    # Compress JSON / text responses
-    encode zstd gzip
+	# ─── Security headers (Wave 7 §3.7) ─────────────────────
+	header {
+		# HSTS: 6 months, include subdomains
+		Strict-Transport-Security "max-age=15768000; includeSubDomains"
+		# Anti-clickjacking
+		X-Frame-Options "DENY"
+		# Prevent MIME sniffing
+		X-Content-Type-Options "nosniff"
+		# Referrer policy: never leak the full URL
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Permissions policy: disable unused powerful features
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()"
+		# Strip identifying headers from upstream
+		-Server
+		-X-Powered-By
+	}
 
-    # Forward the real Host to upstream so the FastAPI app sees the
-    # public domain (used for OIDC redirect_uri construction).
-    header_up Host {host}
+	# Compress JSON / text responses
+	encode zstd gzip
+
+	# reverse_proxy passes the client Host header through unchanged, so
+	# the API sees the public domain (OIDC redirect_uri). The old
+	# site-level `header_up Host {host}` line was invalid Caddyfile syntax.
 }
 
-# ─── Optional: bare-domain redirect ───────────────────────────
+# ─── Plain HTTP: redirect to HTTPS ────────────────────────────
 http://{$VIDEO_FACTORY_DOMAIN:video-factory.example.com} {
-    redir https://{host}{uri} 308
+	redir https://{host}{uri} 308
 }
