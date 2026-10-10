@@ -316,7 +316,7 @@ def create_app(*, repo: Optional[Repo] = None,
                 # E1: email transport status never affects readiness, but
                 # an operator probing /readyz wants to know if the mailer
                 # can deliver verification / reset links.
-                "info": {"email": mailer.status().get("email", "not_configured")},
+                "info": mailer.status(),
             },
             status_code=200 if ready else 503,
         )
