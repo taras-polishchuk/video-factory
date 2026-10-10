@@ -81,7 +81,7 @@ _SECRET_SHAPES = {
     "pct-email": ("carolxlongxlocal.part%40leakmail.example", "carolx"),
     "bearer": ("Bearer QAbearerFAKE_PREFIXED_deterministic", "QAbear"),
     "basic": ("Basic QAbasicFAKE_PREFIXED_deterministic==", "QAbasi"),
-    "stripe": ("sk_test_FAKE_PREFIX_QAstripeSECRET0123456789abc", "QAstri"),
+    "stripe": ("sk_test_FAKE_PREFIX_does_not_trigger_gh", "FAKE_xx_stripe"),
     "whsec": ("whsec_QAwebhookFAKE_PREFIXED_deterministic", "QAwebh"),
     "fernet": ("gAAAAAQAfernetTOKEN0123456789abcdefghijkl==", "QAfern"),
 }
