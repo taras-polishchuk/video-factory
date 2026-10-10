@@ -13,6 +13,9 @@ Three drifts this guards against:
 The scan is static (ast), so lazily imported and function-local imports
 count, and nothing is executed. pkgutil finds the first-party packages,
 importlib.metadata maps import names to distributions.
+
+Python files under scripts/ are operator tooling, not the running API:
+their third-party imports may be satisfied by the dev extra as well.
 """
 
 from __future__ import annotations
@@ -102,14 +105,18 @@ def _runtime_names() -> set[str]:
     return {_requirement_name(s) for s in _runtime_specs()}
 
 
-def _optional_names() -> set[str]:
+def _extra_names(*, include_dev: bool) -> set[str]:
     extras = _pyproject()["project"].get("optional-dependencies", {})
     return {
         _requirement_name(s)
         for group, specs in extras.items()
-        if group != "dev"
+        if include_dev or group != "dev"
         for s in specs
     }
+
+
+def _optional_names() -> set[str]:
+    return _extra_names(include_dev=False)
 
 
 def _source_roots() -> list[Path]:
@@ -149,17 +156,50 @@ def _imported_top_level(path: Path) -> set[str]:
     return found
 
 
+def _is_tooling(path: Path) -> bool:
+    return path.relative_to(ROOT).parts[0] == "scripts"
+
+
 @functools.lru_cache(maxsize=None)
-def _third_party_imports() -> dict[str, list[str]]:
+def _third_party_imports(*, tooling: bool = False) -> dict[str, list[str]]:
+    """module -> files. tooling=False: the running code; True: scripts/."""
     stdlib = set(sys.stdlib_module_names)
     first_party = _first_party_names()
     found: dict[str, list[str]] = {}
     for path in _source_files():
+        if _is_tooling(path) != tooling:
+            continue
         for mod in _imported_top_level(path):
             if mod in stdlib or mod in first_party:
                 continue
             found.setdefault(mod, []).append(str(path.relative_to(ROOT)))
     return found
+
+
+def _used_distributions() -> set[str]:
+    used: set[str] = set()
+    for tooling in (False, True):
+        for module in _third_party_imports(tooling=tooling):
+            used |= _distributions_for(module)
+    return used
+
+
+def _undeclared(imports: dict[str, list[str]], declared: set[str]) -> list[str]:
+    missing: list[str] = []
+    for module, files in sorted(imports.items()):
+        dists = _distributions_for(module)
+        if not dists:
+            missing.append(
+                f"{module} (imported by {files[0]}): not installed here, so it "
+                "cannot be mapped to a distribution; install the project "
+                "dependencies and declare it in pyproject.toml"
+            )
+        elif not dists & declared:
+            missing.append(
+                f"{module} (imported by {files[0]}): distribution "
+                f"{sorted(dists)} is not declared in pyproject.toml"
+            )
+    return missing
 
 
 @functools.lru_cache(maxsize=None)
@@ -183,27 +223,21 @@ def test_scan_finds_the_code_under_test() -> None:
 
 def test_every_third_party_import_is_a_declared_dependency() -> None:
     declared = _runtime_names() | _optional_names()
-    missing: list[str] = []
-    for module, files in sorted(_third_party_imports().items()):
-        dists = _distributions_for(module)
-        if not dists:
-            missing.append(
-                f"{module} (imported by {files[0]}): not installed here, so it "
-                "cannot be mapped to a distribution; install the project "
-                "dependencies and declare it in pyproject.toml"
-            )
-        elif not dists & declared:
-            missing.append(
-                f"{module} (imported by {files[0]}): distribution "
-                f"{sorted(dists)} is not declared in pyproject.toml"
-            )
+    missing = _undeclared(_third_party_imports(), declared)
     assert not missing, "undeclared third-party imports:\n  " + "\n  ".join(missing)
 
 
+def test_scripts_third_party_imports_are_declared_somewhere() -> None:
+    declared = _runtime_names() | _extra_names(include_dev=True)
+    missing = _undeclared(_third_party_imports(tooling=True), declared)
+    assert not missing, (
+        "scripts/ imports packages pyproject does not declare (runtime or dev):\n  "
+        + "\n  ".join(missing)
+    )
+
+
 def test_every_declared_runtime_dependency_is_used() -> None:
-    used: set[str] = set()
-    for module in _third_party_imports():
-        used |= _distributions_for(module)
+    used = _used_distributions()
     unused = sorted(
         name
         for name in _runtime_names()
@@ -220,9 +254,7 @@ def test_not_imported_allowlist_has_no_stale_entries() -> None:
     declared = _runtime_names()
     stale = sorted(n for n in DECLARED_BUT_NOT_IMPORTED if n not in declared)
     assert not stale, f"allowlisted but no longer declared: {stale}"
-    used: set[str] = set()
-    for module in _third_party_imports():
-        used |= _distributions_for(module)
+    used = _used_distributions()
     now_imported = sorted(n for n in DECLARED_BUT_NOT_IMPORTED if n in used)
     assert not now_imported, (
         f"{now_imported} are imported now; remove them from DECLARED_BUT_NOT_IMPORTED"
