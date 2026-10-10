@@ -1957,12 +1957,16 @@ class Repo:
                          workspace_id: Optional[str] = None,
                          state: Optional[str] = None,
                          limit: Optional[int] = None,
-                         cursor: Optional[str] = None
+                         cursor: Optional[str] = None,
+                         workspace_ids: Optional[Iterable[str]] = None,
                          ) -> tuple[list[dict], Optional[str]]:
         """Keyset page of jobs, newest first (MAJ-4).
 
         Returns ``(items, next_cursor)``; ``next_cursor`` is None on
-        the last page. See core/pagination.py.
+        the last page. See core/pagination.py. ``workspace_ids``
+        restricts the page to a set of workspaces (e.g. every
+        workspace the caller is a member of); an empty set yields an
+        empty page.
         """
         from core.pagination import clamp_limit, keyset_page
         wid = workspace_id if workspace_id is not None else company_id
@@ -1970,6 +1974,12 @@ class Repo:
         if wid:
             where += " AND workspace_id=?"
             params.append(wid)
+        if workspace_ids is not None:
+            ids = sorted(set(workspace_ids))
+            if not ids:
+                return [], None
+            where += f" AND workspace_id IN ({','.join('?' * len(ids))})"
+            params.extend(ids)
         if state:
             where += " AND state=?"
             params.append(state)
