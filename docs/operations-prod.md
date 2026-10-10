@@ -311,3 +311,35 @@ HeyGen webhook replays: every accepted signed body is recorded in
 `webhook_receipts` (SHA-256 of the body, kept
 `HEYGEN_WEBHOOK_DEDUP_DAYS`, default 30). A byte-identical resend gets
 `200 {"duplicate": true}` and changes nothing.
+
+---
+
+## Platform-admin allow-list (VIDEO_FACTORY_PLATFORM_ADMINS)
+
+`POST /api/v1/admin/keys/rotate` and `GET /api/v1/admin/keys/status`
+are gated on a server-side allow-list, independent of the
+workspace-level `owner` / `admin` role. The gate reads
+`VIDEO_FACTORY_PLATFORM_ADMINS` (a list of comma-separated user ids)
+and runs BEFORE CSRF and the role check, so it also 403s an
+authenticated caller who is not on the list.
+
+The list is intentionally tiny and operator-controlled. Granting a
+user platform-admin rights is a manual operator action: append their
+`uid` (comma-separated) to `VIDEO_FACTORY_PLATFORM_ADMINS` in
+`/etc/video-factory/credentials/`, then restart
+`video-factory.service`. The platform-admin role is never granted
+through the UI, the database, or any other endpoint.
+
+The S1b env-parity fixture in `tests/test_security_s1b.py` references
+the exact name `VIDEO_FACTORY_PLATFORM_ADMINS` (see the `_ENV_TO_CLEAR`
+list at the top of the file); a typo or rename in this file, in
+`.env.example`, or in `api/admin_keys.py` will surface immediately as
+a test failure.
+
+```bash
+# Grant one operator platform-admin rights
+sudo install -m 0600 /dev/null /etc/video-factory/credentials/video_factory_platform_admins
+echo "uid_abc123,uid_def456" \
+  | sudo tee /etc/video-factory/credentials/video_factory_platform_admins
+sudo systemctl restart video-factory.service
+```
