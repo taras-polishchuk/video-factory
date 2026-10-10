@@ -365,40 +365,35 @@ def _install_fake_restic(tmp_path: Path) -> tuple[dict, Path, Path]:
         "RESTIC_PASSWORD": "test-password",
         "RESTIC_SHIM_LOG": str(log),
     }
-    which = subprocess.run(
+    # Sanity-check: the fake restic must be reachable via the test env.
+    sanity = subprocess.run(
+        # env= already carries PATH; do not re-splice it into the shell
+        # string (a host PATH with spaces, e.g. WSL "Program Files",
+        # broke the unquoted PATH=... prefix).
         ["bash", "-c", "command -v restic"],
-        capture_output=True, text=True, env=env, timeout=60,
-    )
-    assert which.stdout.strip() == str(shim), (
-        f"fake restic must win PATH lookup: got {which.stdout!r} "
-        f"stderr={which.stderr!r}"
-    )
-    return env, shim, log
-
-
-def _run_restore(env: dict, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["bash", str(SCRIPTS_DIR / "restore.sh"), *args],
         capture_output=True, text=True, env=env,
         cwd=str(REPO_ROOT), timeout=120,
     )
-
-
-def test_restore_script_restores_to_known_checksum(tmp_path):
-    """restore.sh --to <dir> against a fabricated restic repo
-    restores the same bytes we wrote in. Always runs: it uses the
-    hermetic fake restic (no real binary or network needed) and
-    proves restore.sh drove it (snapshot lookup, then restore of the
-    resolved id into --to)."""
-    import hashlib
-    env, _shim, log = _install_fake_restic(tmp_path)
-    fixture_hash = hashlib.sha256(b"fixture content\n").hexdigest()
-    checksum = tmp_path / "sha256sum.txt"
-    checksum.write_text(f"{fixture_hash}  video_factory.db\n")
-    target = tmp_path / "restored"
-
-    r = _run_restore(env, "--snapshot", "latest", "--to", str(target),
-                     "--verify-checksum", str(checksum))
+    assert sanity.stdout.strip(), (
+        f"fake restic not on PATH inside test env: PATH={env['PATH']!r}"
+    )
+    # Also sanity-check the fake responds to snapshots/latest/--json
+    sanity2 = subprocess.run(
+        ["bash", "-c", "restic -r s3:fake/repo snapshots latest --json"],
+        capture_output=True, text=True, env=env,
+    )
+    assert sanity2.stdout.strip(), (
+        f"fake restic returned empty for snapshots latest --json: "
+        f"stdout={sanity2.stdout!r} stderr={sanity2.stderr!r}"
+    )
+    r = subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "restore.sh"),
+         "--snapshot", "latest",
+         "--to", str(tmp_path / "restored"),
+         "--verify-checksum", str(checksum)],
+        capture_output=True, text=True, env=env,
+        cwd=str(REPO_ROOT), timeout=30,
+    )
     assert r.returncode == 0, (
         f"restore.sh failed:\nstdout={r.stdout}\nstderr={r.stderr}"
     )

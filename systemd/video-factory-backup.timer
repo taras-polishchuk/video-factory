@@ -1,0 +1,12 @@
+# Daily backup at ~03:30 UTC (randomised by up to 30 min). Persistent:
+# a run missed while the host was off happens at the next boot.
+[Unit]
+Description=Daily Video Factory backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
