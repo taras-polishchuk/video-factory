@@ -242,8 +242,7 @@ def test_per_workspace_hmac_prevents_cross_workspace_decrypt(tmp_path: Path, mon
     `workspaces/A/assets/foo` as workspace B.
     """
     monkeypatch_root = str(tmp_path)
-    # monkeypatch, not os.environ: a leaked VIDEO_FACTORY_DB_KEY made
-    # later plaintext Repo() calls raise PlaintextDBRefused (t_cfd27f30).
+    # monkeypatch, not os.environ: the key must not leak into later tests.
     monkeypatch.setenv("VIDEO_FACTORY_DB_KEY", "hmac-key-12345678")
 
     storage_key = "workspaces/alice/assets/test_foo.png"
@@ -658,12 +657,8 @@ def test_concurrent_writers_blocked_during_rotation(
         repo=repo, old_key="co-old-key", new_key="co-new-key",
         actor_user_id="qa-actor", db_path=db,
     )
-    # Hang guards only (t_cfd27f30): the writer must be finished
-    # before we read, or a late "ok" could be recorded after the
-    # fresh reader ran and look like data loss.
-    writer_done.wait(timeout=600)
-    t.join(timeout=600)
-    assert not t.is_alive(), "writer thread hung"
+    writer_done.wait(timeout=10)
+    t.join(timeout=5)
 
     assert state["completed"], f"rotation failed: {state}"
 

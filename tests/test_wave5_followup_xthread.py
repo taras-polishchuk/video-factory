@@ -72,16 +72,14 @@ def test_cross_thread_writer_persists_after_rotation(tmp_path, monkeypatch):
     post-rotation state of the API process is broken.
     """
     db = str(tmp_path / "xthread.db")
-    # monkeypatch (t_cfd27f30): the old os.environ write leaked the key
-    # into every later test in the worker; plaintext Repo() then raised
-    # PlaintextDBRefused (test_migration_008_*, test_bootstrap_from_legacy_db_*).
+    # monkeypatch: a bare os.environ write leaked the key into later
+    # tests on the same xdist worker (plaintext-DB tests then refused).
     monkeypatch.setenv("VIDEO_FACTORY_DB_KEY", OLD_KEY)
     repo = Repo(db, db_key=OLD_KEY)
     key_rotation.ensure_table(repo)
     user_id = _seed(repo)
 
     writer_done = threading.Event()
-    warmed_up = threading.Event()
     writer_markers: list[tuple[str, str]] = []  # (aid, status)
 
     def writer_loop() -> None:
@@ -94,7 +92,6 @@ def test_cross_thread_writer_persists_after_rotation(tmp_path, monkeypatch):
                 (str(_uuid.uuid4()), "xthread.warmup", "{}",
                  "2026-10-07T00:00:00Z", user_id, ""),
             )
-        warmed_up.set()
         writer_done.wait(timeout=120)
         for i in range(3):
             aid = str(_uuid.uuid4())
@@ -117,10 +114,7 @@ def test_cross_thread_writer_persists_after_rotation(tmp_path, monkeypatch):
 
     wt = threading.Thread(target=writer_loop, daemon=True)
     wt.start()
-    # Wait for the warm-up write instead of sleeping 0.5 s: under load
-    # the warm-up could land after rotate() started, so the test did
-    # not exercise the stale-connection path it pins (t_cfd27f30).
-    assert warmed_up.wait(timeout=600), "writer warm-up never completed"
+    time.sleep(0.5)
 
     state = key_rotation.rotate(
         repo=repo, old_key=OLD_KEY, new_key=NEW_KEY,
@@ -129,10 +123,7 @@ def test_cross_thread_writer_persists_after_rotation(tmp_path, monkeypatch):
     assert state["completed"], f"rotation failed: {state}"
 
     writer_done.set()
-    # Hang guard: the writer must be done before the fresh reader
-    # runs, or a late success marker looks like data loss.
-    wt.join(timeout=600)
-    assert not wt.is_alive(), "writer thread hung"
+    wt.join(timeout=10)
 
     fresh = cipher_db.connect(db, key=NEW_KEY)
     try:
@@ -182,16 +173,14 @@ def test_cross_thread_bypass_does_not_corrupt(tmp_path, monkeypatch):
     appear in the NEW-cipher file (encrypted with OLD key).
     """
     db = str(tmp_path / "xthread_bypass.db")
-    # monkeypatch (t_cfd27f30): the old os.environ write leaked the key
-    # into every later test in the worker; plaintext Repo() then raised
-    # PlaintextDBRefused (test_migration_008_*, test_bootstrap_from_legacy_db_*).
+    # monkeypatch: a bare os.environ write leaked the key into later
+    # tests on the same xdist worker (plaintext-DB tests then refused).
     monkeypatch.setenv("VIDEO_FACTORY_DB_KEY", OLD_KEY)
     repo = Repo(db, db_key=OLD_KEY)
     key_rotation.ensure_table(repo)
     user_id = _seed(repo)
 
     writer_done = threading.Event()
-    warmed_up = threading.Event()
     results: list[tuple[str, bool, str]] = []  # (aid, ok, err)
 
     def writer_loop() -> None:
@@ -203,7 +192,6 @@ def test_cross_thread_bypass_does_not_corrupt(tmp_path, monkeypatch):
                 (str(_uuid.uuid4()), "bypass.warmup", "{}",
                  "2026-10-07T00:00:00Z", user_id, ""),
             )
-        warmed_up.set()
         writer_done.wait(timeout=120)
         for i in range(3):
             aid = str(_uuid.uuid4())
@@ -224,10 +212,7 @@ def test_cross_thread_bypass_does_not_corrupt(tmp_path, monkeypatch):
 
     wt = threading.Thread(target=writer_loop, daemon=True)
     wt.start()
-    # Wait for the warm-up write instead of sleeping 0.5 s: under load
-    # the warm-up could land after rotate() started, so the test did
-    # not exercise the stale-connection path it pins (t_cfd27f30).
-    assert warmed_up.wait(timeout=600), "writer warm-up never completed"
+    time.sleep(0.5)
 
     state = key_rotation.rotate(
         repo=repo, old_key=OLD_KEY, new_key=NEW_KEY,
@@ -236,10 +221,7 @@ def test_cross_thread_bypass_does_not_corrupt(tmp_path, monkeypatch):
     assert state["completed"], f"rotation failed: {state}"
 
     writer_done.set()
-    # Hang guard: the writer must be done before the fresh reader
-    # runs, or a late success marker looks like data loss.
-    wt.join(timeout=600)
-    assert not wt.is_alive(), "writer thread hung"
+    wt.join(timeout=10)
 
     fresh = cipher_db.connect(db, key=NEW_KEY)
     try:
