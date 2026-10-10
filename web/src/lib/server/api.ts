@@ -79,27 +79,17 @@ export async function api_request<T = unknown>(
 // returns the parsed body and accepts the raw session cookie so
 // the caller never has to think about cookie mechanics.
 
+// Note (QA-S1b-07): the four pre-login wrappers (signup/login/
+// forgot/verify) were removed. They were unused on the Svelte side
+// (only `api_request` is called directly via auth-cookies.ts for the
+// post-login paths) and they did not forward an upstream Origin, which
+// would have surfaced as 403 `origin_missing` in production.
+
 export const Auth = {
-	signup: (body: { email: string; password: string; workspace_name: string }) =>
-		api_request<{ user: { user_id: string; email: string }; workspace_id: string }>(
-			"/auth/signup", { method: "POST", body },
-		),
-	login: (body: { email: string; password: string }) =>
-		api_request<{ user: { user_id: string; email: string }; workspace_id: string; workspace_slug: string }>(
-			"/auth/login", { method: "POST", body },
-		),
 	logout: (cookie: string) =>
 		api_request<{ ok: true }>("/auth/logout", {
 			method: "POST", cookie,
 			headers: { "x-csrf-token": csrf_for_cookie(cookie) },
-		}),
-	forgot: (email: string) =>
-		api_request<{ ok: true }>("/auth/forgot", {
-			method: "POST", body: { email },
-		}),
-	verify: (token: string) =>
-		api_request<{ ok: true; email_verified: true }>("/auth/verify", {
-			method: "POST", body: { token },
 		}),
 	me: (cookie: string) =>
 		api_request<{
