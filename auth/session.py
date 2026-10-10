@@ -27,6 +27,11 @@ Secret:
 - Read from `VIDEO_FACTORY_SESSION_SECRET`. If absent the auth
   endpoints return 503; the rest of the API works as before
   (no auth) so that dev / single-tenant installs still function.
+- Rotation (S1b / A1 F29): `VIDEO_FACTORY_SESSION_SECRET_PREVIOUS`
+  (one value or a comma-separated list) is accepted for
+  VERIFICATION ONLY. New CSRF tokens are always derived from the
+  current secret. See docs/operations-prod.md "Session secret
+  rotation".
 """
 from __future__ import annotations
 
@@ -59,6 +64,28 @@ def _session_secret() -> bytes:
     return raw.encode("utf-8")
 
 
+def _previous_session_secrets() -> list[bytes]:
+    """Secrets that still VERIFY (never sign) during a rotation.
+
+    ``VIDEO_FACTORY_SESSION_SECRET_PREVIOUS`` may hold one value or a
+    comma-separated list. Empty entries and an entry equal to the
+    current secret are ignored.
+    """
+    raw = os.environ.get("VIDEO_FACTORY_SESSION_SECRET_PREVIOUS", "")
+    current = os.environ.get("VIDEO_FACTORY_SESSION_SECRET", "").strip()
+    out: list[bytes] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if p and p != current:
+            out.append(p.encode("utf-8"))
+    return out
+
+
+def _verification_secrets() -> list[bytes]:
+    """Current secret first, then the verify-only previous ones."""
+    return [_session_secret(), *_previous_session_secrets()]
+
+
 def new_session_id() -> str:
     """Return a fresh opaque session id (URL-safe, 32 bytes)."""
     return secrets.token_urlsafe(32)
@@ -77,11 +104,56 @@ def derive_csrf_token(session_id: str) -> str:
 
 
 def verify_csrf_token(session_id: str, presented: str) -> bool:
-    """Constant-time comparison of the presented CSRF token."""
+    """Constant-time comparison of the presented CSRF token.
+
+    Accepts a token derived from the current secret or from any
+    ``VIDEO_FACTORY_SESSION_SECRET_PREVIOUS`` entry (rotation window).
+    """
     if not presented or not session_id:
         return False
-    expected = derive_csrf_token(session_id)
-    return hmac.compare_digest(expected, presented)
+    ok = False
+    pres = presented.encode("utf-8", "surrogatepass")
+    for secret in _verification_secrets():
+        expected = hmac.new(secret, session_id.encode("utf-8"),
+                            hashlib.sha256).hexdigest().encode("ascii")
+        # No early exit: every candidate is compared.
+        ok = hmac.compare_digest(expected, pres) or ok
+    return ok
+
+
+# Server-to-server marker for the SvelteKit server (S1b / A1 F5, F7).
+# The web server holds VIDEO_FACTORY_SESSION_SECRET already (it derives
+# CSRF tokens for logout / workspace switch); it sends this value in
+# ``X-VF-Internal-Token`` on its calls to the pre-session /auth/*
+# routes so the API's Origin check can tell them apart from a
+# cross-site browser POST. A browser cannot compute it without the
+# secret, and a cross-origin request carrying a custom header needs a
+# CORS preflight the API never grants.
+INTERNAL_TOKEN_HEADER = "X-VF-Internal-Token"
+_INTERNAL_TOKEN_LABEL = b"vf-internal-caller:v1"
+
+
+def derive_internal_token() -> str:
+    """Return the internal-caller token for the CURRENT secret."""
+    return hmac.new(_session_secret(), _INTERNAL_TOKEN_LABEL,
+                    hashlib.sha256).hexdigest()
+
+
+def verify_internal_token(presented: Optional[str]) -> bool:
+    """True iff ``presented`` matches the current or a previous secret."""
+    if not presented:
+        return False
+    try:
+        secrets_ = _verification_secrets()
+    except SessionSecretMissing:
+        return False
+    ok = False
+    pres = presented.strip().encode("utf-8", "surrogatepass")
+    for secret in secrets_:
+        expected = hmac.new(secret, _INTERNAL_TOKEN_LABEL,
+                            hashlib.sha256).hexdigest().encode("ascii")
+        ok = hmac.compare_digest(expected, pres) or ok
+    return ok
 
 
 def expires_at_iso(ttl_seconds: int = DEFAULT_TTL_SECONDS) -> str:
@@ -154,14 +226,40 @@ def is_production() -> bool:
     return os.environ.get("VIDEO_FACTORY_ENV", "").strip().lower() == "production"
 
 
-def should_use_secure_cookies() -> bool:
+def is_deployed_env() -> bool:
+    """True for ``VIDEO_FACTORY_ENV`` = production / prod / staging.
+
+    Deployed environments get the strict defaults (Secure cookies,
+    Origin required on pre-session auth routes).
+    """
+    env = os.environ.get("VIDEO_FACTORY_ENV", "").strip().lower()
+    return env in ("production", "prod", "staging")
+
+
+def should_use_secure_cookies(request=None) -> bool:
     """Resolve whether to set Secure on the session cookie.
 
-    True if `VF_HTTPS=1` (production signal) or
-    `VIDEO_FACTORY_ENV=production`. Otherwise False.
+    A2 F-05: Secure by default whenever
+
+    - ``VF_HTTPS=1``, or
+    - ``VIDEO_FACTORY_ENV`` is production / prod / staging, or
+    - the request itself arrived over HTTPS (``request.url.scheme``,
+      which uvicorn ``--proxy-headers`` derives from a trusted
+      ``X-Forwarded-Proto``).
+
+    Only plain-HTTP local dev / tests get a non-Secure cookie.
     """
     if os.environ.get("VF_HTTPS", "").strip() == "1":
         return True
-    if is_production():
+    if is_deployed_env():
         return True
+    if request is not None:
+        try:
+            if request.url.scheme == "https":
+                return True
+            from auth.client_ip import forwarded_https
+            if forwarded_https(request):
+                return True
+        except Exception:  # noqa: BLE001 - malformed scope: fall through
+            pass
     return False

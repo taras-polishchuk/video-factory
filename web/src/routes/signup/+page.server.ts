@@ -8,6 +8,7 @@
 import { fail, redirect } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
 import { env } from "$env/dynamic/private";
+import { upstream_headers } from "$lib/server/upstream";
 import { set_session_cookie } from "$lib/server/auth-cookies";
 
 const API_BASE = env.VIDEO_FACTORY_API_URL || "http://127.0.0.1:8000";
@@ -40,7 +41,7 @@ export const actions: Actions = {
 		try {
 			const r = await fetch(API_BASE + "/auth/signup", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", ...upstream_headers() },
 				body: JSON.stringify({ email, password, workspace_name }),
 			});
 			if (!r.ok) {

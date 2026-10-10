@@ -190,6 +190,12 @@ def require_csrf(request: Request,
     """Verify the X-CSRF-Token header for state-changing requests.
 
     Endpoints that need this should declare it as a dependency.
+
+    S1b / A1 F9: the session behind the cookie must also still be
+    LIVE. An expired row (not yet GC'd) is deleted and refused with
+    401, exactly like ``get_current_user``; a revoked session (row
+    deleted by logout / password reset / login rotation) has no row
+    and is refused with 401; a locked or deleted user is refused too.
     """
     repo = request.app.state.repo
     session_id = _read_cookie(request)
@@ -198,5 +204,19 @@ def require_csrf(request: Request,
     sess = _load_session(repo, session_id)
     if not sess:
         raise HTTPException(401, "invalid session")
+    if is_expired(sess["expires_at"]):
+        try:
+            repo._conn().execute(
+                "DELETE FROM sessions WHERE session_id=?", (session_id,)
+            )
+            repo._conn().commit()
+        except Exception:
+            pass
+        raise HTTPException(401, "session expired")
+    user = _load_user(repo, sess["user_id"])
+    if not user:
+        raise HTTPException(401, "user not found")
+    if user["status"] == "locked":
+        raise HTTPException(423, "user is locked")
     if not x_csrf_token or not verify_csrf_token(session_id, x_csrf_token):
         raise HTTPException(403, "invalid CSRF token")
