@@ -98,6 +98,23 @@ def _dev_expose_tokens() -> bool:
     return env not in ("production", "prod", "staging")
 
 
+def _str_or_400(payload: dict, field: str, *, max_len: int = 512) -> str:
+    """Pull a string field; reject non-string with 400.
+
+    S1b-FU4 defect 1: ``(payload.get("email") or "").strip()`` crashed
+    with 500 on a non-string body (``.strip()`` on int / list / dict).
+    Centralise the type guard so every auth route answers 400 with a
+    fixed message instead.
+    """
+    raw = payload.get(field)
+    if not isinstance(raw, str):
+        raise HTTPException(400, f"{field} must be a string")
+    out = raw.strip()
+    if len(out) > max_len:
+        raise HTTPException(400, f"{field} too long")
+    return out
+
+
 def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
     """Build the /auth/* router bound to the given repo.
 
@@ -159,8 +176,8 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
         except Exception:
             pass
         _require_secret()
-        email = (payload.get("email") or "").strip()
-        password = payload.get("password") or ""
+        email = _str_or_400(payload, "email")
+        password = _str_or_400(payload, "password")
         workspace_name = (payload.get("workspace_name") or "").strip()
         if not _EMAIL_RE.match(email):
             raise HTTPException(400, "invalid email")
@@ -280,8 +297,8 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
         from auth.origin import require_trusted_origin as _rto
         _rto(request)
         _require_secret()
-        email = (payload.get("email") or "").strip()
-        password = payload.get("password") or ""
+        email = _str_or_400(payload, "email")
+        password = _str_or_400(payload, "password")
         if not email or not password:
             raise HTTPException(400, "email and password required")
         ip = _client_ip(request)
@@ -392,7 +409,7 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
             if not _d1.allowed:
                 raise HTTPException(429, "too many requests",
                     headers={"Retry-After": str(int(_d1.window_seconds))})
-            _email_pre = (payload.get("email") or "").strip().lower()
+            _email_pre = _str_or_400(payload, "email").lower()
             if _email_pre:
                 _d2 = _hit(repo, bucket="forgot_email", key=email_key(_email_pre))
                 if not _d2.allowed:
@@ -403,7 +420,7 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
         except Exception:
             pass
         # Always 200 to prevent email enumeration.
-        email = (payload.get("email") or "").strip().lower()
+        email = _str_or_400(payload, "email").lower()
         ip = _client_ip(request)
         token_value = None
         if email:
@@ -732,7 +749,7 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
         m = repo.get_membership(ctx.user_id, workspace_id)
         if not m or not has_min_role(m["role"], "admin"):
             raise HTTPException(403, "requires admin role on this workspace")
-        email = (payload.get("email") or "").strip().lower()
+        email = _str_or_400(payload, "email").lower()
         role = (payload.get("role") or "").strip()
         if not email or role not in ("admin", "editor", "viewer"):
             raise HTTPException(400, "email and role (admin|editor|viewer) required")
