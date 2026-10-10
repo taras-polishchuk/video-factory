@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from assembly.ffmpeg_safe import (
+    CONCAT_INPUT_GUARD,
     drawtext_from_file,
     write_concat_list,
     write_text_file,
@@ -208,7 +209,7 @@ def _ffmpeg_concat(*, concat: str, out: str, width: int, height: int,
                    duration: int) -> bool:
     cmd = [
         # Safe mode (default): the list only holds relative portable names.
-        "ffmpeg", "-y", "-f", "concat", "-i", concat,
+        "ffmpeg", "-y", *CONCAT_INPUT_GUARD, "-f", "concat", "-i", concat,
         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
         "-an", out,

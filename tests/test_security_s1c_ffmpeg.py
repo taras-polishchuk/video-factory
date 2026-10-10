@@ -225,6 +225,52 @@ def test_stitch_concat_list_ignores_hostile_ref_names(monkeypatch, tmp_path):
         assert call["listed_bytes"][name] == storage.get(ref)
     for arg in call["cmd"]:
         assert "it's" not in arg and "evil" not in arg and "\n" not in arg
+    # Untrusted inputs are opened file-only with a container allow-list.
+    cmd = call["cmd"]
+    i_concat = cmd.index("concat")
+    assert cmd[cmd.index("-protocol_whitelist") + 1] == "file"
+    assert cmd.index("-protocol_whitelist") < i_concat
+    audio_i = [i for i, a in enumerate(cmd) if a == "-i"][1]
+    assert Path(cmd[audio_i + 1]).name == "audio.m4a"
+    assert "-protocol_whitelist" in cmd[i_concat:audio_i]
+
+
+def test_stitch_forces_allow_listed_suffixes(monkeypatch, tmp_path):
+    """A provider-named ``x.m3u8`` must not reach ffmpeg as .m3u8 (HLS)."""
+    from assembly import ffmpeg_assembler as fa
+    from control_plane.storage import LocalDiskStorage
+    storage = LocalDiskStorage(str(tmp_path / "st"))
+    refs = ["comfy_cloud/j/evil.m3u8", "comfy_cloud/j/ok.WEBM", "comfy_cloud/j/noext",
+            "comfy_cloud/j/pic.png"]
+    for ref in refs:
+        storage.put(key=ref, data=b"#EXTM3U\n", mime_type="video/mp4")
+    storage.put(key="a/voice.m3u8", data=b"#EXTM3U\n", mime_type="audio/mp4")
+    seen: list = []
+    monkeypatch.setattr(fa.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(fa.subprocess, "check_call", _fake_ffmpeg_writing_output(seen))
+    monkeypatch.setattr(fa, "qc_outputs", lambda **kw: fa.QCResult(True, {}, []))
+    fa.stitch_scene_clips(storage=storage, clip_refs=refs, output_ref="o/s.mp4",
+                          target_duration_seconds=3, audio_ref="a/voice.m3u8")
+    (call,) = seen
+    names = re.findall(r"file '([^']+)'", call["concat_text"])
+    assert names == ["clip_0001.mp4", "clip_0002.webm", "clip_0003.mp4", "clip_0004.mp4"]
+    assert not any(a.endswith(".m3u8") for a in call["cmd"])
+
+
+def test_ffprobe_is_file_protocol_only(monkeypatch, tmp_path):
+    from assembly import ffmpeg_assembler as fa
+    seen = {}
+
+    def fake(cmd, **kw):
+        seen["cmd"] = list(cmd)
+        return b"{}"
+
+    monkeypatch.setattr(fa.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(fa.subprocess, "check_output", fake)
+    fa.ffprobe_or_none(str(tmp_path / "x.mp4"))
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("-protocol_whitelist") + 1] == "file"
+    assert cmd.index("-protocol_whitelist") < len(cmd) - 1
 
 
 def test_write_concat_list_rejects_unsafe_names(tmp_path):
@@ -368,6 +414,97 @@ def test_real_ffmpeg_stitch_with_hostile_ref_names(tmp_path):
     assert res is not None and res.get("output_ref"), "stitch failed on quoted ref names"
     d = fa.probe_duration_seconds(storage.path_for("assembled/x/stitched.mp4"))
     assert d is not None and 1.5 <= d <= 2.6
+
+
+@needs_ffmpeg
+def test_real_ffmpeg_stitch_hls_playlist_cannot_pull_other_files(tmp_path):
+    """Provider returns ``evil.m3u8`` whose body points at another
+    tenant's mp4 by absolute path. On main the HLS demuxer drew that video
+    (solid red) into the stitched output."""
+    from assembly import ffmpeg_assembler as fa
+    from control_plane.storage import LocalDiskStorage
+    storage = LocalDiskStorage(str(tmp_path / "st"))
+    victim = tmp_path / "st" / "jobs" / "other_tenant" / "final.mp4"
+    victim.parent.mkdir(parents=True)
+    subprocess.check_call(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=160x120:d=1:r=10",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(victim)],
+        timeout=60)
+    legit = tmp_path / "legit.mp4"
+    subprocess.check_call(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=160x120:d=1:r=10",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(legit)],
+        timeout=60)
+    storage.put(key="comfy_cloud/j/legit.mp4", data=legit.read_bytes(), mime_type="video/mp4")
+    playlist = ("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\n"
+                f"{victim}\n#EXT-X-ENDLIST\n").encode()
+    storage.put(key="comfy_cloud/j/evil.m3u8", data=playlist, mime_type="video/mp4")
+    res = fa.stitch_scene_clips(storage=storage,
+                                clip_refs=["comfy_cloud/j/legit.mp4", "comfy_cloud/j/evil.m3u8"],
+                                output_ref="assembled/x/stitched.mp4",
+                                target_duration_seconds=2)
+    if res is None or not res.get("output_ref"):
+        return  # clean failure is acceptable
+    out = storage.path_for("assembled/x/stitched.mp4")
+    raw = subprocess.check_output(
+        # Centre crop: the stitch pads to 1080x1920 with black bars.
+        ["ffmpeg", "-v", "error", "-i", out, "-vf", "fps=4,crop=iw/2:ih/4,scale=16:16",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], timeout=60)
+    frames = [raw[i:i + 16 * 16 * 3] for i in range(0, len(raw), 16 * 16 * 3)]
+    assert frames
+    for fr in frames:
+        r = sum(fr[0::3]) / (len(fr) / 3)
+        b = sum(fr[2::3]) / (len(fr) / 3)
+        assert not (r > 150 and b < 80), "another file's video was stitched in"
+
+
+@needs_ffmpeg
+def test_real_ffmpeg_concat_guard_blocks_hls_even_with_m3u8_name(tmp_path):
+    """Second layer, independent of the suffix allow-list: a concat list
+    entry that IS named ``.m3u8`` (HLS probe accepts it) is refused by the
+    container allow-list in CONCAT_INPUT_GUARD."""
+    from assembly.ffmpeg_safe import CONCAT_INPUT_GUARD, write_concat_list
+    victim = tmp_path / "victim.mp4"
+    subprocess.check_call(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=64x64:d=1:r=10",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(victim)],
+        timeout=60)
+    (tmp_path / "evil.m3u8").write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\n"
+        f"{victim}\n#EXT-X-ENDLIST\n")
+    concat = write_concat_list(tmp_path / "concat.txt", ["evil.m3u8"])
+    out = tmp_path / "out.mp4"
+
+    def run(guard):
+        return subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", *guard, "-f", "concat", "-i", str(concat),
+             "-c:v", "libx264", "-preset", "ultrafast", "-an", str(out)],
+            capture_output=True, text=True, timeout=60)
+
+    # Without the guard ffmpeg 6.1 follows the playlist and encodes the
+    # victim (see the S1c report); with it the HLS demuxer is refused.
+    guarded = run(CONCAT_INPUT_GUARD)
+    assert guarded.returncode != 0
+    assert "whitelist" in guarded.stderr.lower()
+    assert not out.exists() or out.stat().st_size == 0
+
+
+@needs_ffmpeg
+def test_real_ffmpeg_stitch_with_audio_ref(tmp_path):
+    from assembly import ffmpeg_assembler as fa
+    from control_plane.storage import LocalDiskStorage
+    storage = LocalDiskStorage(str(tmp_path / "st"))
+    src = _clip(tmp_path, "src", "clip", duration=1.0)
+    storage.put(key="clips/a.mp4", data=Path(src).read_bytes(), mime_type="video/mp4")
+    audio = tmp_path / "voice.m4a"
+    subprocess.check_call(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                           "sine=frequency=220:duration=1", str(audio)], timeout=60)
+    storage.put(key="audio/voice's.m4a", data=audio.read_bytes(), mime_type="audio/mp4")
+    res = fa.stitch_scene_clips(storage=storage, clip_refs=["clips/a.mp4"],
+                                output_ref="assembled/y/stitched.mp4",
+                                target_duration_seconds=1, audio_ref="audio/voice's.m4a")
+    assert res is not None and res.get("output_ref"), "stitch with audio failed"
+    assert fa.probe_has_audio(storage.path_for("assembled/y/stitched.mp4")) is True
 
 
 # ── 4. API validation + end to end ──────────────────────────────────────

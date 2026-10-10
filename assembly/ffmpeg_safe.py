@@ -8,6 +8,10 @@ Rules:
 * Concat lists hold portable relative basenames we generate
   (``clip_0001.mp4``). They live next to the list, so the concat demuxer
   runs in its default safe mode (no ``-safe 0``).
+* Media bytes from a provider are untrusted. Local copies get a suffix
+  from a fixed allow-list (a ``.m3u8`` name would let ffmpeg's HLS
+  demuxer pull any local ``.mp4`` into the output), and the inputs are
+  opened with a file-only protocol and container allow-list.
 """
 from __future__ import annotations
 
@@ -19,7 +23,17 @@ from typing import Iterable
 
 # ffmpeg concat "safe" rule: portable charset, relative, no leading dot.
 PORTABLE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
-_SAFE_SUFFIX = re.compile(r"^\.[a-z0-9]{1,8}$")
+
+CLIP_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".mkv", ".webm"})
+AUDIO_SUFFIXES = frozenset({".m4a", ".aac", ".mp3", ".wav", ".ogg", ".opus", ".flac"})
+
+# Input options for untrusted media: local files only, container demuxers
+# only (no hls/concat-in-concat/image2/etc. via content sniffing).
+CONCAT_INPUT_GUARD = ("-protocol_whitelist", "file",
+                      "-format_whitelist", "concat,mov,matroska")
+AUDIO_INPUT_GUARD = ("-protocol_whitelist", "file",
+                     "-format_whitelist", "mov,matroska,mp3,wav,ogg,flac,aac")
+PROBE_GUARD = ("-protocol_whitelist", "file")
 
 
 def require_portable_name(name: str) -> str:
@@ -28,10 +42,10 @@ def require_portable_name(name: str) -> str:
     return name
 
 
-def safe_media_suffix(name: str) -> str:
-    """Lower-case extension of ``name`` if it is short alnum, else ''."""
-    suffix = Path(name).suffix.lower()
-    return suffix if _SAFE_SUFFIX.match(suffix) else ""
+def media_suffix(name: str, allowed: frozenset, default: str) -> str:
+    """Lower-case extension of ``name`` if allow-listed, else ``default``."""
+    suffix = Path(str(name)).suffix.lower()
+    return suffix if suffix in allowed else default
 
 
 def write_concat_list(path: Path, names: Iterable[str]) -> Path:
