@@ -645,10 +645,13 @@ def test_readyz_ready_shape(tmp_path, monkeypatch):
     r = TestClient(_app(monkeypatch, tmp_path)).get("/readyz")
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"status", "checks", "errors", "warnings"}
+    # EMAIL E1 added the informational "info" block (email transport);
+    # it never takes part in readiness.
+    assert set(body) == {"status", "checks", "errors", "warnings", "info"}
     assert body["status"] == "ready"
     assert body["checks"] == {"db": True, "vault_key": True, "master_key": True}
     assert body["errors"] == {} and body["warnings"] == {}
+    assert body["info"]["email"] in ("configured", "not_configured")
 
 
 @pytest.mark.parametrize("bad_key", ["too_short", "X" * 44, "!" * 44])
