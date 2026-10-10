@@ -527,9 +527,18 @@ def build_router(repo: Repo) -> APIRouter:
         # first signup-attached workspace.
         memberships = list_workspaces_for_user(repo, ctx.user_id)
         owned = [m for m in memberships if m.get("role") == "owner"]
-        user_plan = (
-            owned[0].get("plan", "free") if owned else "free"
-        )
+        # F-RV-003: do NOT use ``owned[0]``.  The list is ordered by
+        # ``created_at`` (1-second resolution) so two workspaces
+        # created in the same second tie and SQLite may return the
+        # newly-created FREE one first, 403-ing a paying user.  A user
+        # who owns ANY paid workspace is a paid user: take the highest
+        # plan across everything they own.
+        _plan_rank = {"free": 0, "pro": 1, "enterprise": 2}
+        user_plan = "free"
+        for m in owned:
+            p = (m.get("plan") or "free").lower()
+            if _plan_rank.get(p, 0) > _plan_rank.get(user_plan, 0):
+                user_plan = p
         decision = check_workspace_count(
             plan=user_plan,
             workspaces_owned=len(owned),

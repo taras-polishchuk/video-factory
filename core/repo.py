@@ -1292,6 +1292,24 @@ class Repo:
                 (int(time.time()), event_id),
             )
 
+    def release_stripe_event(self, event_id: str) -> bool:
+        """Drop the idempotency claim of an event that FAILED processing.
+
+        ``insert_stripe_event`` claims the id before the handler runs.
+        If the handler then raises, Stripe retries the same event id;
+        without releasing the claim the retry is acked as a duplicate
+        and the billing change is lost.  Only rows that were never
+        stamped processed are removed, so a completed event can never
+        be re-opened.  Returns True if a row was released.
+        """
+        with self.tx() as c:
+            cur = c.execute(
+                "DELETE FROM stripe_events "
+                "WHERE id=? AND processed_at IS NULL",
+                (event_id,),
+            )
+            return (cur.rowcount or 0) > 0
+
     def get_stripe_event(self, event_id: str) -> Optional[dict]:
         """Fetch a stored Stripe event (for tests + debugging)."""
         row = self._conn().execute(

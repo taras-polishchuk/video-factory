@@ -39,6 +39,8 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
+from core.repo import NotFound
+
 
 _logger = logging.getLogger("api.webhooks_stripe")
 if not _logger.handlers:
@@ -199,68 +201,9 @@ def build_router(repo, *, audit=None) -> APIRouter:
             # Never let an audit write break the webhook path.
             pass
 
-    @router.post("/api/v1/webhooks/stripe")
-    async def stripe_webhook(
-        request: Request,
-        stripe_signature: Optional[str] = Header(default=None,
-                                                    alias="Stripe-Signature"),
-    ):
-        if not secret:
-            # Defense in depth: even though require_secret_at_boot()
-            # already raised, a re-import of the module without
-            # the env set should still refuse.
-            raise HTTPException(503, "stripe webhook not configured")
-        if not stripe_signature:
-            raise HTTPException(401, "missing Stripe-Signature header")
-
-        body = await request.body()
-        if not body:
-            raise HTTPException(400, "empty body")
-
-        # ── signature verification ─────────────────────────────
-        try:
-            event = _stripe.Webhook.construct_event(
-                body, stripe_signature, secret,
-            )
-            # Convert to a plain dict so the rest of the handler
-            # can use ``.get()`` ergonomics without sprinkling
-            # type assertions everywhere.  ``to_dict()`` recurses
-            # into nested Stripe objects.
-            event = event.to_dict() if hasattr(event, "to_dict") else event
-        except _stripe.error.SignatureVerificationError:
-            _write_audit("webhook.stripe.rejected",
-                          {"reason": "signature_invalid"})
-            raise HTTPException(401, "invalid signature")
-        except ValueError as e:
-            # Malformed payload.
-            raise HTTPException(400, f"invalid payload: {e}")
-
-        event_id = event.get("id")
-        event_type = event.get("type") or ""
-        if not event_id:
-            raise HTTPException(400, "event missing id")
-
-        # ── idempotency: record the event BEFORE processing ─────
-        raw_json = json.dumps(event, sort_keys=True, default=str)
-        try:
-            recorded = repo.insert_stripe_event(
-                event_id=event_id, event_type=event_type,
-                raw_json=raw_json,
-            )
-        except Exception as e:
-            # Database failure on the idempotency table is fatal
-            # for the webhook — better to fail loud and let Stripe
-            # retry than to process without dedup.
-            _logger.warning("stripe_events insert failed: %s", e)
-            raise HTTPException(503, "idempotency store unavailable")
-        if not recorded:
-            # Duplicate replay. Stripe expects 2xx + idempotent.
-            _write_audit("webhook.stripe.duplicate",
-                          {"event_id": event_id, "type": event_type})
-            return {"received": True, "duplicate": True,
-                    "event_id": event_id, "type": event_type}
-
-        # ── dispatch by event type ──────────────────────────────
+    def _dispatch(event_id: str, event_type: str,
+                   event: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply one already-claimed, signature-verified event."""
         data_obj = event.get("data") or {}
         inner = data_obj.get("object") or {}
 
@@ -277,6 +220,48 @@ def build_router(repo, *, audit=None) -> APIRouter:
                         "reason": "checkout session has no workspace reference"}
             customer_id = _customer_id_from(inner)
             subscription_id = inner.get("subscription")
+
+            # F-RV-001 (same class as F-W6C-001): a late / replayed
+            # checkout.session.completed carries a fresh event id, so
+            # the idempotency table cannot catch it.  It maps to
+            # "pro"; it must never demote a workspace that is already
+            # on a higher plan (enterprise).
+            try:
+                existing_ws = repo.get_workspace(workspace_id)
+            except NotFound:
+                # Permanent condition: retrying can never succeed, so
+                # ack with 200 instead of 5xx-looping against Stripe.
+                _write_audit("webhook.stripe.ignored",
+                              {"event_id": event_id, "type": event_type,
+                               "reason": "unknown_workspace",
+                               "workspace_id": workspace_id})
+                repo.mark_stripe_event_processed(event_id)
+                return {"received": True, "ignored": True,
+                        "event_id": event_id, "type": event_type,
+                        "reason": "checkout session workspace not found"}
+            existing_plan = existing_ws.get("plan") or "free"
+            if _plan_rank("pro") < _plan_rank(existing_plan):
+                _write_audit(
+                    "billing.checkout_downgrade_blocked",
+                    {"event_id": event_id, "workspace_id": workspace_id,
+                     "existing_plan": existing_plan,
+                     "attempted_plan": "pro",
+                     "stripe_customer_id": customer_id,
+                     "stripe_subscription_id": subscription_id},
+                    workspace_id=workspace_id,
+                )
+                _logger.warning(
+                    "refusing checkout.downgrade for workspace=%s "
+                    "existing=%s attempted=pro event=%s",
+                    workspace_id, existing_plan, event_id,
+                )
+                repo.mark_stripe_event_processed(event_id)
+                return {"received": True, "ok": True,
+                        "event_id": event_id, "type": event_type,
+                        "workspace_id": workspace_id,
+                        "plan": existing_plan,
+                        "downgrade_refused": True}
+
             try:
                 with repo.tx() as c:
                     repo.update_workspace_billing(
@@ -469,5 +454,82 @@ def build_router(repo, *, audit=None) -> APIRouter:
         repo.mark_stripe_event_processed(event_id)
         return {"received": True, "ignored": True,
                 "event_id": event_id, "type": event_type}
+
+    @router.post("/api/v1/webhooks/stripe")
+    async def stripe_webhook(
+        request: Request,
+        stripe_signature: Optional[str] = Header(default=None,
+                                                    alias="Stripe-Signature"),
+    ):
+        if not secret:
+            # Defense in depth: even though require_secret_at_boot()
+            # already raised, a re-import of the module without
+            # the env set should still refuse.
+            raise HTTPException(503, "stripe webhook not configured")
+        if not stripe_signature:
+            raise HTTPException(401, "missing Stripe-Signature header")
+
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty body")
+
+        # ── signature verification ─────────────────────────────
+        try:
+            event = _stripe.Webhook.construct_event(
+                body, stripe_signature, secret,
+            )
+            # Convert to a plain dict so the rest of the handler
+            # can use ``.get()`` ergonomics without sprinkling
+            # type assertions everywhere.  ``to_dict()`` recurses
+            # into nested Stripe objects.
+            event = event.to_dict() if hasattr(event, "to_dict") else event
+        except _stripe.error.SignatureVerificationError:
+            _write_audit("webhook.stripe.rejected",
+                          {"reason": "signature_invalid"})
+            raise HTTPException(401, "invalid signature")
+        except ValueError as e:
+            # Malformed payload.
+            raise HTTPException(400, f"invalid payload: {e}")
+
+        event_id = event.get("id")
+        event_type = event.get("type") or ""
+        if not event_id:
+            raise HTTPException(400, "event missing id")
+
+        # ── idempotency: record the event BEFORE processing ─────
+        raw_json = json.dumps(event, sort_keys=True, default=str)
+        try:
+            recorded = repo.insert_stripe_event(
+                event_id=event_id, event_type=event_type,
+                raw_json=raw_json,
+            )
+        except Exception as e:
+            # Database failure on the idempotency table is fatal
+            # for the webhook — better to fail loud and let Stripe
+            # retry than to process without dedup.
+            _logger.warning("stripe_events insert failed: %s", e)
+            raise HTTPException(503, "idempotency store unavailable")
+        if not recorded:
+            # Duplicate replay. Stripe expects 2xx + idempotent.
+            _write_audit("webhook.stripe.duplicate",
+                          {"event_id": event_id, "type": event_type})
+            return {"received": True, "duplicate": True,
+                    "event_id": event_id, "type": event_type}
+
+        # ── dispatch by event type ──────────────────────────────
+        # F-RV-002: the event row was inserted BEFORE processing (so
+        # concurrent deliveries dedupe).  If applying the event raises
+        # (-> 5xx, Stripe retries the SAME event id) the claim must be
+        # released, otherwise the retry is acked as a duplicate and the
+        # billing change is lost forever.
+        try:
+            return _dispatch(event_id, event_type, event)
+        except Exception:
+            try:
+                repo.release_stripe_event(event_id)
+            except Exception as rel_err:  # never mask the original error
+                _logger.warning("could not release stripe event %s: %s",
+                                event_id, rel_err)
+            raise
 
     return router
