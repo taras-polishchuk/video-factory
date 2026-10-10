@@ -1,0 +1,177 @@
+name: CI
+
+# Runs on every push to main and on every pull request against it.
+# Every job is read-only: no secrets, no deploy, no push. Deploys stay
+# manual (scripts/deploy.sh).
+#
+# Third-party actions are pinned to a full commit SHA (the comment names
+# the release). Dependabot (.github/dependabot.yml) bumps SHA and comment
+# together.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same PR or branch cancels the superseded run.
+# main is never cancelled: every commit that lands there gets a verdict.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The render tests drive a real ffmpeg (drawtext needs a font).
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+          ffmpeg -version | head -n 1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      # -n 2, never more: each worker can spawn an ffmpeg of ~700 MB.
+      # "still_green" tests re-run the whole suite from inside the suite.
+      # PYTHONPATH: api/, core/ and auth/ are run from the source tree,
+      # not installed as packages.
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/ -q -n 2 -k 'not still_green' -p no:cacheprovider
+
+  web:
+    name: Web (SvelteKit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm run check` is `svelte-check --tsconfig ./jsconfig.json`.
+      - name: svelte-check
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Pinned so the findings match a local run (shellcheck 0.11.0).
+      - name: Install shellcheck
+        run: |
+          python -m pip install "shellcheck-py==0.11.0.1"
+          shellcheck --version
+
+      - name: Lint shell scripts
+        run: shellcheck -x scripts/*.sh systemd/*.sh
+
+  opentofu:
+    name: OpenTofu fmt and validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/opentofu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: "1.13.1"
+          tofu_wrapper: false
+
+      - name: tofu fmt
+        run: tofu fmt -check -recursive -diff
+
+      # No backend, no credentials: validate only checks the configuration.
+      - name: tofu init
+        run: tofu init -backend=false -input=false
+
+      - name: tofu validate
+        run: tofu validate
+
+  docker:
+    name: Docker build (no push)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build api image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          tags: video-factory-api:ci
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      # The web image arrives with the production deploy path
+      # (web/Dockerfile). Until the file exists this step is skipped.
+      - name: Build web image
+        if: ${{ hashFiles('web/Dockerfile') != '' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: web
+          file: web/Dockerfile
+          push: false
+          tags: video-factory-web:ci
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
