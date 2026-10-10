@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
+
+_DEFAULT_CSRF = None
+
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
@@ -79,10 +82,18 @@ def _signup(client, *, email, workspace_name="W"):
 
 
 def _csrf(client):
-    return client.get("/auth/csrf").json()["csrf_token"]
+    tok = client.get("/auth/csrf").json()["csrf_token"]
+    import sys as _sys; _sys.modules[__name__]._DEFAULT_CSRF = tok
+    return tok
+
+
+def _force_csrf(client):
+    "Always re-fetch csrf bound to the current session cookie."
+    _csrf(client)
 
 
 def _submit_job(client, *, wid, render_profile="mock", topic="t"):
+    _force_csrf(client)
     return client.post(
         f"/api/v1/workspaces/{wid}/jobs",
         json={
@@ -90,6 +101,7 @@ def _submit_job(client, *, wid, render_profile="mock", topic="t"):
             "platforms": ["tiktok"], "render_profile": render_profile,
             "count": 1,
         },
+        headers={"X-CSRF-Token": _DEFAULT_CSRF},
     )
 
 

@@ -16,6 +16,8 @@ import time
 from typing import Any, Dict, Tuple
 from unittest.mock import MagicMock, patch
 
+_DEFAULT_CSRF = None
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -68,8 +70,10 @@ def e2e(tmp_path, monkeypatch):
     assert r.status_code == 200, r.text
     wid = r.json()["workspace_id"]
     csrf = client.get("/auth/csrf").json()["csrf_token"]
+    import sys as _sys; _sys.modules[__name__]._DEFAULT_CSRF = csrf
     yield client, repo, wid, csrf
     _billing.reset_stripe_client()
+    # expose for the helpers via module global (set on fixture setup)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -141,10 +145,13 @@ def _fill_jobs(repo, wid, n):
                  '["tiktok"]', "9:16", 1, "mock", 0, now, now, "completed"))
 
 
-def _submit(client, wid, profile="mock"):
+def _submit(client, wid, profile="mock", csrf=None):
+    token = csrf if csrf is not None else _DEFAULT_CSRF
+    headers = {"X-CSRF-Token": token} if token else {}
     return client.post(f"/api/v1/workspaces/{wid}/jobs", json={
         "topic": "t", "language": "en", "duration_seconds": 5,
-        "platforms": ["tiktok"], "render_profile": profile, "count": 1})
+        "platforms": ["tiktok"], "render_profile": profile, "count": 1},
+        headers=headers)
 
 
 # --- C1 / C2: checkout + portal (Wave 6a) ------------------------------------
