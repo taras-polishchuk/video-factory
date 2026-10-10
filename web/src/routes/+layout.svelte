@@ -21,8 +21,12 @@
 	// auth card and must not be wrapped in the app shell. Detect
 	// them by pathname so the layout falls through to {@render
 	// children()} for those routes.
-	const PUBLIC_AUTH = ['/login', '/signup', '/forgot'];
-	let isAuthPage = $derived(PUBLIC_AUTH.includes($page.url.pathname));
+	const PUBLIC_AUTH = ['/login', '/signup', '/forgot', '/reset'];
+	let isAuthPage = $derived(
+		PUBLIC_AUTH.includes($page.url.pathname) ||
+		$page.url.pathname.startsWith('/verify/') ||
+		$page.url.pathname.startsWith('/reset/')
+	);
 
 	const NAV = [
 		{ href: '/', label: 'Overview' },

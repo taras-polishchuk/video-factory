@@ -241,7 +241,10 @@ class StripeClient:
             # ``stripe.checkout.Session.create`` don't need to also
             # configure the global module key.
             stripe.api_key = self._api_key
-            sess = stripe.checkout.Session.create(**params)
+            sess = _call_with_timeout(
+                stripe.checkout.Session.create, kwargs=params,
+                timeout_s=_http_timeout_seconds(),
+            )
         except StripeError as e:
             raise StripeCallError(str(e)) from e
         except (TimeoutError, ConnectionResetError, OSError) as e:
@@ -268,9 +271,10 @@ class StripeClient:
             raise ValueError("customer_id required for portal session")
         try:
             stripe.api_key = self._api_key
-            sess = stripe.billing_portal.Session.create(
-                customer=customer_id,
-                return_url=return_url,
+            sess = _call_with_timeout(
+                stripe.billing_portal.Session.create,
+                kwargs={"customer": customer_id, "return_url": return_url},
+                timeout_s=_http_timeout_seconds(),
             )
         except StripeError as e:
             raise StripeCallError(str(e)) from e
@@ -328,6 +332,38 @@ def configure_stripe_client(api_key: str,
 
 # ── CLI smoke entry point ─────────────────────────────────────
 
+
+
+
+def _http_timeout_seconds(default: float = 10.0) -> float:
+    """Resolve the Stripe HTTP timeout from env, or the default."""
+    raw = os.environ.get("STRIPE_HTTP_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _call_with_timeout(fn, *, kwargs, timeout_s):
+    """Call ``fn(**kwargs)`` in a worker thread, raising TimeoutError
+    if it does not return within ``timeout_s`` seconds.
+
+    The Stripe SDK (1.x) does not expose a per-request timeout on
+    ``Session.create``/``billing_portal.Session.create`` directly, so
+    the API layer enforces a wall-clock bound here. Returns whatever
+    ``fn`` returns; re-raises any exception verbatim.
+    """
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn, **kwargs)
+        try:
+            return fut.result(timeout=timeout_s)
+        except _cf.TimeoutError as e:
+            raise TimeoutError(
+                f"stripe call exceeded {timeout_s:.1f}s",
+            ) from e
 
 def _main() -> int:  # pragma: no cover - CLI smoke only
     """CLI smoke: ``python -m api.billing`` exits non-zero if the

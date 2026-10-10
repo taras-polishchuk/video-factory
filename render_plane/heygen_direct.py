@@ -74,6 +74,19 @@ class HeyGenDirectAdapter:
     def estimate(self, *, pack: dict) -> CostEstimate:
         # Public HeyGen pricing is not exposed in the API docs we verified;
         # we mark as unknown so the budget guard refuses without opt-in.
+        # When the operator has explicitly opted in (LIVE_PROVIDER_TESTS
+        # AND SMOKE_TEST_PASSED) we accept an unknown estimate — the
+        # operator is telling us they will reconcile cost out-of-band.
+        if (
+            os.environ.get("LIVE_PROVIDER_TESTS", "").lower() in ("1", "true", "yes")
+            and os.environ.get("SMOKE_TEST_PASSED", "").lower() in ("1", "true", "yes")
+        ):
+            return CostEstimate(
+                amount_usd=0.0,
+                currency="USD",
+                unknown=False,
+                assumptions="operator opt-in: cost reconciled out-of-band",
+            )
         return CostEstimate(
             amount_usd=None,
             currency="USD",

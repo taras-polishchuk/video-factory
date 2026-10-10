@@ -367,7 +367,7 @@ def _install_fake_restic(tmp_path: Path) -> tuple[dict, Path, Path]:
     }
     # Sanity-check: the fake restic must be reachable via the test env.
     sanity = subprocess.run(
-        ["bash", "-c", f'PATH={env["PATH"]} command -v restic'],
+        ["bash", "-c", f'PATH="{env["PATH"]}" command -v restic'],
         capture_output=True, text=True, env=env,
         cwd=str(REPO_ROOT), timeout=120,
     )
@@ -376,7 +376,7 @@ def _install_fake_restic(tmp_path: Path) -> tuple[dict, Path, Path]:
     )
     # Also sanity-check the fake responds to snapshots/latest/--json
     sanity2 = subprocess.run(
-        ["bash", "-c", f'PATH={env["PATH"]} restic -r s3:fake/repo snapshots latest --json'],
+        ["bash", "-c", f'PATH="{env["PATH"]}" restic -r s3:fake/repo snapshots latest --json'],
         capture_output=True, text=True, env=env,
     )
     assert sanity2.stdout.strip(), (

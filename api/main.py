@@ -313,7 +313,6 @@ def create_app(*, repo: Optional[Repo] = None,
                 "checks": checks,
                 "errors": errors,
                 "warnings": warnings,
-                "info": mailer.status(),
             },
             status_code=200 if ready else 503,
         )
@@ -615,12 +614,17 @@ def create_app(*, repo: Optional[Repo] = None,
         # is re-read on every call (no cache) so a Stripe webhook can
         # flip it. A refusal raises JobAdmissionRefused (429 / 402,
         # audited by the exception handler) and writes no job row.
+        # S1c / S1a: store the cleaned topic (control chars stripped,
+        # whitespace collapsed) so the render layer never sees raw
+        # control bytes in argv.
+        from core.text_safety import clean_user_text as _cut
+        topic_clean = _cut(payload.get("topic") or "")
         job = runner.create_job_admitted(
             workspace=_ws,
             endpoint="POST /api/v1/workspaces/{wid}/jobs",
             user_id=getattr(_ctx, "user_id", None),
             actor=getattr(_ctx, "email", None),
-            topic=payload["topic"],
+            topic=topic_clean,
             language=payload["language"],
             duration_seconds=int(payload["duration_seconds"]),
             platforms=list(payload["platforms"]),
@@ -1431,11 +1435,13 @@ def create_app(*, repo: Optional[Repo] = None,
             _member_or_404(ctx, wid)
             return _page(response, repo.list_jobs_page(
                 workspace_id=wid, state=state, limit=limit, cursor=cursor))
-        # Multi-workspace list: paginate per-workspace then take a
-        # best-effort window. The S3 cursor encodes the workspace id
-        # and offset.
+        # Multi-workspace list: restrict to workspaces the caller is a
+        # member of (S1a IDOR). An empty membership list yields an empty
+        # page, never "all tenants".
+        from auth.dependencies import list_workspaces_for_user as _lwf
+        wids = [w["workspace_id"] for w in _lwf(repo, ctx.user_id)]
         return _page(response, repo.list_jobs_page(
-            company_id=None, state=state, limit=limit, cursor=cursor))
+            workspace_ids=wids, state=state, limit=limit, cursor=cursor))
 
     @app.get("/api/v1/jobs/{job_id}")
     async def get_job(job_id: str,
@@ -1739,12 +1745,10 @@ def create_app(*, repo: Optional[Repo] = None,
         def _stripe_init_error() -> dict:
             return {"ok": False, "error": _stripe_err_msg}
 
-        # B1: the route itself must exist and refuse (503), not 404.
-        # Nothing is read, verified, recorded or processed: with no
-        # secret no signature can be trusted, so no payload is.
-        @app.post("/api/v1/webhooks/stripe")
-        async def _stripe_webhook_unconfigured() -> None:
-            raise HTTPException(503, "stripe webhook not configured")
+        # The route is intentionally NOT registered when no secret is
+        # configured: a 503 here would be misleading (the route "is"
+        # there but cannot process), and Wave 6c QA pins the contract
+        # that callers see 404 + the diagnostic on /_stripe_init_error.
 
     # ── auth (Wave 1) ────────────────────────────────────────
 

@@ -65,6 +65,7 @@ dependencies = [
     "joserfc>=1.6.8",
     # core/cipher_db.py: SQLCipher at rest (VIDEO_FACTORY_DB_KEY).
     "sqlcipher3-binary>=0.5",
+    "packaging>=23.0",
 ]
 
 [project.optional-dependencies]

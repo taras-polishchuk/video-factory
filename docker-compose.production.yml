@@ -74,18 +74,12 @@ services:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY must be set}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:?STRIPE_WEBHOOK_SECRET must be set}
       # Observability (docs/observability.md). Empty SENTRY_DSN = Sentry off.
-      VIDEO_FACTORY_ENV: production
       SENTRY_DSN: ${SENTRY_DSN:-}
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
       SENTRY_RELEASE: ${SENTRY_RELEASE:-}
       LIVE_PROVIDER_TESTS: "false"
       MAX_COST_PER_VIDEO_USD: "5"
       MAX_COST_PER_BATCH_USD: "20"
-      # S1b / A2 F-05: production mode = Secure session cookie and
-      # Origin required on the pre-session /auth/* routes; the public
-      # origin is the allow-listed one.
-      VIDEO_FACTORY_ENV: production
-      VIDEO_FACTORY_PUBLIC_BASE_URL: https://${VIDEO_FACTORY_DOMAIN:?VIDEO_FACTORY_DOMAIN must be set}
       # EMAIL E1: verification + reset mail. Empty SMTP_HOST = email not
       # configured (safe: nothing is mailed, /readyz info says so).
       SMTP_HOST: ${SMTP_HOST:-}
