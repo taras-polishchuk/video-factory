@@ -651,10 +651,12 @@ def test_existing_189_tests_still_green():
          "tests/test_api.py", "tests/test_auth.py",
          "tests/test_credential_vault.py", "tests/test_wave1_qa.py",
          "tests/test_wave2_qa.py", "tests/test_wave3_ui.py",
-         "tests/test_wave4_oidc.py"],
+         "tests/test_wave4_oidc.py", "-p", "no:cacheprovider"],
         capture_output=True, text=True, cwd=str(REPO_ROOT),
         env={**os.environ, "PYTHONPATH": "."},
-        timeout=180,
+        # Hang guard only (t_cfd27f30): 180 s was tight for a cold
+        # collect of 7 modules on a loaded host.
+        timeout=600,
     )
     assert r.returncode == 0, (
         f"collect-only failed:\n{r.stdout}\n{r.stderr}"

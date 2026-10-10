@@ -285,6 +285,20 @@ def test_webhook_endpoint_refuses_when_secret_unset(env, monkeypatch):
 # ── F7: publish intent cross-company guard ───────────────────────────
 
 
+def _wait_pipeline_idle(job_id: str) -> None:
+    """Determinism fix (t_cfd27f30). POST /api/v1/jobs starts the
+    real mock pipeline in a background thread. These tests then force
+    ``state='done'`` and publish, but the still-running pipeline kept
+    rewriting ``state`` ('running' per stage, then 'done'/'failed'),
+    so the publish call raced it and intermittently got
+    400 "job must be in done state". Wait for the pipeline thread to
+    finish before pinning the state the test wants."""
+    from core.runners import Singleton
+    assert Singleton.get().wait(job_id, timeout=600), (
+        f"pipeline thread for {job_id} still running after 600s"
+    )
+
+
 def test_publish_intent_rejects_cross_company_attack_at_repo_layer(env):
     """At the repo layer (used by API + future internal callers + tests),
     passing a company_id which does not own the job raises Forbidden.
@@ -305,6 +319,7 @@ def test_publish_intent_rejects_cross_company_attack_at_repo_layer(env):
         "duration_seconds": 5, "platforms": ["tiktok"], "bible_id": bid,
     })
     job_id = r.json()["job_id"]
+    _wait_pipeline_idle(job_id)
     repo.update_job(job_id, state="done")
     # Direct repo call with the WRONG company_id must raise Forbidden.
     from core.repo import Forbidden
@@ -336,6 +351,7 @@ def test_publish_intent_accepts_own_company(env):
         "duration_seconds": 5, "platforms": ["tiktok"], "bible_id": bid,
     })
     job_id = r.json()["job_id"]
+    _wait_pipeline_idle(job_id)
     repo.update_job(job_id, state="done")
     r = client.post(f"/api/v1/jobs/{job_id}/publish", json={
         "action": "draft", "platforms": ["tiktok"],
@@ -358,6 +374,7 @@ def test_publish_intent_rejects_unknown_platform(env):
         "duration_seconds": 5, "platforms": ["tiktok"], "bible_id": bid,
     })
     job_id = r.json()["job_id"]
+    _wait_pipeline_idle(job_id)
     repo.update_job(job_id, state="done")
     r = client.post(f"/api/v1/jobs/{job_id}/publish", json={
         "action": "draft", "platforms": ["not_a_real_platform"],
@@ -491,14 +508,12 @@ def test_job_runner_assembly_skip_does_not_fail_job(tmp_path):
             count=1, render_profile="mock",
         )
         runner.submit(job["job_id"])
-        # Wait for completion
-        import time
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            j = repo.get_job(job["job_id"])
-            if j["state"] in ("done", "failed"):
-                break
-            time.sleep(0.1)
+        # Wait for completion on the runner's completion signal (the
+        # old 30 s wall-clock poll was load-sensitive; t_cfd27f30).
+        # The patched shutil.which must stay in place until the
+        # pipeline thread is done, which wait() guarantees.
+        assert runner.wait(job["job_id"], timeout=600), "pipeline hang"
+        j = repo.get_job(job["job_id"])
         # Job MUST reach done even without ffmpeg.
         assert j["state"] == "done", f"job ended in {j['state']} without ffmpeg; expected done"
         stages = repo.list_stages(job["job_id"])

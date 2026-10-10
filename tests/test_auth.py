@@ -75,14 +75,24 @@ def auth_env(tmp_path, monkeypatch, secret_env):
     yield client, repo, storage
 
 
-def _wait_done(client, job_id, timeout_s=60):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        j = client.get(f"/api/v1/jobs/{job_id}").json()
-        if j["state"] in ("done", "failed"):
-            return j
-        time.sleep(0.1)
-    raise AssertionError(f"job did not finish in {timeout_s}s")
+# Hang guard only. Completion is signalled by the runner thread
+# finishing (JobRunner.wait), not by polling the job row against a
+# short wall clock: the old 60 s poll failed whenever the host was
+# loaded (CPU-bound ffmpeg encodes under pytest-xdist). t_cfd27f30.
+JOB_HANG_GUARD_S = 600
+
+
+def _wait_done(client, job_id, timeout_s=JOB_HANG_GUARD_S):
+    from core.runners import Singleton
+    finished = Singleton.get().wait(job_id, timeout=timeout_s)
+    j = client.get(f"/api/v1/jobs/{job_id}").json()
+    if not finished:
+        raise AssertionError(
+            f"job pipeline thread still running after {timeout_s}s "
+            f"(state={j['state']!r})"
+        )
+    assert j["state"] in ("done", "failed"), j
+    return j
 
 
 def _signup(client, *, email="alice@example.com", password="Password12345!",
