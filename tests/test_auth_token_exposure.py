@@ -38,11 +38,11 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
-def _signup(client, email="victim@example.com"):
+def _signup(client, email="victim@example.com", headers=None):
     return client.post("/auth/signup", json={
         "email": email, "password": "Password12345!",
         "workspace_name": "Victim Co",
-    })
+    }, headers=headers or {})
 
 
 def test_forgot_does_not_return_reset_token_by_default(client):
@@ -71,10 +71,15 @@ def test_signup_does_not_return_verification_token_by_default(client):
 def test_dev_opt_in_ignored_in_production(client, monkeypatch, env):
     monkeypatch.setenv("VIDEO_FACTORY_DEV_EXPOSE_TOKENS", "1")
     monkeypatch.setenv("VIDEO_FACTORY_ENV", env)
-    r = _signup(client, email=f"{env}@example.com")
+    # S1b (A1 F5/F7): production/staging refuse pre-session auth posts
+    # that carry no Origin, so send the same-origin header a browser
+    # on the real site sends.
+    same_origin = {"Origin": "http://testserver"}
+    r = _signup(client, email=f"{env}@example.com", headers=same_origin)
     assert r.status_code == 200
     assert "verification_token" not in r.json()
-    r2 = client.post("/auth/forgot", json={"email": f"{env}@example.com"})
+    r2 = client.post("/auth/forgot", json={"email": f"{env}@example.com"},
+                     headers=same_origin)
     assert "reset_token" not in r2.json()
 
 

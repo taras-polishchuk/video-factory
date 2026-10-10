@@ -239,7 +239,7 @@ def test_oidc_state_token_single_use(auth_env, make_google_token):
     assert pending_row is not None
     assert pending_row[1] is None
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -261,7 +261,7 @@ def test_oidc_state_token_replay_rejected(auth_env, make_google_token):
     state_blob, nonce = _state_blob_from_start(client)
     token, _ = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r1 = client.get(
@@ -312,7 +312,7 @@ def test_oidc_id_token_signature_verified_against_jwks(
     client, _ = auth_env
     state_blob, _ = _state_blob_from_start(client)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": bad_token,
     }
     r = client.get(
@@ -337,7 +337,7 @@ def test_oidc_id_token_audience_matches_client_id(
         nonce, overrides={"aud": "some-other-client-id"},
     )
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -359,7 +359,7 @@ def test_oidc_id_token_issuer_matches_discovery(
         nonce, overrides={"iss": "https://attacker.example.com"},
     )
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -379,7 +379,7 @@ def test_oidc_id_token_nonce_matches_session(
     state_blob, _ = _state_blob_from_start(client)
     token, _ = make_google_token("WRONG-NONCE-1234")
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -397,7 +397,7 @@ def test_oidc_new_user_creation_from_google(auth_env, make_google_token):
     state_blob, nonce = _state_blob_from_start(client)
     token, claims = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -437,7 +437,7 @@ def test_oidc_existing_user_linked_by_verified_email(
     state_blob, nonce = _state_blob_from_start(client)
     token, claims = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -476,7 +476,7 @@ def test_oidc_unverified_email_does_not_link(
     state_blob, nonce = _state_blob_from_start(client)
     token, _ = make_google_token(nonce, overrides={"email_verified": False})
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -503,7 +503,7 @@ def test_oidc_creates_default_workspace_for_new_user(
     state_blob, nonce = _state_blob_from_start(client)
     token, _ = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -535,7 +535,7 @@ def test_oidc_user_has_no_password(auth_env, make_google_token):
     state_blob, nonce = _state_blob_from_start(client)
     token, _ = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -558,8 +558,10 @@ def test_oidc_github_flow_if_implemented(auth_env):
     assert r.status_code == 302, r.text
     qs = _parse_qs(r.headers["Location"])
     assert qs["client_id"] == [os.environ["GITHUB_OIDC_CLIENT_ID"]]
-    assert "openid" in qs["scope"][0]
-    assert "user:email" in qs["scope"][0]
+    # S1b / A1 F25: GitHub asks for `user:email` only (no `openid`,
+    # no `read:user`); PKCE S256 is on (A1 F24).
+    assert qs["scope"] == ["user:email"]
+    assert qs["code_challenge_method"] == ["S256"]
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -569,7 +571,7 @@ def test_oidc_github_flow_if_implemented(auth_env):
 def test_oidc_callback_with_invalid_code_returns_400(auth_env):
     import api.oidc as _oidc
 
-    def failing_exchange(provider, code, redirect_uri):
+    def failing_exchange(provider, code, redirect_uri, **_kw):
         raise _oidc.OIDCCallbackError("invalid_grant")
 
     _oidc._exchange_code = failing_exchange
@@ -623,7 +625,7 @@ def test_oidc_logout_disconnects_provider(auth_env, make_google_token):
     state_blob, nonce = _state_blob_from_start(client)
     token, claims = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -712,7 +714,7 @@ def test_oidc_audit_row_records_provider_and_sub(
     state_blob, nonce = _state_blob_from_start(client)
     token, claims = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -780,7 +782,7 @@ def test_oidc_list_identities(auth_env, make_google_token):
     state_blob, nonce = _state_blob_from_start(client)
     token, _ = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -811,7 +813,7 @@ def test_oidc_disconnect_refuses_to_orphan_account(
     state_blob, nonce = _state_blob_from_start(client)
     token, claims = make_google_token(nonce)
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
     r = client.get(
@@ -866,7 +868,7 @@ def test_oidc_signature_failure_triggers_jwks_refresh(auth_env, monkeypatch):
     )
     client, _ = auth_env
     state_blob, _ = _state_blob_from_start(client)
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": bad_token,
     }
     r = client.get(

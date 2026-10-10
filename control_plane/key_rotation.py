@@ -141,6 +141,20 @@ def _fingerprint(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
+def redact_keys(text: str, *keys: Optional[str]) -> str:
+    """Replace every occurrence of ``keys`` in ``text`` by its fingerprint.
+
+    S1b / A1 F15: error strings from SQLCipher / the copy step end up
+    in the audit row, the HTTP error body and the logs; none of them
+    may ever carry key material.
+    """
+    out = text or ""
+    for k in keys:
+        if k:
+            out = out.replace(k, f"[key:{_fingerprint(k)}]")
+    return out
+
+
 def _audit(repo, *, event: str, actor_user_id: str,
            extra: Optional[dict] = None) -> None:
     """Append a runner_audit row for the rotation event.
@@ -434,13 +448,15 @@ def _rotate_locked(*, repo, old_key: str, new_key: str,
             (_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),),
         )
         _audit(repo, event=EVENT_FAILED, actor_user_id=actor_user_id,
-                extra={"error": str(e)})
+                extra={"error": redact_keys(str(e), old_key, new_key)})
         # Clean up the .new artifact if it's still there.
         if new_path.exists():
             new_path.unlink(missing_ok=True)
         if isinstance(e, RotationFailed):
             raise
-        raise RotationFailed(f"rotation aborted: {e}") from e
+        raise RotationFailed(
+            f"rotation aborted: {redact_keys(str(e), old_key, new_key)}"
+        ) from e
 
     # ── 7. Mark completed + REFRESH the Repo to use NEW key ─
     # The BLOCKER-1 fix lives here.  The cipher file on disk is

@@ -6,6 +6,7 @@
 import { fail } from "@sveltejs/kit";
 import type { Actions, PageServerLoad } from "./$types";
 import { env } from "$env/dynamic/private";
+import { upstream_headers } from "$lib/server/upstream";
 
 const API_BASE = env.VIDEO_FACTORY_API_URL || "http://127.0.0.1:8000";
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -22,7 +23,7 @@ export const actions: Actions = {
 		try {
 			await fetch(API_BASE + "/auth/forgot", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", ...upstream_headers() },
 				body: JSON.stringify({ email }),
 			});
 		} catch {

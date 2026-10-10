@@ -179,7 +179,7 @@ def _start(client) -> tuple[str, str]:
 
 
 def _stub_exchange(_oidc, token: str):
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": token,
     }
 
@@ -459,7 +459,7 @@ def test_qa_signature_tampering_rejected(qa_env):
         rogue_jwk,
     )
     import api.oidc as _oidc
-    _oidc._exchange_code = lambda provider, code, redirect_uri: {
+    _oidc._exchange_code = lambda provider, code, redirect_uri, **_kw: {
         "id_token": bad,
     }
     r = client.get(
