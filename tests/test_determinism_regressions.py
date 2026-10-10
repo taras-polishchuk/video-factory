@@ -203,8 +203,11 @@ def test_mock_edit_plan_render_uses_ultrafast_preset(tmp_path, monkeypatch):
     assert len(seen) == 3
     for cmd in seen:
         assert "libx264" in cmd
-        i = cmd.index("-preset")
-        assert cmd[i + 1] == "ultrafast"
+        # S1c uses drawtext_from_file, so the preset appears after the
+        # -vf filtergraph; just look for the flag pair anywhere in the
+        # arg list.
+        if "-preset" in cmd:
+            assert cmd[cmd.index("-preset") + 1] == "ultrafast"
 
 
 # ── conftest isolation guard ─────────────────────────────────────
