@@ -372,7 +372,7 @@ def test_key_rotation_audit_started_completed(
     )
     rows = repo._conn().execute(  # noqa: SLF001
         "SELECT event FROM runner_audit WHERE event IN (?, ?) "
-        "ORDER BY created_at, audit_id",
+        "ORDER BY created_at, rowid",
         (key_rotation.EVENT_STARTED, key_rotation.EVENT_COMPLETED),
     ).fetchall()
     events = [r[0] for r in rows]
