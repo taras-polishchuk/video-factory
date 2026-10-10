@@ -399,6 +399,17 @@ class JobRunner:
                                           status_message="assembly failed")
                     return
                 ref = result["output_ref"]
+                # S1a: bind the final MP4 to the job's workspace with
+                # the Wave 5 HMAC sidecar.  render_plan_to_storage
+                # writes the blob without one, and the download route
+                # now fails closed when the sidecar is missing.
+                if job.get("workspace_id"):
+                    from control_plane import artifact_hmac
+                    artifact_hmac.write_sidecar(
+                        storage_root=str(self.storage_root),
+                        storage_key=ref["key"],
+                        workspace_id=job["workspace_id"],
+                    )
                 self.repo.create_output(
                     job_id,
                     storage_key=ref["key"],

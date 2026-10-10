@@ -302,6 +302,9 @@ def test_asset_path_traversal_blocked(env):
 
 def test_integrations_are_disabled(env):
     client, _, _ = env
+    # S1a: /api/v1/integrations now requires a session (anonymous
+    # -> 401, see tests/test_security_s1a_authz.py).
+    client._ensure_signed_up()
     r = client.get("/api/v1/integrations")
     items = r.json()
     assert all(item["enabled"] is False for item in items)

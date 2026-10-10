@@ -543,7 +543,7 @@ def test_signup_then_submit_job_end_to_end(auth_env):
     jid = client.post("/api/v1/jobs", json={
         "company_id": cid, "bible_id": bid, "topic": "hello",
         "language": "en-US", "duration_seconds": 9, "platforms": ["tiktok"],
-    }).json()["job_id"]
+    }, headers={"X-CSRF-Token": csrf}).json()["job_id"]
     final = _wait_done(client, jid)
     assert final["state"] == "done", final["status_message"]
 

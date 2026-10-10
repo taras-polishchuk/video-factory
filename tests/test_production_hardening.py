@@ -285,6 +285,24 @@ def test_webhook_endpoint_refuses_when_secret_unset(env, monkeypatch):
 # ── F7: publish intent cross-company guard ───────────────────────────
 
 
+def _settle(repo, job_id, timeout_s=60):
+    """Wait until the background runner has finished with the job.
+
+    These tests force `state="done"` on a job the real JobRunner is
+    still executing; the runner sets `state="running"` at every
+    stage start, so without this wait the forced state can be
+    overwritten before the publish call (race seen in the S1a full
+    suite run).  The assertions themselves are unchanged.
+    """
+    import time
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if repo.get_job(job_id)["state"] in ("done", "failed"):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"job {job_id} did not settle in {timeout_s}s")
+
+
 def test_publish_intent_rejects_cross_company_attack_at_repo_layer(env):
     """At the repo layer (used by API + future internal callers + tests),
     passing a company_id which does not own the job raises Forbidden.
@@ -305,6 +323,7 @@ def test_publish_intent_rejects_cross_company_attack_at_repo_layer(env):
         "duration_seconds": 5, "platforms": ["tiktok"], "bible_id": bid,
     })
     job_id = r.json()["job_id"]
+    _settle(repo, job_id)
     repo.update_job(job_id, state="done")
     # Direct repo call with the WRONG company_id must raise Forbidden.
     from core.repo import Forbidden
@@ -336,6 +355,7 @@ def test_publish_intent_accepts_own_company(env):
         "duration_seconds": 5, "platforms": ["tiktok"], "bible_id": bid,
     })
     job_id = r.json()["job_id"]
+    _settle(repo, job_id)
     repo.update_job(job_id, state="done")
     r = client.post(f"/api/v1/jobs/{job_id}/publish", json={
         "action": "draft", "platforms": ["tiktok"],
@@ -358,6 +378,7 @@ def test_publish_intent_rejects_unknown_platform(env):
         "duration_seconds": 5, "platforms": ["tiktok"], "bible_id": bid,
     })
     job_id = r.json()["job_id"]
+    _settle(repo, job_id)
     repo.update_job(job_id, state="done")
     r = client.post(f"/api/v1/jobs/{job_id}/publish", json={
         "action": "draft", "platforms": ["not_a_real_platform"],

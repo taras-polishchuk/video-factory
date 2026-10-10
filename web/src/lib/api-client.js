@@ -15,17 +15,43 @@
 
 const BASE = '/api/v1';
 
+// CSRF (SECURITY S1a): every state-changing API route checks
+// X-CSRF-Token against the session. The session cookie is HttpOnly,
+// so the token comes from GET /auth/csrf (same origin; Caddy and the
+// Vite dev proxy forward /auth/* to FastAPI). Cached per page load;
+// refetched once if the API rejects it (e.g. after a re-login).
+const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+let csrfToken = null;
+
+async function getCsrf(force = false) {
+	if (csrfToken && !force) return csrfToken;
+	const r = await fetch('/auth/csrf', { credentials: 'same-origin' });
+	if (!r.ok) throw new Error('session expired, please log in again');
+	csrfToken = (await r.json()).csrf_token;
+	return csrfToken;
+}
+
+async function send(url, opts, headers) {
+	const method = (opts.method || 'GET').toUpperCase();
+	if (!UNSAFE.has(method)) {
+		return fetch(url, { ...opts, headers, credentials: 'same-origin' });
+	}
+	for (const force of [false, true]) {
+		headers['X-CSRF-Token'] = await getCsrf(force);
+		const r = await fetch(url, { ...opts, headers, credentials: 'same-origin' });
+		if (r.status !== 403 || force) return r;
+		const detail = await r.clone().text();
+		if (!/csrf/i.test(detail)) return r;
+	}
+}
+
 async function req(path, opts = {}) {
 	const headers = { ...(opts.headers || {}) };
 	if (opts.body && !(opts.body instanceof FormData) && typeof opts.body !== 'string') {
 		headers['Content-Type'] = 'application/json';
 		opts.body = JSON.stringify(opts.body);
 	}
-	const r = await fetch(BASE + path, {
-		...opts,
-		headers,
-		credentials: 'same-origin',
-	});
+	const r = await send(BASE + path, opts, headers);
 	if (!r.ok) {
 		const text = await r.text();
 		let detail;
@@ -57,17 +83,16 @@ export const api = {
 	uploadAsset: async (companyId, file, kind='misc') => {
 		const fd = new FormData();
 		fd.append('file', file);
-		return fetch(BASE + '/workspaces/' + companyId + '/assets?kind=' + encodeURIComponent(kind),
-			{ method: 'POST', body: fd, credentials: 'same-origin' }).then(r => {
-			if (!r.ok) throw new Error(r.status + ' upload failed');
-			return r.json();
-		});
+		return req('/workspaces/' + companyId + '/assets?kind=' + encodeURIComponent(kind),
+			{ method: 'POST', body: fd });
 	},
 	assetDownloadUrl: (id) => BASE + '/assets/' + id + '/download',
 	// jobs
 	listJobs: (companyId) => req('/workspaces/' + companyId + '/jobs'),
 	getJob: (id) => req('/jobs/' + id),
-	createJob: (b) => req('/jobs', { method: 'POST', body: b }),
+	// Workspace-scoped route (S1a): same handler semantics as the
+	// legacy POST /jobs, membership checked against the URL wid.
+	createJob: (b) => req('/workspaces/' + b.company_id + '/jobs', { method: 'POST', body: b }),
 	jobStages: (id) => req('/jobs/' + id + '/stages'),
 	jobOutputs: (id) => req('/jobs/' + id + '/outputs'),
 	retryJob: (id) => req('/jobs/' + id + '/retry', { method: 'POST' }),

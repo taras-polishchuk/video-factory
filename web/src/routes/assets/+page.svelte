@@ -18,7 +18,7 @@
     if (!file || !company) return;
     uploading = true; err = '';
     try {
-      const a = await api.uploadAsset(company.workspace_id, 'asset', file);
+      const a = await api.uploadAsset(company.workspace_id, file, 'misc');
       assets = [a, ...assets];
     } catch (e) { err = e.message; }
     finally { uploading = false; }
