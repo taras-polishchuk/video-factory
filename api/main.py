@@ -748,6 +748,54 @@ def create_app(*, repo: Optional[Repo] = None,
             "http://localhost",
         ).rstrip("/")
 
+    def _require_billing_configured() -> None:
+        """503 on every billing route while no Stripe key is set.
+
+        Called AFTER auth, CSRF and the membership/role check so an
+        anonymous or foreign caller learns nothing about the
+        deployment's billing config (VF-STG-04 / VF-STG-05).
+        """
+        if not _billing.is_configured():
+            raise HTTPException(503, _billing.BILLING_NOT_CONFIGURED_DETAIL)
+
+    @app.exception_handler(_billing.StripeConfigError)
+    async def _stripe_config_error(request: Request,
+                                   exc: "_billing.StripeConfigError"):
+        # Safety net for any billing route (current or future) that
+        # reaches get_stripe_client() without the explicit guard.  Fixed
+        # body: the exception text names the env var, the client must
+        # not see it.
+        return JSONResponse(
+            {"detail": _billing.BILLING_NOT_CONFIGURED_DETAIL},
+            status_code=503,
+        )
+
+    def _payload_str(payload: dict, key: str, default: str = "") -> str:
+        """Read an optional string field; non-strings are a 400.
+
+        ``None`` and ``""`` fall back to ``default`` (the old
+        ``payload.get(key) or default`` behaviour); anything else that
+        is not a ``str`` used to blow up in ``.strip()`` as a 500.
+        """
+        v = payload.get(key)
+        if v is None or v == "":
+            return default
+        if not isinstance(v, str):
+            raise HTTPException(400, f"{key} must be a string")
+        return v.strip()
+
+    @app.get("/api/v1/billing/status")
+    async def billing_status(
+        ctx: AuthContext = Depends(get_current_user),
+    ):
+        """Is billing usable on this deployment?  Booleans only.
+
+        The UI hides or disables upgrade buttons when ``enabled`` is
+        false.  Needs a session (any member), exposes no key, no price
+        id and no webhook state.
+        """
+        return {"enabled": _billing.is_configured()}
+
     def _require_workspace_owner_or_admin(
         ctx: AuthContext, workspace_id: str,
     ) -> dict:
@@ -773,11 +821,12 @@ def create_app(*, repo: Optional[Repo] = None,
     ):
         require_csrf(request,
                       x_csrf_token=request.headers.get("X-CSRF-Token"))
-        workspace_id = (payload.get("workspace_id") or "").strip()
+        workspace_id = _payload_str(payload, "workspace_id")
         if not workspace_id:
             raise HTTPException(400, "workspace_id required")
-        plan = (payload.get("plan") or "pro").strip()
+        plan = _payload_str(payload, "plan", "pro")
         ws = _require_workspace_owner_or_admin(ctx, workspace_id)
+        _require_billing_configured()
         # Reject if already on a paid plan — no need to send the
         # user to Stripe twice.  Wave 6b will route the user to
         # the portal endpoint instead; for now we surface 409 so
@@ -874,17 +923,25 @@ def create_app(*, repo: Optional[Repo] = None,
     ):
         require_csrf(request,
                       x_csrf_token=request.headers.get("X-CSRF-Token"))
-        workspace_id = (payload.get("workspace_id") or "").strip()
+        workspace_id = _payload_str(payload, "workspace_id")
         if not workspace_id:
             raise HTTPException(400, "workspace_id required")
         _require_workspace_owner_or_admin(ctx, workspace_id)
+        # 503 before the 404: without a Stripe key "complete a
+        # Checkout first" would send the user to a dead end.
+        _require_billing_configured()
         billing_state = repo.get_workspace_billing(workspace_id)
         customer_id = billing_state.get("stripe_customer_id")
         if not customer_id:
-            raise HTTPException(
-                404,
-                "no Stripe customer for this workspace yet — "
-                "complete a Checkout first",
+            # ``detail`` keeps the legacy shape; ``code`` lets the UI
+            # branch (offer Checkout) without matching on prose.
+            return JSONResponse(
+                {
+                    "detail": "no Stripe customer for this workspace "
+                              "yet, complete a Checkout first",
+                    "code": "no_stripe_customer",
+                },
+                status_code=404,
             )
         client = _billing.get_stripe_client()
         base = _billing_base_url(request)
@@ -1607,6 +1664,13 @@ def create_app(*, repo: Optional[Repo] = None,
     # missing the router factory raises at app construction time
     # so missing-config is loud at boot, not at first request.
     try:
+        # A blank / whitespace-only secret is "not set": signing with
+        # a guessable secret would let anyone forge plan upgrades.
+        if not (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip():
+            raise RuntimeError(
+                "STRIPE_WEBHOOK_SECRET is not set; the Stripe webhook "
+                "endpoint refuses all requests until it is configured"
+            )
         from api.webhooks_stripe import build_router as _stripe_webhook_router
         _stripe_router = _stripe_webhook_router(
             repo=repo,
@@ -1622,6 +1686,13 @@ def create_app(*, repo: Optional[Repo] = None,
         @app.get("/_stripe_init_error")
         def _stripe_init_error() -> dict:
             return {"ok": False, "error": _stripe_err_msg}
+
+        # B1: the route itself must exist and refuse (503), not 404.
+        # Nothing is read, verified, recorded or processed: with no
+        # secret no signature can be trusted, so no payload is.
+        @app.post("/api/v1/webhooks/stripe")
+        async def _stripe_webhook_unconfigured() -> None:
+            raise HTTPException(503, "stripe webhook not configured")
 
     # ── auth (Wave 1) ────────────────────────────────────────
 
