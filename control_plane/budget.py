@@ -15,6 +15,7 @@ adapter in lock-down. See `render_plane/gate.py` for the unified gate.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -48,7 +49,12 @@ class BudgetDecision:
 
 
 class BudgetGuard:
-    """In-memory cumulative budget. Estimates come from renderer.estimate()."""
+    """In-memory cumulative budget. Estimates come from renderer.estimate().
+
+    Thread-safe: ``reserve`` / ``release`` / ``record_spend`` serialise
+    on an internal lock, so concurrent submits cannot both fit into the
+    last slice of the batch ceiling (BLK-1).
+    """
 
     def __init__(
         self,
@@ -59,6 +65,7 @@ class BudgetGuard:
         self._max_video = float(max_cost_per_video_usd)
         self._max_batch = float(max_cost_per_batch_usd)
         self._batch_spent = 0.0
+        self._lock = threading.Lock()
 
     def preflight(
         self,
@@ -97,8 +104,48 @@ class BudgetGuard:
     def record_spend(self, amount_usd: float) -> None:
         if amount_usd < 0:
             raise BudgetExceeded("negative spend")
-        self._batch_spent += amount_usd
+        with self._lock:
+            self._batch_spent += amount_usd
+
+    def reserve(
+        self,
+        *,
+        estimated_cost_usd: Optional[float],
+        scope: str = "video",
+    ) -> BudgetDecision:
+        """Atomic preflight + record_spend.
+
+        Returns the preflight decision; when it is allowed the estimate
+        is already counted as spent. Undo with ``release`` if the work
+        is abandoned before the provider is charged.
+        """
+        with self._lock:
+            decision = self.preflight(
+                estimated_cost_usd=estimated_cost_usd, scope=scope,
+            )
+            if decision.allowed:
+                self._batch_spent += float(estimated_cost_usd or 0.0)
+            return decision
+
+    def release(self, amount_usd: Optional[float]) -> None:
+        """Give back a reservation that was never charged."""
+        if not amount_usd:
+            return
+        with self._lock:
+            self._batch_spent = max(0.0, self._batch_spent - float(amount_usd))
 
     @property
     def spent(self) -> float:
         return self._batch_spent
+
+
+def preflight_or_block(guard: BudgetGuard, *, estimated_cost_usd) -> BudgetDecision:
+    """Raise ``BudgetExceeded`` when the guard refuses the estimate.
+
+    MAJ-2: moved here from the deleted ``core/budget_enforcer.py`` shim
+    (its ``BudgetEnforcer`` was a 1:1 delegate of ``BudgetGuard``).
+    """
+    decision = guard.preflight(estimated_cost_usd=estimated_cost_usd)
+    if not decision.allowed:
+        raise BudgetExceeded(decision.reason)
+    return decision

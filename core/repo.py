@@ -227,6 +227,56 @@ def _compute_checksum(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+# Process-local fallback for _bootstrap_lock when an OS-level lock is
+# unavailable (":memory:" DBs, non-POSIX hosts, filesystems without
+# flock support). Keyed by the resolved DB directory.
+_BOOTSTRAP_FALLBACK_LOCKS: dict = {}
+_BOOTSTRAP_FALLBACK_GUARD = threading.Lock()
+
+
+@contextmanager
+def _bootstrap_lock(db_path: str) -> Iterator[None]:
+    """Exclusive cross-process + cross-thread lock for schema bootstrap.
+
+    Uses ``flock`` on the DB's *directory* (no sidecar lock file to
+    litter, and never an fd on the DB file itself: closing a second fd
+    on the DB file would drop SQLite's own POSIX locks). Each call opens
+    its own fd, so threads of one process exclude each other too.
+    Falls back to a process-local lock when flock is not available.
+    """
+    directory = None
+    if db_path and db_path != ":memory:" and not db_path.startswith("file:"):
+        directory = str(Path(db_path).resolve().parent)
+    fd = None
+    if directory is not None:
+        try:
+            import fcntl
+            fd = os.open(directory, os.O_RDONLY)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            fd = None
+    if fd is not None:
+        try:
+            yield
+        finally:
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        return
+    key = directory or db_path
+    with _BOOTSTRAP_FALLBACK_GUARD:
+        lock = _BOOTSTRAP_FALLBACK_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        yield
+
+
 class Repo:
     """Thread-safe SQLite wrapper. Per-thread connections guarded by a lock."""
 
@@ -348,6 +398,17 @@ class Repo:
         return c
 
     def _bootstrap_schema(self):
+        # F-11: two processes (or threads) opening the same DB at the
+        # same time must not interleave the schema bootstrap below.
+        # Several steps are check-then-ALTER (PRAGMA table_info, then
+        # ALTER TABLE ADD COLUMN); interleaved, the second booter
+        # crashes with "duplicate column name". The migration ledger
+        # itself is guarded by BEGIN IMMEDIATE; this lock covers the
+        # rest of the bootstrap.
+        with _bootstrap_lock(self.db_path):
+            self._bootstrap_schema_locked()
+
+    def _bootstrap_schema_locked(self):
         c = self._conn()
         # ── Wave 2 BLOCKER fix (t_d76b7c0c) ──
         # The order of operations matters when the DB already
@@ -422,6 +483,11 @@ class Repo:
             c.execute("ALTER TABLE audit_log ADD COLUMN workspace_id TEXT")
         if "actor" not in cols:
             c.execute("ALTER TABLE audit_log ADD COLUMN actor TEXT")
+        # Keyset pagination of GET /workspaces/{wid}/audit (MAJ-4).
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_workspace_created "
+            "ON audit_log(workspace_id, created_at)"
+        )
         c.commit()
 
     def _extend_workspaces_billing_columns(self) -> None:
@@ -1040,6 +1106,42 @@ class Repo:
                 c.commit()
             except Exception:
                 c.rollback()
+                raise
+
+    @contextmanager
+    def immediate_tx(self) -> Iterator[sqlite3.Connection]:
+        """A real write transaction: ``BEGIN IMMEDIATE`` ... ``COMMIT``.
+
+        Connections are opened with ``isolation_level=None``
+        (autocommit), so ``tx()`` above does NOT group statements: each
+        execute commits on its own. Read-then-write invariants (job
+        quota, budget) need an actual transaction. ``BEGIN IMMEDIATE``
+        takes SQLite's RESERVED lock up front, which serialises the
+        whole block against every other writer: other threads of this
+        process (they own other connections) and other processes.
+        The SELECTs inside the block therefore see the latest committed
+        state and nobody can insert in between. ``self._lock`` keeps the
+        in-process ordering identical to ``tx()``. Rotation-gated like
+        ``tx()``.
+        """
+        with self._lock:
+            from control_plane import key_rotation as _kr
+            if not _kr.writes_allowed(self):
+                raise _kr.RotationInProgress(
+                    "master-key rotation in progress; writes are paused"
+                )
+            c = self._conn()
+            if c.in_transaction:
+                # A best-effort writer on this thread left a statement
+                # transaction open; never nest into it.
+                c.execute("COMMIT")
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                yield c
+                c.execute("COMMIT")
+            except BaseException:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
                 raise
 
     # ── Workspace access guard ────────────────────────────────
@@ -1663,10 +1765,27 @@ class Repo:
         rows = self._conn().execute(
             "SELECT asset_id, workspace_id, kind, filename, storage_key, "
             "mime_type, size_bytes, checksum, uploaded_at FROM assets "
-            "WHERE workspace_id=? ORDER BY uploaded_at DESC",
+            "WHERE workspace_id=? ORDER BY uploaded_at DESC, rowid DESC",
             (workspace_id,),
         ).fetchall()
         return [self._row_asset(r) for r in rows]
+
+    def list_assets_page(self, workspace_id: str, *,
+                           limit: Optional[int] = None,
+                           cursor: Optional[str] = None
+                           ) -> tuple[list[dict], Optional[str]]:
+        """Keyset page of assets, newest first (MAJ-4)."""
+        from core.pagination import clamp_limit, keyset_page
+        self.require_workspace(workspace_id)
+        return keyset_page(
+            self._conn(),
+            select=("SELECT asset_id, workspace_id, kind, filename, "
+                    "storage_key, mime_type, size_bytes, checksum, "
+                    "uploaded_at FROM assets"),
+            where="workspace_id=?", params=[workspace_id],
+            ts_col="uploaded_at", limit=clamp_limit(limit), cursor=cursor,
+            row_fn=self._row_asset,
+        )
 
     def _row_asset(self, row) -> dict:
         return {
@@ -1691,7 +1810,18 @@ class Repo:
                      aspect_ratio: str = "9:16", count: int = 1,
                      render_profile: str = "mock",
                      bible_id: Optional[str] = None,
-                     approval_required: bool = False) -> dict:
+                     approval_required: bool = False,
+                     admission=None) -> dict:
+        """Insert a job row in state ``queued``.
+
+        ``admission`` (BLK-1): optional ``callable(conn, job_id)`` run
+        inside the same ``BEGIN IMMEDIATE`` transaction as the INSERT,
+        before it. It re-reads whatever it needs through ``conn``
+        (job count this month, ...) and raises to refuse; the INSERT
+        then never happens. Check + insert are one atomic unit across
+        threads and processes, so two concurrent submits cannot both
+        pass a "N jobs left" check.
+        """
         wid = self._resolve_wid(company_id, workspace_id)
         self.require_workspace(wid)
         if bible_id:
@@ -1706,7 +1836,9 @@ class Repo:
                 raise ValueError("bible must be approved before job creation")
         job_id = new_id("job")
         t = now_iso()
-        with self.tx() as c:
+        with (self.immediate_tx() if admission is not None else self.tx()) as c:
+            if admission is not None:
+                admission(c, job_id)
             c.execute(
                 """INSERT INTO jobs(job_id, workspace_id, bible_id, topic, language,
                    duration_seconds, platforms_json, aspect_ratio, count,
@@ -1748,9 +1880,12 @@ class Repo:
         return self._row_job(row)
 
     def count_jobs_since(self, *, workspace_id: str,
-                            since_iso: str) -> int:
+                            since_iso: str, conn=None) -> int:
         """Count how many jobs the workspace has submitted at or
         after ``since_iso`` (inclusive).
+
+        ``conn``: pass the connection of an open ``immediate_tx()`` to
+        count inside that transaction (atomic quota admission, BLK-1).
 
         Used by the Wave 6b FREE-tier monthly job quota
         (``core/quotas.check_job_quota``).  Pure SELECT; no tx
@@ -1766,7 +1901,7 @@ class Repo:
         That matches the operator's mental model: "I burnt my 5
         attempts on broken bibles" is a real quota cost.
         """
-        row = self._conn().execute(
+        row = (conn or self._conn()).execute(
             "SELECT COUNT(*) FROM jobs WHERE workspace_id=? "
             "AND created_at >= ?",
             (workspace_id, since_iso),
@@ -1807,9 +1942,131 @@ class Repo:
         if state:
             q += " AND state=?"
             params.append(state)
-        q += " ORDER BY created_at DESC"
+        q += " ORDER BY created_at DESC, rowid DESC"
         rows = self._conn().execute(q, params).fetchall()
         return [self._row_job(r) for r in rows]
+
+    _JOB_COLS = (
+        "job_id, workspace_id, bible_id, topic, language, "
+        "duration_seconds, platforms_json, aspect_ratio, count, "
+        "render_profile, approval_required, created_at, updated_at, "
+        "state, status_message, current_stage"
+    )
+
+    def list_jobs_page(self, *, company_id: Optional[str] = None,
+                         workspace_id: Optional[str] = None,
+                         state: Optional[str] = None,
+                         limit: Optional[int] = None,
+                         cursor: Optional[str] = None
+                         ) -> tuple[list[dict], Optional[str]]:
+        """Keyset page of jobs, newest first (MAJ-4).
+
+        Returns ``(items, next_cursor)``; ``next_cursor`` is None on
+        the last page. See core/pagination.py.
+        """
+        from core.pagination import clamp_limit, keyset_page
+        wid = workspace_id if workspace_id is not None else company_id
+        where, params = "1=1", []
+        if wid:
+            where += " AND workspace_id=?"
+            params.append(wid)
+        if state:
+            where += " AND state=?"
+            params.append(state)
+        return keyset_page(
+            self._conn(), select=f"SELECT {self._JOB_COLS} FROM jobs",
+            where=where, params=params, ts_col="created_at",
+            limit=clamp_limit(limit), cursor=cursor, row_fn=self._row_job,
+        )
+
+    # ── Restart recovery (F-30) ───────────────────────────────
+
+    def recover_stale_running_jobs(self, *, older_than_seconds: float,
+                                      max_requeues: int = 1,
+                                      exclude_job_ids: Iterable[str] = (),
+                                      now: Optional[float] = None) -> dict:
+        """Requeue (once) or fail jobs stuck in ``running``.
+
+        A job whose row has not been touched (``updated_at``) for
+        ``older_than_seconds`` while in state ``running`` has no live
+        pipeline thread (the process died mid-run). The first time we
+        see it we put it back to ``queued`` and bump
+        ``recovery_count``; once ``recovery_count`` reached
+        ``max_requeues`` it is marked ``failed`` with a reason instead,
+        so a job that crashes the worker cannot loop forever. Orphan
+        ``running`` stage rows of those jobs are closed as ``failed``.
+        One ``BEGIN IMMEDIATE`` transaction: two booting processes
+        cannot both requeue the same job.
+
+        Returns ``{"requeued": [job_id...], "failed": [job_id...]}``.
+        """
+        cutoff = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime((now if now is not None else time.time())
+                        - float(older_than_seconds)),
+        )
+        skip = set(exclude_job_ids or ())
+        requeued: list[str] = []
+        failed: list[str] = []
+        t = now_iso()
+        with self.immediate_tx() as c:
+            rows = c.execute(
+                "SELECT job_id, recovery_count FROM jobs "
+                "WHERE state='running' AND updated_at <= ? "
+                "ORDER BY created_at, rowid",
+                (cutoff,),
+            ).fetchall()
+            for job_id, rc in rows:
+                if job_id in skip:
+                    continue
+                rc = int(rc or 0)
+                if rc < max_requeues:
+                    c.execute(
+                        "UPDATE jobs SET state='queued', "
+                        "recovery_count=?, status_message=?, "
+                        "updated_at=? WHERE job_id=?",
+                        (rc + 1,
+                         f"recovered after restart: re-queued "
+                         f"(attempt {rc + 1} of {max_requeues})",
+                         t, job_id),
+                    )
+                    requeued.append(job_id)
+                else:
+                    c.execute(
+                        "UPDATE jobs SET state='failed', "
+                        "status_message=?, updated_at=? WHERE job_id=?",
+                        (f"failed after restart: job was still running "
+                         f"after {rc} recovery attempt(s); not retried "
+                         f"again (stale for >= "
+                         f"{int(older_than_seconds)}s)",
+                         t, job_id),
+                    )
+                    failed.append(job_id)
+                c.execute(
+                    "UPDATE job_stages SET status='failed', "
+                    "finished_at=COALESCE(finished_at, ?), "
+                    "error=COALESCE(error, ?) "
+                    "WHERE job_id=? AND status='running'",
+                    (t, "interrupted: process restarted mid-stage",
+                     job_id),
+                )
+        return {"requeued": requeued, "failed": failed}
+
+    def list_queued_job_ids(self) -> list[str]:
+        """Queued jobs, oldest first (FIFO order for resubmission)."""
+        rows = self._conn().execute(
+            "SELECT job_id FROM jobs WHERE state='queued' "
+            "ORDER BY created_at, rowid"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_job_recovery_count(self, job_id: str) -> int:
+        row = self._conn().execute(
+            "SELECT recovery_count FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        if not row:
+            raise NotFound(f"job {job_id} not found")
+        return int(row[0] or 0)
 
     def _row_job(self, row) -> dict:
         return {
@@ -2024,10 +2281,27 @@ class Repo:
         rows = self._conn().execute(
             "SELECT intent_id, job_id, workspace_id, action, platforms_json, "
             "caption, scheduled_for, created_at, executed_at, status, detail "
-            "FROM publish_intents WHERE job_id=? ORDER BY created_at DESC",
+            "FROM publish_intents WHERE job_id=? "
+            "ORDER BY created_at DESC, rowid DESC",
             (job_id,),
         ).fetchall()
         return [self._row_intent(r) for r in rows]
+
+    def list_publish_intents_page(self, job_id: str, *,
+                                    limit: Optional[int] = None,
+                                    cursor: Optional[str] = None
+                                    ) -> tuple[list[dict], Optional[str]]:
+        """Keyset page of publish intents, newest first (MAJ-4)."""
+        from core.pagination import clamp_limit, keyset_page
+        return keyset_page(
+            self._conn(),
+            select=("SELECT intent_id, job_id, workspace_id, action, "
+                    "platforms_json, caption, scheduled_for, created_at, "
+                    "executed_at, status, detail FROM publish_intents"),
+            where="job_id=?", params=[job_id], ts_col="created_at",
+            limit=clamp_limit(limit), cursor=cursor,
+            row_fn=self._row_intent,
+        )
 
     def _row_intent(self, row) -> dict:
         return {
@@ -2539,9 +2813,16 @@ class Repo:
                         actor: Optional[str] = None) -> dict:
         """Append a row to audit_log.
 
+        MAJ-1: this is the ONLY code path that writes ``audit_log``.
+        ``auth.audit_log.append``, ``core.audit.emit`` and the
+        ``audit_log`` mirror in ``control_plane.repo_helpers.
+        append_runner_audit`` all delegate here.
+
         `actor` is the denormalized display name (email or
         'operator') so audit consumers do not need to join users
-        at read time. Best-effort: never raises.
+        at read time. Best-effort: never raises; a dropped row is
+        logged as a warning (logger ``auth.audit_log``) so the
+        operator sees it.
         """
         try:
             audit_id = f"audlog_{uuid.uuid4().hex[:12]}"
@@ -2557,33 +2838,85 @@ class Repo:
                     "context": context or {},
                     "user_id": user_id, "workspace_id": workspace_id,
                     "actor": actor}
-        except Exception:
+        except Exception as e:
             # Best-effort: never let an audit failure break the
-            # caller.  Mirrors `auth.audit_log.append` policy.
+            # caller (a missed audit row is better than a missed
+            # login / billing action), but surface it.
+            try:
+                from auth.audit_log import _logger as _audit_logger
+                _audit_logger.warning(
+                    "audit_append dropped row event=%s user=%s "
+                    "workspace=%s err=%s: %s",
+                    event, user_id, workspace_id, type(e).__name__, e,
+                )
+            except Exception:
+                pass
             return {"audit_id": "", "event": event, "context": {},
                     "user_id": user_id, "workspace_id": workspace_id,
                     "actor": actor}
+
+    @staticmethod
+    def _row_audit(r) -> dict:
+        return {
+            "audit_id": r[0],
+            "event": r[1],
+            "context": json.loads(r[2]) if r[2] else {},
+            "user_id": r[3],
+            "workspace_id": r[4],
+            "actor": r[5],
+            "created_at": r[6],
+        }
 
     def list_audit(self, *, workspace_id: str, limit: int = 100) -> list[dict]:
         """Return recent audit rows for a workspace, newest first."""
         rows = self._conn().execute(
             "SELECT audit_id, event, context_json, user_id, workspace_id, "
             "actor, created_at FROM audit_log WHERE workspace_id=? "
-            "ORDER BY created_at DESC LIMIT ?",
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
             (workspace_id, int(limit)),
         ).fetchall()
-        return [
-            {
-                "audit_id": r[0],
-                "event": r[1],
-                "context": json.loads(r[2]) if r[2] else {},
-                "user_id": r[3],
-                "workspace_id": r[4],
-                "actor": r[5],
-                "created_at": r[6],
-            }
-            for r in rows
-        ]
+        return [self._row_audit(r) for r in rows]
+
+    def list_audit_page(self, *, workspace_id: str,
+                          limit: Optional[int] = None,
+                          cursor: Optional[str] = None
+                          ) -> tuple[list[dict], Optional[str]]:
+        """Keyset page of audit rows, newest first (MAJ-4).
+
+        Default page size stays 100 (the pre-pagination default of
+        GET /workspaces/{wid}/audit); max 200.
+        """
+        from core.pagination import clamp_limit, keyset_page
+        return keyset_page(
+            self._conn(),
+            select=("SELECT audit_id, event, context_json, user_id, "
+                    "workspace_id, actor, created_at FROM audit_log"),
+            where="workspace_id=?", params=[workspace_id],
+            ts_col="created_at", limit=clamp_limit(limit, default=100),
+            cursor=cursor, row_fn=self._row_audit,
+        )
+
+    # ── Retention (F-42) ─────────────────────────────────────
+
+    def delete_audit_older_than(self, cutoff_iso: str) -> dict:
+        """Delete ``audit_log`` and ``runner_audit`` rows created
+        strictly before ``cutoff_iso``. Returns per-table counts."""
+        out = {}
+        with self.immediate_tx() as c:
+            for table in ("audit_log", "runner_audit"):
+                exists = c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name=?", (table,),
+                ).fetchone()
+                if not exists:
+                    out[table] = 0
+                    continue
+                cur = c.execute(
+                    f"DELETE FROM {table} WHERE created_at < ?",
+                    (cutoff_iso,),
+                )
+                out[table] = int(cur.rowcount or 0)
+        return out
 
     # ── Auth: alias for the Wave 1 -> Wave 2 transition ───────
 

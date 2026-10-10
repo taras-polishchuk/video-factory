@@ -1,11 +1,12 @@
 """Single source of truth for Wave 6b audit event names.
 
-The DB-backed `audit_log` table is written by exactly ONE helper
-throughout the codebase: ``auth.audit_log.append`` (best-effort,
-never raises) and ``Repo.append_audit`` (the equivalent method
-on the repo).  The brief for Wave 6b is explicit: do NOT bypass
-the existing audit path, just call it with the canonical event
-names below.
+The DB-backed `audit_log` table is written by exactly ONE code
+path: ``Repo.append_audit`` (best-effort, never raises, logs a
+warning on a dropped row).  ``auth.audit_log.append``, ``emit``
+below and the actor mirror in ``append_runner_audit`` are thin
+delegates to it (MAJ-1).  The brief for Wave 6b is explicit: do
+NOT bypass the existing audit path, just call it with the canonical
+event names below.
 
 Why this module exists (instead of inlining strings at the call
 site):
@@ -52,6 +53,13 @@ EVENT_LIVE_PROVIDER_BLOCKED: str = "live_provider.blocked"
 a request (plan=free, or workspace.live_enabled=false, or both).
 Context MUST include ``workspace_id``, ``plan``,
 ``ws_live_enabled``, ``render_profile``, ``reason``.
+"""
+
+EVENT_BUDGET_REFUSED: str = "budget.refused"
+"""Emitted when atomic job admission (core/admission.py, BLK-1)
+refuses a submit because the budget guard refused the cost estimate
+(unknown live cost, per-video or batch ceiling). Context MUST include
+``workspace_id``, ``render_profile``, ``reason_code``, ``reason``.
 """
 
 

@@ -40,6 +40,7 @@ from urllib.parse import parse_qsl, urlencode
 from prometheus_client import (
     CollectorRegistry,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
 )
@@ -364,6 +365,46 @@ REQUEST_DURATION = Histogram(
              1.0, 2.5, 5.0, 10.0),
     registry=REGISTRY,
 )
+
+
+# JobRunner queue gauges (JOBS S3). Unlabelled, so cardinality is
+# fixed. Values are read from the process-wide runner at scrape time
+# (``set_function``), so they can never drift from the runner state.
+# The import is lazy to keep api.observability free of a module-level
+# dependency on core.runners.
+def _runner_stat(method: str):
+    def _read() -> float:
+        try:
+            from core.runners import Singleton
+            runner = Singleton._instance  # noqa: SLF001
+            return float(getattr(runner, method)()) if runner else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+    return _read
+
+
+JOB_QUEUE_DEPTH = Gauge(
+    "video_factory_job_queue_depth",
+    "Jobs accepted by the JobRunner and waiting (FIFO) for a free "
+    "slot; capped by VIDEO_FACTORY_MAX_CONCURRENT_JOBS.",
+    registry=REGISTRY,
+)
+JOB_QUEUE_DEPTH.set_function(_runner_stat("queue_depth"))
+
+JOBS_ACTIVE = Gauge(
+    "video_factory_jobs_active",
+    "Jobs currently executing in the JobRunner (<= the concurrency cap).",
+    registry=REGISTRY,
+)
+JOBS_ACTIVE.set_function(_runner_stat("active_count"))
+
+JOBS_CONCURRENCY_LIMIT = Gauge(
+    "video_factory_jobs_concurrency_limit",
+    "Configured JobRunner concurrency cap "
+    "(VIDEO_FACTORY_MAX_CONCURRENT_JOBS).",
+    registry=REGISTRY,
+)
+JOBS_CONCURRENCY_LIMIT.set_function(_runner_stat("concurrency_limit"))
 
 
 def metrics_response() -> bytes:

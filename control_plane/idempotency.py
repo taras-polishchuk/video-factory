@@ -104,27 +104,61 @@ class DurableIdempotencyStore:
 
     def save(self, key: str, receipt: ProviderSubmitReceipt) -> None:
         with self._lock:
-            try:
-                self._conn().execute(
-                    "INSERT INTO idem_receipts(idem_key, provider_job_id, metadata_json, created_at) VALUES (?,?,?,?)",
-                    (key, receipt.provider_job_id,
-                     json.dumps(receipt.accepted_metadata or {}),
-                     json.dumps({"ts": "now"})[1:-1]),  # placeholder; real time below
-                )
-            except sqlite3.IntegrityError:
-                return
-            import time as _t
+            self._insert_locked(key, receipt)
+
+    def _insert_locked(self, key: str, receipt: ProviderSubmitReceipt) -> bool:
+        """INSERT one receipt (caller holds ``self._lock``).
+
+        One statement with the real timestamp (no placeholder row +
+        UPDATE, MAJ-7). Returns False when the key already existed.
+        """
+        import time as _t
+        try:
             self._conn().execute(
-                "UPDATE idem_receipts SET created_at=? WHERE idem_key=?",
-                (_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()), key),
+                "INSERT INTO idem_receipts(idem_key, provider_job_id, metadata_json, created_at) VALUES (?,?,?,?)",
+                (key, receipt.provider_job_id,
+                 json.dumps(receipt.accepted_metadata or {}),
+                 _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())),
             )
+        except sqlite3.IntegrityError:
+            return False
+        return True
 
     def submit_once(self, key: str, receipt: ProviderSubmitReceipt) -> ProviderSubmitReceipt:
-        existing = self.lookup(key)
-        if existing is not None:
-            return existing
-        self.save(key, receipt)
-        return receipt
+        # MAJ-5: lookup + insert under ONE lock hold, so two threads
+        # cannot both miss the lookup and both believe they won.
+        with self._lock:
+            row = self._conn().execute(
+                "SELECT provider_job_id, metadata_json FROM idem_receipts WHERE idem_key=?",
+                (key,),
+            ).fetchone()
+            if row:
+                return ProviderSubmitReceipt(
+                    provider_job_id=row[0],
+                    accepted_metadata=json.loads(row[1]) if row[1] else {},
+                )
+            if self._insert_locked(key, receipt):
+                return receipt
+        # Lost an INSERT race against another process: return the
+        # receipt that won.
+        return self.lookup(key) or receipt
+
+    def all_receipts(self) -> list:
+        """Every receipt as ``(idem_key, ProviderSubmitReceipt)``, in a
+        deterministic order (oldest first, then key). Used to seed the
+        JobRunner's in-memory store on start-up (F-10)."""
+        with self._lock:
+            rows = self._conn().execute(
+                "SELECT idem_key, provider_job_id, metadata_json "
+                "FROM idem_receipts ORDER BY created_at, idem_key"
+            ).fetchall()
+        return [
+            (k, ProviderSubmitReceipt(
+                provider_job_id=pid,
+                accepted_metadata=json.loads(meta) if meta else {},
+            ))
+            for k, pid, meta in rows
+        ]
 
 
 def canonicalize_for_hash(obj: Any) -> Any:
