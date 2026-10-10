@@ -49,6 +49,11 @@ services:
       context: .
       dockerfile: Dockerfile
     image: video-factory-api:${VIDEO_FACTORY_IMAGE_TAG:-dev}
+    # Same as the Dockerfile CMD (kept explicit so the compose file shows
+    # the real process). 0.0.0.0: Caddy reaches it over the compose
+    # network (staging VF-STG-02); no host port is published.
+    # --log-config: JSON-only stdout (docs/observability.md).
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--log-config", "api/uvicorn_log_config.json", "--proxy-headers", "--no-server-header"]
     environment:
       VIDEO_FACTORY_DB: /data/video_factory.db
       VIDEO_FACTORY_STORAGE: /data/storage

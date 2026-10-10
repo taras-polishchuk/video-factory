@@ -383,6 +383,17 @@ def test_compose_production_env():
     assert "127.0.0.1" not in re.sub(r"#.*", "", api.split("command:")[-1].split("\n")[0])
 
 
+def test_compose_api_command_matches_dockerfile_cmd():
+    """The compose override must run exactly what the image was verified with."""
+    import json
+    docker = (REPO_ROOT / "Dockerfile").read_text()
+    cmd_src = docker[docker.rindex("CMD ["):].split("CMD", 1)[1]
+    cmd_src = cmd_src[: cmd_src.index("]") + 1].replace("\\\n", " ")
+    compose_line = next(ln for ln in _compose_service("api").splitlines()
+                        if ln.strip().startswith("command:"))
+    assert json.loads(compose_line.split("command:", 1)[1]) == json.loads(cmd_src)
+
+
 def test_systemd_unit_is_type_simple():
     unit = (REPO_ROOT / "systemd" / "video-factory.service").read_text()
     assert re.search(r"^Type=simple$", unit, re.MULTILINE)
