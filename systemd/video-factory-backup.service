@@ -1,0 +1,30 @@
+# Video Factory: nightly encrypted backup (restic). Triggered by
+# video-factory-backup.timer; run once by hand with
+#   systemctl start video-factory-backup.service && journalctl -u video-factory-backup -n 50
+#
+# /etc/video-factory/backup.env (0600, operator-provided, never in git):
+#   RESTIC_REPOSITORY=s3:s3.amazonaws.com/<bucket>/video-factory
+#   RESTIC_PASSWORD=...
+#   AWS_ACCESS_KEY_ID=...
+#   AWS_SECRET_ACCESS_KEY=...
+#   RESTIC_RETENTION_DAYS=30            (optional)
+# scripts/backup.sh snapshots the DB through the api container (online
+# SQLCipher backup), the storage tree and the Caddy cert volume, and
+# writes a sha256 manifest into the snapshot.
+
+[Unit]
+Description=Video Factory backup (restic)
+After=video-factory.service docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/video-factory
+EnvironmentFile=/etc/video-factory/backup.env
+Environment=VF_COMPOSE_PROJECT=video-factory
+Environment=VF_COMPOSE_FILE=/opt/video-factory/docker-compose.production.yml
+Environment=VF_COMPOSE_ENV_FILE=/opt/video-factory/.env.production
+Environment=VF_BACKUP_STAGING=/var/backups/video-factory
+ExecStart=/opt/video-factory/scripts/backup.sh
+Nice=10
+IOSchedulingClass=idle

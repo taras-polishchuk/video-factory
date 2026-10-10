@@ -24,11 +24,14 @@ Config:
 
   * ``STRIPE_WEBHOOK_SECRET`` env var (required at boot). The handler
     refuses ALL requests if this is unset.
-  * ``STRIPE_PRICE_PRO`` and ``STRIPE_PRICE_ENTERPRISE`` (optional):
-    when set, the handler maps a subscription's price to the
-    matching plan on ``customer.subscription.updated``. When
-    unset, any active subscription maps to ``pro`` (preserves the
-    pre-Wave-6c upgrade semantics for the test sandbox).
+  * ``STRIPE_PRO_PRICE_ID`` and ``STRIPE_ENTERPRISE_PRICE_ID``
+    (optional; same names as checkout, A2 F-24): when the enterprise
+    price is set, the handler maps a subscription with that price to
+    the ``enterprise`` plan on ``customer.subscription.updated``. Any
+    other active subscription maps to ``pro`` (preserves the
+    pre-Wave-6c upgrade semantics for the test sandbox). The legacy
+    names ``STRIPE_PRICE_PRO`` / ``STRIPE_PRICE_ENTERPRISE`` are still
+    read, with a deprecation warning.
 """
 from __future__ import annotations
 
@@ -113,13 +116,16 @@ def _plan_for_price_id(price_id: Optional[str]) -> str:
     """Map a Stripe price id to a workspace plan.
 
     Default: any non-empty price id maps to ``pro``. The
-    STRIPE_PRICE_ENTERPRISE env var upgrades the price -> plan
-    mapping so prod tenants with a dedicated enterprise SKU
-    land on the ``enterprise`` plan.
+    STRIPE_ENTERPRISE_PRICE_ID env var (legacy name
+    STRIPE_PRICE_ENTERPRISE, deprecated; see
+    ``api.billing.configured_price_id``) upgrades the price -> plan
+    mapping so prod tenants with a dedicated enterprise SKU land on
+    the ``enterprise`` plan.
     """
     if not price_id:
         return "pro"
-    enterprise_price = os.environ.get("STRIPE_PRICE_ENTERPRISE", "").strip()
+    from api.billing import configured_price_id
+    enterprise_price = configured_price_id("enterprise")
     if enterprise_price and price_id == enterprise_price:
         return "enterprise"
     return "pro"

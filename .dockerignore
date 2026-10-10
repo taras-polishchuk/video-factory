@@ -1,0 +1,29 @@
+# Build context hygiene for the API image (Dockerfile at repo root).
+# Never ship env files, databases, venvs, node_modules or git metadata.
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.venv
+venv
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+artifacts
+storage
+caddy-data
+.restic
+*.log
+
+# Not needed at runtime
+tests
+web
+infra/opentofu/.terraform
+infra/opentofu/*.tfstate*
+infra/hosts
+docs
+*.md
+!README.md

@@ -1,45 +1,48 @@
-# Video Factory — production systemd unit
+# Video Factory: production systemd unit
 #
-# Installs the api + web containers as a systemd service so the OS
-# supervises them. Secrets are passed via `LoadCredential=` (systemd
-# ≥ 250) — the operator writes the credential files under
-# /etc/video-factory/credentials/ (mode 0600) and systemd passes them
-# into the service environment without ever writing them to disk
-# inside the service.
+# Supervises the docker compose stack (api + web + caddy). Secrets are
+# passed via `LoadCredential=` (systemd >= 250): the operator (or
+# scripts/provision-and-deploy.sh) writes the credential files under
+# /etc/video-factory/credentials/ (mode 0600) and
+# video-factory-load-env.sh renders /opt/video-factory/.env.production
+# (0600, atomic write) for compose before each start.
 #
-# Companion file: docker-compose.production.yml + the LoadCredential=
-# mapping below.
+# Type=simple: `docker compose up` stays in the foreground and never
+# sends sd_notify(READY=1); the old Type=notify made systemd wait for a
+# notification that never comes.
+#
+# Companion files: docker-compose.production.yml,
+# systemd/video-factory-load-env.sh, systemd/secret-distribution.md.
 
 [Unit]
-Description=Video Factory SaaS (api + web)
+Description=Video Factory SaaS (api + web + caddy)
 After=network-online.target docker.service
 Requires=docker.service
 Wants=network-online.target
 
 [Service]
-Type=notify
-NotifyAccess=main
+Type=simple
 WorkingDirectory=/opt/video-factory
+# Creates /var/log/video-factory (credential-load audit log).
+LogsDirectory=video-factory
 
-# ─── Secrets (mode 0600; never written to /opt/video-factory/.env) ──
+# ─── Secrets (mode 0600) ───────────────────────────────────────
+# HETZNER_TOKEN is not here on purpose: the server never needs it.
 LoadCredential=cloudflare_api_token:/etc/video-factory/credentials/cloudflare_api_token
-LoadCredential=hetzner_token:/etc/video-factory/credentials/hetzner_token
 LoadCredential=stripe_secret_key:/etc/video-factory/credentials/stripe_secret_key
 LoadCredential=stripe_webhook_secret:/etc/video-factory/credentials/stripe_webhook_secret
 LoadCredential=video_factory_secret_key:/etc/video-factory/credentials/video_factory_secret_key
 LoadCredential=video_factory_db_key:/etc/video-factory/credentials/video_factory_db_key
 LoadCredential=video_factory_session_secret:/etc/video-factory/credentials/video_factory_session_secret
 
-# Read each credential into $CREDENTIALS_DIR/<name> at service start,
-# then export as env var to compose.
-Environment=VIDEO_FACTORY_CREDENTIALS_DIR=%d/credentials
-ExecStartPre=/usr/local/bin/video-factory-load-env.sh
-ExecStart=/usr/bin/docker compose --env-file /opt/video-factory/.env.production up
-ExecStop=/usr/bin/docker compose down
-ExecReload=/usr/bin/docker compose restart
+ExecStartPre=/usr/local/bin/video-factory-load-env.sh /opt/video-factory/.env.production
+ExecStart=/usr/bin/docker compose -p video-factory -f /opt/video-factory/docker-compose.production.yml --env-file /opt/video-factory/.env.production up --remove-orphans
+ExecStop=/usr/bin/docker compose -p video-factory -f /opt/video-factory/docker-compose.production.yml --env-file /opt/video-factory/.env.production down --timeout 30
+ExecReload=/usr/bin/docker compose -p video-factory -f /opt/video-factory/docker-compose.production.yml --env-file /opt/video-factory/.env.production restart
 
 Restart=on-failure
 RestartSec=10s
+TimeoutStopSec=90s
 
 [Install]
 WantedBy=multi-user.target
