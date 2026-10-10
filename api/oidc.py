@@ -188,6 +188,25 @@ def _new_state_nonce() -> str:
     return f"{secrets.token_urlsafe(16)}.{secrets.token_urlsafe(16)}"
 
 
+# ── PKCE (RFC 7636, S1b / A1 F24) ─────────────────────────────────
+
+def new_pkce_verifier() -> str:
+    """Return a fresh ``code_verifier``: 64 chars from the unreserved set.
+
+    RFC 7636 §4.1 allows 43..128 characters of [A-Z a-z 0-9 - . _ ~];
+    ``token_urlsafe(48)`` yields exactly 64 of [A-Z a-z 0-9 - _].
+    """
+    return secrets.token_urlsafe(48)
+
+
+def pkce_challenge(verifier: str) -> str:
+    """S256 ``code_challenge`` = BASE64URL(SHA256(verifier)), no padding."""
+    import base64
+    import hashlib
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
 def _split_state(state_blob: str) -> tuple[str, str]:
     """Split a stored state value back into (state, nonce).
 
@@ -204,13 +223,16 @@ def _split_state(state_blob: str) -> tuple[str, str]:
 
 def authorize_url(
     *, provider: str, redirect_uri: str, state: str, nonce: str,
+    code_challenge: Optional[str] = None,
 ) -> str:
     """Build the provider authorize URL.
 
     We hand-build the URL because we do not want to depend on the
     ``requests`` library (the authlib ``requests_client`` wrapper
     requires it). The URL shape is RFC 6749 §4.1.1 and works for
-    every OIDC-compliant provider.
+    every OIDC-compliant provider. With ``code_challenge`` the URL
+    carries PKCE (RFC 7636) ``code_challenge`` +
+    ``code_challenge_method=S256``; Google and GitHub both honour it.
     """
     import urllib.parse
     entry = _provider_cache.get(provider)
@@ -225,16 +247,25 @@ def authorize_url(
         # Google account" affordance — important for shared machines.
         "prompt": "select_account",
     }
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
     qs = urllib.parse.urlencode(params)
     return f"{entry['discovery']['authorization_endpoint']}?{qs}"
 
 
 def _scopes(provider: str) -> list[str]:
-    """OIDC scopes per provider."""
+    """OIDC scopes per provider.
+
+    GitHub (S1b / A1 F25): ``user:email`` only. It is enough for the
+    verified primary address (/user/emails) and the public /user
+    profile; ``read:user`` (private profile data) and ``openid``
+    (GitHub user sign-in is plain OAuth, no id_token) are not asked.
+    """
     if provider == "google":
         return ["openid", "email", "profile"]
     if provider == "github":
-        return ["read:user", "user:email", "openid"]
+        return ["user:email"]
     return ["openid", "email", "profile"]
 
 
@@ -242,12 +273,15 @@ def _scopes(provider: str) -> list[str]:
 
 def _exchange_code(
     *, provider: str, code: str, redirect_uri: str,
+    code_verifier: Optional[str] = None,
 ) -> dict:
     """Exchange ``code`` for tokens at the provider's token endpoint.
 
     Returns the raw token dict (typically
     ``{access_token, id_token, expires_in, ...}``). Raises
-    ``OIDCCallbackError`` on any failure.
+    ``OIDCCallbackError`` on any failure. ``code_verifier`` is the
+    PKCE secret bound to the state row; the provider rejects the
+    exchange if it does not hash to the ``code_challenge`` it saw.
     """
     import httpx
     import urllib.parse
@@ -259,6 +293,8 @@ def _exchange_code(
         "client_id": entry["client_id"],
         "client_secret": entry["client_secret"],
     }
+    if code_verifier:
+        body["code_verifier"] = code_verifier
     try:
         r = httpx.post(
             entry["discovery"]["token_endpoint"],
@@ -297,11 +333,13 @@ class OIDCCallbackError(Exception):
 def exchange_code_and_verify(
     *, provider: str, code: str, redirect_uri: str,
     expected_state: str, expected_nonce: str,
+    code_verifier: Optional[str] = None,
 ) -> dict:
     """Exchange the auth code, verify the id_token, return claims.
 
     Steps:
-      1. Exchange ``code`` for tokens at the provider's token endpoint.
+      1. Exchange ``code`` (+ the PKCE ``code_verifier``) for tokens
+         at the provider's token endpoint.
       2. Verify the id_token signature against the JWKS.
       3. Verify ``iss`` matches the discovery issuer.
       4. Verify ``aud`` matches the configured client_id.
@@ -316,6 +354,7 @@ def exchange_code_and_verify(
         token = _exchange_code(
             provider=provider, code=code,
             redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
         )
     except OIDCCallbackError:
         raise
@@ -467,8 +506,11 @@ def _ensure_oidc_pending_table(repo) -> None:
     Migration 007 covers ``oauth_identities`` but the one-time
     state/nonce store is kept in its own lightweight table so we
     can purge expired rows without affecting linked identities.
+    S1b adds the ``code_verifier`` column (PKCE) to tables created
+    by an older build.
     """
-    repo._conn().execute(
+    conn = repo._conn()
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS oidc_pending ("
         "  state TEXT PRIMARY KEY,"
         "  nonce TEXT NOT NULL,"
@@ -476,23 +518,28 @@ def _ensure_oidc_pending_table(repo) -> None:
         "  redirect_after TEXT,"
         "  created_at TEXT NOT NULL,"
         "  expires_at TEXT NOT NULL,"
-        "  consumed_at TEXT"
+        "  consumed_at TEXT,"
+        "  code_verifier TEXT"
         ")"
     )
-    repo._conn().commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(oidc_pending)")}
+    if "code_verifier" not in cols:
+        conn.execute("ALTER TABLE oidc_pending ADD COLUMN code_verifier TEXT")
+    conn.commit()
 
 
 def _store_pending(repo, *, state: str, nonce: str, provider: str,
-                   redirect_after: Optional[str]) -> None:
+                   redirect_after: Optional[str],
+                   code_verifier: Optional[str] = None) -> None:
     _ensure_oidc_pending_table(repo)
     now = _now_iso()
     expires = _now_plus(_STATE_TTL_SECONDS)
     repo._conn().execute(
         "INSERT INTO oidc_pending(state, nonce, provider, "
-        "redirect_after, created_at, expires_at) "
-        "VALUES (?,?,?,?,?,?)",
+        "redirect_after, created_at, expires_at, code_verifier) "
+        "VALUES (?,?,?,?,?,?,?)",
         (state, nonce, provider.lower(),
-         redirect_after or "", now, expires),
+         redirect_after or "", now, expires, code_verifier),
     )
     repo._conn().commit()
 
@@ -509,7 +556,7 @@ def _consume_pending(repo, *, state: str) -> Optional[dict]:
     conn = repo._conn()
     row = conn.execute(
         "SELECT state, nonce, provider, redirect_after, expires_at, "
-        "consumed_at FROM oidc_pending WHERE state=?",
+        "consumed_at, code_verifier FROM oidc_pending WHERE state=?",
         (state,),
     ).fetchone()
     if not row:
@@ -518,17 +565,21 @@ def _consume_pending(repo, *, state: str) -> Optional[dict]:
         return None
     if _is_expired(row[4]):
         return None
-    conn.execute(
+    cur = conn.execute(
         "UPDATE oidc_pending SET consumed_at=? WHERE state=? AND consumed_at IS NULL",
         (_now_iso(), state),
     )
     conn.commit()
+    if cur.rowcount != 1:
+        # A concurrent callback consumed it between SELECT and UPDATE.
+        return None
     return {
         "state": row[0],
         "nonce": row[1],
         "provider": row[2],
         "redirect_after": row[3] or None,
         "expires_at": row[4],
+        "code_verifier": row[6] or None,
     }
 
 
@@ -539,7 +590,8 @@ def build_router(repo) -> APIRouter:
     router = APIRouter(prefix="/auth/oauth", tags=["auth"])
 
     def _client_ip(request: Request) -> str:
-        return (request.client.host if request.client else "") or "unknown"
+        from auth.client_ip import client_ip as _resolve_client_ip
+        return _resolve_client_ip(request)
 
     def _redirect_uri(request: Request, provider: str) -> str:
         base = _env(
@@ -562,10 +614,14 @@ def build_router(repo) -> APIRouter:
             raise HTTPException(503, str(e))
         state_blob = _new_state_nonce()
         state, nonce = _split_state(state_blob)
+        # S1b / A1 F24: PKCE S256. The verifier never leaves the
+        # server; only its hash goes to the provider in the URL.
+        code_verifier = new_pkce_verifier()
         _store_pending(
             repo, state=state_blob, nonce=nonce,
             provider=p,
             redirect_after=redirect_after,
+            code_verifier=code_verifier,
         )
         try:
             url = authorize_url(
@@ -573,6 +629,7 @@ def build_router(repo) -> APIRouter:
                 redirect_uri=_redirect_uri(request, p),
                 state=state_blob,
                 nonce=nonce,
+                code_challenge=pkce_challenge(code_verifier),
             )
         except OIDCConfigError as e:
             raise HTTPException(503, str(e))
@@ -602,6 +659,10 @@ def build_router(repo) -> APIRouter:
         # treats state as opaque — we just compare the full blob).
         if state_param != pending["state"]:
             raise HTTPException(400, "state mismatch")
+        # S1b / A1 F24: a pending row without a PKCE verifier was not
+        # minted by this build's /start (or was tampered with): refuse.
+        if not pending.get("code_verifier"):
+            raise HTTPException(400, "invalid or expired state")
         try:
             claims = exchange_code_and_verify(
                 provider=p,
@@ -609,6 +670,7 @@ def build_router(repo) -> APIRouter:
                 redirect_uri=_redirect_uri(request, p),
                 expected_state=expected_state,
                 expected_nonce=expected_nonce,
+                code_verifier=pending["code_verifier"],
             )
         except OIDCConfigError as e:
             # Provider discovery / JWKS / network outage.
@@ -698,6 +760,15 @@ def build_router(repo) -> APIRouter:
         )
 
         # Issue session cookie + redirect to landing page.
+        # S1b / A1 F8: drop any session id the browser presented
+        # before this sign-in, then issue a fresh one.
+        from auth.session import SESSION_COOKIE_NAME as _SCN
+        _presented = (request.cookies.get(_SCN) or "").strip()
+        if _presented:
+            try:
+                repo.delete_session(_presented)
+            except Exception:  # noqa: BLE001 - never block sign-in
+                pass
         session_id = new_session_id()
         csrf = derive_csrf_token(session_id)
         repo.create_session(
@@ -725,7 +796,7 @@ def build_router(repo) -> APIRouter:
 
         request.state._vf_session_cookie = build_set_cookie_value(
             session_id=session_id, max_age=DEFAULT_TTL_SECONDS,
-            secure=should_use_secure_cookies(),
+            secure=should_use_secure_cookies(request),
         )
         landing = pending.get("redirect_after") or "/"
         # Always return JSON in tests; in a real browser the UI

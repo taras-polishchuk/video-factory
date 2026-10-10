@@ -59,13 +59,23 @@ def create_app(*, repo: Optional[Repo] = None,
         ),
     )
 
-    if cors_origins:
+    # S1b / A1 F14: CORS is OFF unless an explicit allow-list is
+    # given (``cors_origins=`` or VIDEO_FACTORY_CORS_ORIGINS); ``*``
+    # is never honoured. F19: hardening headers on every response,
+    # also when the API is reached without Caddy. See api/security.py.
+    from api.security import (
+        CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, SECURITY_HEADERS_STR,
+        SecurityHeadersMiddleware, cors_origins_from_env,
+    )
+    _cors = cors_origins_from_env(cors_origins)
+    if _cors:
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=cors_origins,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_origins=_cors,
+            allow_methods=CORS_ALLOW_METHODS,
+            allow_headers=CORS_ALLOW_HEADERS,
         )
+    app.add_middleware(SecurityHeadersMiddleware)
 
     @app.exception_handler(NotFound)
     async def _nf(request: Request, exc: NotFound):
@@ -114,7 +124,7 @@ def create_app(*, repo: Optional[Repo] = None,
         return JSONResponse(
             {"error": "internal server error", "request_id": rid},
             status_code=500,
-            headers={"X-Request-ID": rid},
+            headers={"X-Request-ID": rid, **SECURITY_HEADERS_STR},
         )
 
     # ── health + openapi ───────────────────────────────────────
@@ -830,31 +840,11 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.post("/api/v1/admin/keys/rotate")
     async def keys_rotate(request: Request,
-                          payload: dict,
                           ctx: AuthContext = Depends(get_current_user)):
-        from control_plane import key_rotation
-        owner_wid = _find_owner_workspace(repo, ctx.user_id)
-        if not owner_wid:
-            raise HTTPException(403, "owner role required")
-        old_key = payload.get("old_key")
-        new_key = payload.get("new_key")
-        if not old_key or not new_key:
-            raise HTTPException(
-                400, "old_key and new_key are required"
-            )
-        try:
-            return key_rotation.rotate(
-                repo=repo,
-                old_key=old_key,
-                new_key=new_key,
-                actor_user_id=ctx.user_id,
-            )
-        except key_rotation.RotationInProgress as e:
-            raise HTTPException(503, str(e))
-        except key_rotation.KeyFingerprintMissing as e:
-            raise HTTPException(400, str(e))
-        except key_rotation.RotationFailed as e:
-            raise HTTPException(500, str(e))
+        # S1b / A1 F11 + F15: CSRF, owner/admin role, current-password
+        # re-auth, key material never logged. See api/admin_keys.py.
+        from api.admin_keys import handle_rotate
+        return await handle_rotate(request, ctx, repo)
 
     # ── companies ──────────────────────────────────────────────
     # NOTE (Wave 2 follow-up, t_d76b7c0c): the legacy alias routes

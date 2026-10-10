@@ -8,6 +8,7 @@
 import { error } from "@sveltejs/kit";
 import type { PageServerLoad } from "./$types";
 import { env } from "$env/dynamic/private";
+import { upstream_headers } from "$lib/server/upstream";
 
 const API_BASE = env.VIDEO_FACTORY_API_URL || "http://127.0.0.1:8000";
 
@@ -19,7 +20,7 @@ export const load: PageServerLoad = async ({ params }) => {
 	try {
 		const r = await fetch(API_BASE + "/auth/verify", {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { "content-type": "application/json", ...upstream_headers() },
 			body: JSON.stringify({ token }),
 		});
 		if (r.status === 404) {
