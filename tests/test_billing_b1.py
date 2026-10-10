@@ -509,3 +509,37 @@ def test_checkout_and_portal_happy_path_unchanged(make_app):
                          json={"workspace_id": client.workspace_id})
     assert r2.status_code == 200, r2.text
     assert r2.json() == {"url": "https://billing.stripe.com/p/b1"}
+
+
+# ── 8. UI contract: /billing page follows /billing/status ─────
+#
+# Source-level pins (the repo's pattern for web/ in test_wave3_ui.py).
+# Runtime behaviour of the page was probed against a live API + vite
+# dev server and is recorded in the B1 report.
+
+
+def _web(path: str) -> str:
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent / "web" / "src"
+    return (root / path).read_text()
+
+
+def test_billing_page_reads_status_and_disables_buttons_when_off():
+    server = _web("routes/billing/+page.server.ts")
+    page = _web("routes/billing/+page.svelte")
+    assert "/api/v1/billing/status" in server
+    # unknown (null) must count as off: only an explicit true enables
+    assert "j.enabled === true" in server
+    assert "data.billingEnabled === true" in page
+    # both buttons are tied to the flag
+    assert page.count("disabled={!billingOn") == 2
+
+
+def test_billing_error_messages_never_echo_upstream_text():
+    msgs = _web("lib/server/billing.ts")
+    # 503 maps to a fixed sentence, not to the response body
+    assert "Billing is not set up on this deployment" in msgs
+    assert "no_stripe_customer" in msgs
+    # the helper takes (status, action, code) only: no body text in
+    assert "export function billing_error_message(" in msgs
+    assert "detail" not in msgs.split("export function")[1]
