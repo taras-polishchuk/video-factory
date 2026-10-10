@@ -38,7 +38,9 @@ Why a thin wrapper and not a Stripe-backed dataclass:
 """
 from __future__ import annotations
 
+import logging
 import os
+import warnings
 from typing import Optional
 
 import stripe
@@ -50,23 +52,51 @@ from stripe._error import StripeError
 # Env var that holds the Stripe secret key (sk_test_* for dev).
 STRIPE_SECRET_KEY_ENV = "STRIPE_SECRET_KEY"
 
-# Body of the 503 the API returns on every billing route while no Stripe
-# key is configured (VF-STG-04 / VF-STG-05).  One constant so the status
-# route, the guard and the exception handler cannot drift apart.
-BILLING_NOT_CONFIGURED_DETAIL = "billing not configured"
-
-# Upper bound for one Stripe HTTP round trip.  The SDK default is 80 s
-# (times 3 attempts), which would pin a worker for minutes when Stripe
-# hangs.  Operators can override with STRIPE_HTTP_TIMEOUT_SECONDS.
-STRIPE_HTTP_TIMEOUT_ENV = "STRIPE_HTTP_TIMEOUT_SECONDS"
-DEFAULT_STRIPE_HTTP_TIMEOUT_SECONDS = 10.0
-
 # Default Price IDs by plan. Operators can override via env; the
 # Wave 6a brief does not pin these, so we use placeholder IDs and
 # let the deployment environment set them. Tests assert that
 # whichever price_id is passed reaches the Stripe SDK.
 DEFAULT_PRO_PRICE_ID = "price_pro_placeholder"
 DEFAULT_ENTERPRISE_PRICE_ID = "price_enterprise_placeholder"
+
+# A2 F-24: ONE canonical env name per plan price. The webhook handler
+# used to read STRIPE_PRICE_PRO / STRIPE_PRICE_ENTERPRISE while checkout
+# read STRIPE_PRO_PRICE_ID / STRIPE_ENTERPRISE_PRICE_ID, so an operator
+# who set only one spelling got silently wrong plan mapping. The legacy
+# names still work but log a deprecation warning; the canonical name
+# wins when both are set.
+STRIPE_PRICE_ENV = {
+    "pro": "STRIPE_PRO_PRICE_ID",
+    "enterprise": "STRIPE_ENTERPRISE_PRICE_ID",
+}
+LEGACY_STRIPE_PRICE_ENV = {
+    "pro": "STRIPE_PRICE_PRO",
+    "enterprise": "STRIPE_PRICE_ENTERPRISE",
+}
+_warned_legacy_price_env: set[str] = set()
+_price_logger = logging.getLogger("api.billing")
+
+
+def configured_price_id(plan: str) -> str:
+    """Return the Stripe Price ID configured for ``plan`` ("" if unset).
+
+    Reads the canonical env var first, then the deprecated legacy name.
+    Empty / whitespace values count as unset.
+    """
+    canonical = STRIPE_PRICE_ENV[plan]
+    value = os.environ.get(canonical, "").strip()
+    if value:
+        return value
+    legacy = LEGACY_STRIPE_PRICE_ENV[plan]
+    value = os.environ.get(legacy, "").strip()
+    if value:
+        if legacy not in _warned_legacy_price_env:
+            _warned_legacy_price_env.add(legacy)
+            msg = f"{legacy} is deprecated; set {canonical} instead"
+            _price_logger.warning(msg)
+            warnings.warn(msg, DeprecationWarning, stacklevel=2)
+        return value
+    return ""
 
 
 # ── Errors ─────────────────────────────────────────────────────
@@ -85,26 +115,8 @@ class StripeCallError(RuntimeError):
 
     Catches ``stripe.error.StripeError`` at the wrapper boundary so
     the API layer can decide how to surface the failure (500 vs
-    503 vs user-friendly 400).  Also raised for transport failures
-    (timeouts, resets) and for a Stripe answer without a redirect URL;
-    the API maps all of them to 502 + an audit row.
+    503 vs user-friendly 400).
     """
-
-
-def _stripe_timeout_seconds() -> float:
-    raw = (os.environ.get(STRIPE_HTTP_TIMEOUT_ENV) or "").strip()
-    try:
-        value = float(raw) if raw else DEFAULT_STRIPE_HTTP_TIMEOUT_SECONDS
-    except ValueError:
-        return DEFAULT_STRIPE_HTTP_TIMEOUT_SECONDS
-    return value if value > 0 else DEFAULT_STRIPE_HTTP_TIMEOUT_SECONDS
-
-
-def _install_bounded_http_client() -> None:
-    """Point the SDK at an HTTP client with a bounded timeout."""
-    stripe.default_http_client = stripe.RequestsClient(
-        timeout=_stripe_timeout_seconds(),
-    )
 
 
 # ── Client wrapper ────────────────────────────────────────────
@@ -125,12 +137,13 @@ class StripeClient:
                 f"missing Stripe API key (set {STRIPE_SECRET_KEY_ENV})"
             )
         self._api_key = api_key
-        _install_bounded_http_client()
-        self._pro_price_id = pro_price_id or os.environ.get(
-            "STRIPE_PRO_PRICE_ID", DEFAULT_PRO_PRICE_ID,
+        self._pro_price_id = (
+            pro_price_id or configured_price_id("pro") or DEFAULT_PRO_PRICE_ID
         )
-        self._enterprise_price_id = enterprise_price_id or os.environ.get(
-            "STRIPE_ENTERPRISE_PRICE_ID", DEFAULT_ENTERPRISE_PRICE_ID,
+        self._enterprise_price_id = (
+            enterprise_price_id
+            or configured_price_id("enterprise")
+            or DEFAULT_ENTERPRISE_PRICE_ID
         )
 
     @property
@@ -210,16 +223,10 @@ class StripeClient:
             # configure the global module key.
             stripe.api_key = self._api_key
             sess = stripe.checkout.Session.create(**params)
-        except (StripeError, OSError) as e:
-            # OSError covers TimeoutError / ConnectionError that a
-            # custom HTTP client may let through unwrapped.
+        except StripeError as e:
             raise StripeCallError(str(e)) from e
-        url = getattr(sess, "url", None) or ""
-        if not url:
-            raise StripeCallError("stripe returned a checkout session "
-                                  "without a url")
         return {
-            "url": url,
+            "url": getattr(sess, "url", None) or "",
             "session_id": getattr(sess, "id", None) or "",
             "customer_id": getattr(sess, "customer", None) or "",
         }
@@ -244,14 +251,10 @@ class StripeClient:
                 customer=customer_id,
                 return_url=return_url,
             )
-        except (StripeError, OSError) as e:
+        except StripeError as e:
             raise StripeCallError(str(e)) from e
-        url = getattr(sess, "url", None) or ""
-        if not url:
-            raise StripeCallError("stripe returned a portal session "
-                                  "without a url")
         return {
-            "url": url,
+            "url": getattr(sess, "url", None) or "",
             "session_id": getattr(sess, "id", None) or "",
         }
 
@@ -271,25 +274,13 @@ def get_stripe_client() -> StripeClient:
     """
     global _client
     if _client is None:
-        key = (os.environ.get(STRIPE_SECRET_KEY_ENV) or "").strip()
+        key = os.environ.get(STRIPE_SECRET_KEY_ENV)
         if not key:
             raise StripeConfigError(
                 f"missing Stripe API key (set {STRIPE_SECRET_KEY_ENV})"
             )
         _client = StripeClient(api_key=key)
     return _client
-
-
-def is_configured() -> bool:
-    """True when a Stripe client exists or can be built from the env.
-
-    Never raises and never returns the key.  The API uses it for
-    ``GET /api/v1/billing/status`` and for the 503 guard on every
-    billing route.
-    """
-    if _client is not None:
-        return True
-    return bool((os.environ.get(STRIPE_SECRET_KEY_ENV) or "").strip())
 
 
 def reset_stripe_client() -> None:
