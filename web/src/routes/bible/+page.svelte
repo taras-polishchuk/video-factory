@@ -1,6 +1,7 @@
 <script>
-  import { api } from '$lib/api-client.js';
-  import { onMount } from 'svelte';
+  import { api, describeError } from '$lib/api-client.js';
+  import StatusNote from '$lib/components/StatusNote.svelte';
+  import { untrack } from 'svelte';
 
   let { data } = $props();
 
@@ -15,22 +16,28 @@
   });
   let saveError = $state('');
   let saving = $state(false);
-  let loaded = $state(false);
+  let approving = $state(false);
+  let phase = $state('loading'); // loading | ready | error
+  let loadError = $state('');
 
-  async function load() {
-    loaded = true;
+  async function loadBibles() {
+    if (!company) return;
+    phase = 'loading';
+    loadError = '';
+    try {
+      const bs = await api.listBibles(company.workspace_id);
+      bibles = bs;
+      active = bs[0] || null;
+      phase = 'ready';
+    } catch (e) {
+      loadError = describeError(e);
+      phase = 'error';
+    }
   }
 
   $effect(() => {
-    if (company) {
-      api.listBibles(company.workspace_id).then(bs => {
-        bibles = bs;
-        active = bs[0] || null;
-      });
-    }
+    if (company) untrack(loadBibles);
   });
-
-  onMount(load);
 
   async function saveDraft() {
     if (!company) return;
@@ -55,14 +62,21 @@
       const b = await api.createBible(company.workspace_id, payload);
       bibles = [b, ...bibles];
       active = b;
-    } catch (e) { saveError = e.message; }
+    } catch (e) { saveError = describeError(e); }
     finally { saving = false; }
   }
 
   async function approve(bible) {
-    const updated = await api.approveBible(bible.bible_id);
-    bibles = bibles.map(b => b.bible_id === updated.bible_id ? updated : b);
-    if (active?.bible_id === updated.bible_id) active = updated;
+    saveError = '';
+    approving = true;
+    try {
+      const updated = await api.approveBible(bible.bible_id);
+      bibles = bibles.map(b => b.bible_id === updated.bible_id ? updated : b);
+      if (active?.bible_id === updated.bible_id) active = updated;
+    } catch (e) {
+      // Was an unhandled rejection: the button just did nothing.
+      saveError = describeError(e);
+    } finally { approving = false; }
   }
 </script>
 
@@ -96,8 +110,10 @@
       </div>
     </header>
 
-    {#if !loaded}
-      <p class="muted">Loading…</p>
+    {#if phase === 'loading'}
+      <StatusNote kind="loading" message="Loading versions…" />
+    {:else if phase === 'error'}
+      <StatusNote kind="error" title="Couldn’t load Bible versions" message={loadError} onretry={loadBibles} />
     {:else if bibles.length === 0}
       <div class="empty">
         <p>No Bible yet.</p>
@@ -133,73 +149,73 @@
     </header>
 
     {#if saveError}
-      <div class="alert error">{saveError}</div>
+      <div class="alert error" role="alert">{saveError}</div>
     {/if}
 
     <div class="vf-row">
       <div class="vf-col" style="flex: 2 1 320px;">
-        <label>Brand name</label>
-        <input bind:value={form.name} placeholder={company.name} />
+        <label for="bible-name">Brand name</label>
+        <input id="bible-name" name="name" bind:value={form.name} placeholder={company.name} />
       </div>
       <div class="vf-col">
-        <label>Audience</label>
-        <input bind:value={form.audience} placeholder="home baristas 25-45" />
+        <label for="bible-audience">Audience <span class="req">(required)</span></label>
+        <input id="bible-audience" name="audience" bind:value={form.audience} placeholder="home baristas 25-45" required />
       </div>
     </div>
 
     <div class="vf-row">
       <div class="vf-col">
-        <label>Positioning</label>
-        <input bind:value={form.positioning} />
+        <label for="bible-positioning">Positioning</label>
+        <input id="bible-positioning" name="positioning" bind:value={form.positioning} />
       </div>
       <div class="vf-col">
-        <label>Tone</label>
-        <input bind:value={form.tone} />
+        <label for="bible-tone">Tone</label>
+        <input id="bible-tone" name="tone" bind:value={form.tone} />
       </div>
     </div>
 
     <div class="vf-row">
       <div class="vf-col">
-        <label>CTA</label>
-        <input bind:value={form.cta} />
+        <label for="bible-cta">CTA</label>
+        <input id="bible-cta" name="cta" bind:value={form.cta} />
       </div>
       <div class="vf-col">
-        <label>Approved script (optional)</label>
-        <input bind:value={form.approved_script} />
+        <label for="bible-script">Approved script (optional)</label>
+        <input id="bible-script" name="approved_script" bind:value={form.approved_script} />
       </div>
     </div>
 
-    <label>Prohibited phrases / imagery (one per line)</label>
-    <textarea bind:value={form.prohibited} rows="3" placeholder="No medical claims&#10;No competitor logos"></textarea>
+    <label for="bible-prohibited">Prohibited phrases / imagery (one per line)</label>
+    <textarea id="bible-prohibited" name="prohibited" bind:value={form.prohibited} rows="3" placeholder="No medical claims&#10;No competitor logos"></textarea>
 
     <h3 class="section-h3">Brand colors</h3>
     <div class="color-grid">
       <div class="color-cell">
-        <input type="color" bind:value={form.primary} aria-label="primary color" />
+        <input type="color" id="bible-primary-picker" bind:value={form.primary} aria-label="Primary color picker" />
         <div>
-          <label>Primary</label>
-          <input type="text" bind:value={form.primary} class="hex" />
+          <label for="bible-primary">Primary</label>
+          <input type="text" id="bible-primary" name="primary" bind:value={form.primary} class="hex" />
         </div>
       </div>
       <div class="color-cell">
-        <input type="color" bind:value={form.background} aria-label="background color" />
+        <input type="color" id="bible-background-picker" bind:value={form.background} aria-label="Background color picker" />
         <div>
-          <label>Background</label>
-          <input type="text" bind:value={form.background} class="hex" />
+          <label for="bible-background">Background</label>
+          <input type="text" id="bible-background" name="background" bind:value={form.background} class="hex" />
         </div>
       </div>
       <div class="color-cell">
-        <input type="color" bind:value={form.text} aria-label="text color" />
+        <input type="color" id="bible-text-picker" bind:value={form.text} aria-label="Text color picker" />
         <div>
-          <label>Text</label>
-          <input type="text" bind:value={form.text} class="hex" />
+          <label for="bible-text">Text</label>
+          <input type="text" id="bible-text" name="text" bind:value={form.text} class="hex" />
         </div>
       </div>
       <div class="color-cell">
-        <input type="color" bind:value={form.accent} aria-label="accent color" />
+        <input type="color" id="bible-accent-picker" bind:value={form.accent} aria-label="Accent color picker" />
         <div>
-          <label>Accent</label>
-          <input type="text" bind:value={form.accent} class="hex" />
+          <label for="bible-accent">Accent</label>
+          <input type="text" id="bible-accent" name="accent" bind:value={form.accent} class="hex" />
         </div>
       </div>
     </div>
@@ -209,7 +225,7 @@
         {saving ? 'Saving…' : active ? 'Save as new draft' : 'Save draft'}
       </button>
       {#if active && active.status === 'draft'}
-        <button class="vf-btn" onclick={() => approve(active)}>Approve v{active.version}</button>
+        <button class="vf-btn" onclick={() => approve(active)} disabled={approving}>{approving ? 'Approving…' : `Approve v${active.version}`}</button>
       {/if}
     </div>
   </section>
@@ -232,6 +248,7 @@
     margin: 0 0 var(--vf-sp-2);
   }
   .sub { color: var(--vf-text-secondary); max-width: 640px; margin-top: var(--vf-sp-3); }
+  .req { text-transform: none; letter-spacing: 0; }
 
   .card-header {
     display: flex;

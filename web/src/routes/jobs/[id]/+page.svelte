@@ -1,5 +1,6 @@
 <script>
-  import { api } from '$lib/api-client.js';
+  import { api, describeError } from '$lib/api-client.js';
+  import StatusNote from '$lib/components/StatusNote.svelte';
   import { onMount, onDestroy } from 'svelte';
   import { page } from '$app/stores';
 
@@ -24,8 +25,9 @@
       ]);
       error = '';
     } catch (e) {
-      error = e.message;
-      job = null;
+      // Keep the last good job on screen when a background refresh
+      // fails; only a first-load failure replaces the page.
+      error = describeError(e);
     }
     loading = false;
   }
@@ -54,7 +56,7 @@
       publishResult = { ok: true, detail: r.detail };
       publishIntents = await api.publishList(jobId);
     } catch (e) {
-      publishResult = { ok: false, detail: e.message };
+      publishResult = { ok: false, detail: describeError(e) };
     }
   }
 
@@ -62,7 +64,7 @@
     try {
       await api.retryJob(jobId);
       load();
-    } catch (e) { error = e.message; }
+    } catch (e) { error = describeError(e); }
   }
 
   function pillFor(state) {
@@ -79,14 +81,17 @@
 <svelte:head><title>{job?.topic || 'Job'} · Video Factory</title></svelte:head>
 
 {#if error && !job}
-  <div class="vf-card">
+  <div class="vf-card" role="alert">
     <h1>Couldn’t load job</h1>
     <p class="muted">{error}</p>
     <a href="/jobs" class="vf-btn vf-btn-ghost">← Back to jobs</a>
   </div>
 {:else if !job}
-  <p class="muted">Loading…</p>
+  <StatusNote kind="loading" message="Loading job…" />
 {:else}
+  {#if error}
+    <StatusNote kind="error" title="Live updates paused" message={error} onretry={load} />
+  {/if}
   <header class="page-header">
     <div class="header-row">
       <div>
@@ -158,7 +163,12 @@
         <a href={api.outputDownloadUrl(jobId, finalVideo.output_id)} download={finalVideo.filename} class="vf-btn vf-btn-primary">Download</a>
       </header>
       <div class="player">
-        <video controls src={api.outputDownloadUrl(jobId, finalVideo.output_id)} poster="" preload="metadata"></video>
+        <!-- Mock renders have no speech track. The empty captions file keeps a
+             captions <track> on the player (WCAG 1.2.2) until real
+             transcripts exist. -->
+        <video controls src={api.outputDownloadUrl(jobId, finalVideo.output_id)} preload="metadata">
+          <track kind="captions" src="/captions-none.vtt" srclang="en" label="English (none available)" />
+        </video>
       </div>
     </section>
   {/if}
@@ -226,6 +236,7 @@
 
       {#if publishIntents.length > 0}
         <h3 class="section-h3">Past intents</h3>
+        <div class="table-scroll">
         <table>
           <thead><tr><th>Action</th><th>Platforms</th><th>Caption</th><th>Status</th><th>When</th></tr></thead>
           <tbody>
@@ -240,6 +251,7 @@
             {/each}
           </tbody>
         </table>
+        </div>
       {/if}
     {:else}
       <p class="muted">Job must reach <code>done</code> before publishing. Currently <code>{job.state}</code>.</p>

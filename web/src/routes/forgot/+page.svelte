@@ -1,15 +1,21 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
+
 	let { form } = $props<{
 		form?: { ok?: boolean; email?: string; errors?: Record<string, string> };
 	}>();
 
-	let email = $state(form?.email || "");
+	// Seeded once from the server-side `form` result (untrack =
+	// intentional); bound so hydration keeps text typed early.
+	let email = $state(untrack(() => form?.email ?? ''));
 	let submitting = $state(false);
 
 	function onSubmit() { submitting = true; }
 </script>
 
 <svelte:head><title>Reset password · Video Factory</title></svelte:head>
+
+<svelte:window onpageshow={(e) => { if (e.persisted) submitting = false; }} />
 
 <div class="auth-page">
 	<form class="auth-card" method="POST" onsubmit={onSubmit}>

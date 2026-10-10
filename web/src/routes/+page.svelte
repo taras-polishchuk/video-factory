@@ -1,5 +1,7 @@
 <script>
-  import { api } from '$lib/api-client.js';
+  import { api, describeError } from '$lib/api-client.js';
+  import EmptyState from '$lib/components/EmptyState.svelte';
+  import StatusNote from '$lib/components/StatusNote.svelte';
   import { onMount } from 'svelte';
 
   let { data } = $props();
@@ -7,25 +9,41 @@
   let stats = $state({ companies: 0, jobs: 0, running: 0, done: 0, failed: 0, integrations: 0 });
   let recent = $state([]);
   let integrations = $state([]);
-  let loaded = $state(false);
+  // loading | ready | error
+  let phase = $state('loading');
+  let loadError = $state('');
 
-  onMount(async () => {
+  // Onboarding lives HERE and only here (A-1/A-4): the layout never
+  // swaps a route's content, so /credentials etc. always render.
+  // `firstCredentialExists` defaults to true in the layout loader when
+  // the credentials lookup fails, so a backend hiccup never shows it.
+  let showOnboarding = $derived(!!data.activeWorkspace && data.firstCredentialExists === false);
+
+  async function load() {
     if (!data.activeWorkspace) return;
     const wid = data.activeWorkspace.workspace_id;
-    const jobs = await api.listJobs(wid);
-    const ints = await api.integrations();
-    integrations = ints;
-    stats = {
-      companies: (data.workspaces || []).length,
-      jobs: jobs.length,
-      running: jobs.filter(j => j.state === 'running' || j.state === 'queued').length,
-      done: jobs.filter(j => j.state === 'done').length,
-      failed: jobs.filter(j => j.state === 'failed').length,
-      integrations: ints.length,
-    };
-    recent = jobs.slice(0, 6);
-    loaded = true;
-  });
+    phase = 'loading';
+    loadError = '';
+    try {
+      const [jobs, ints] = await Promise.all([api.listJobs(wid), api.integrations()]);
+      integrations = ints;
+      stats = {
+        companies: (data.workspaces || []).length,
+        jobs: jobs.length,
+        running: jobs.filter(j => j.state === 'running' || j.state === 'queued').length,
+        done: jobs.filter(j => j.state === 'done').length,
+        failed: jobs.filter(j => j.state === 'failed').length,
+        integrations: ints.length,
+      };
+      recent = jobs.slice(0, 6);
+      phase = 'ready';
+    } catch (e) {
+      loadError = describeError(e);
+      phase = 'error';
+    }
+  }
+
+  onMount(load);
 
   function pillFor(state) {
     if (state === 'done') return 'ok';
@@ -50,6 +68,25 @@
     </div>
   </div>
 </header>
+
+{#if !data.activeWorkspace}
+  <EmptyState
+    title="No workspace yet"
+    body="Your account is not a member of any workspace, so there is nothing to show. Log out and sign up again to create one, or ask a workspace owner to invite you."
+  />
+{:else}
+{#if showOnboarding}
+  <EmptyState
+    compact
+    title="Welcome — paste your first provider key to get started"
+    body="You're signed in. Add a provider key to start producing videos."
+    ctaHref="/credentials"
+    ctaLabel="Add provider key"
+    hint="A provider key is the API key for a rendering or publishing service (HeyGen, ComfyUI, Publer). It is stored encrypted for this workspace only. Mock renders need no key, so you can also try a test video right away."
+    secondaryHref="/create"
+    secondaryLabel="Create a mock video"
+  />
+{/if}
 
 <section class="stat-grid">
   <a href="/bible" class="stat hoverable">
@@ -83,14 +120,17 @@
     <a href="/jobs" class="vf-btn vf-btn-ghost vf-btn-sm">View all →</a>
   </header>
 
-  {#if !loaded}
-    <p class="muted">Loading…</p>
+  {#if phase === 'loading'}
+    <StatusNote kind="loading" message="Loading recent jobs…" />
+  {:else if phase === 'error'}
+    <StatusNote kind="error" title="Couldn’t load jobs" message={loadError} onretry={load} />
   {:else if recent.length === 0}
     <div class="empty">
       <p>No jobs yet.</p>
       <a href="/create" class="vf-btn vf-btn-primary vf-btn-sm">+ Create the first one</a>
     </div>
   {:else}
+    <div class="table-scroll">
     <table>
       <thead>
         <tr><th>Job</th><th>Topic</th><th>Company</th><th>State</th><th>Stage</th><th>Created</th></tr>
@@ -108,6 +148,7 @@
         {/each}
       </tbody>
     </table>
+    </div>
   {/if}
 </section>
 
@@ -120,8 +161,12 @@
     <a href="/integrations" class="vf-btn vf-btn-ghost vf-btn-sm">Manage</a>
   </header>
 
-  {#if integrations.length === 0}
-    <p class="muted">Loading provider status…</p>
+  {#if phase === 'loading'}
+    <StatusNote kind="loading" message="Loading provider status…" />
+  {:else if phase === 'error'}
+    <StatusNote kind="error" title="Couldn’t load provider status" message={loadError} onretry={load} />
+  {:else if integrations.length === 0}
+    <StatusNote kind="empty" message="No providers reported by the API." />
   {:else}
     <div class="provider-row">
       {#each integrations as i}
@@ -134,6 +179,7 @@
     </div>
   {/if}
 </section>
+{/if}
 
 <style>
   .page-header {

@@ -1,8 +1,24 @@
 <script>
-  import { api } from '$lib/api-client.js';
+  import { api, describeError } from '$lib/api-client.js';
+  import StatusNote from '$lib/components/StatusNote.svelte';
   import { onMount } from 'svelte';
+
   let items = $state([]);
-  onMount(() => api.integrations().then(set => items = set));
+  let phase = $state('loading'); // loading | ready | error
+  let loadError = $state('');
+
+  async function load() {
+    phase = 'loading';
+    loadError = '';
+    try {
+      items = await api.integrations();
+      phase = 'ready';
+    } catch (e) {
+      loadError = describeError(e);
+      phase = 'error';
+    }
+  }
+  onMount(load);
 </script>
 
 <svelte:head><title>Integrations · Video Factory</title></svelte:head>
@@ -18,8 +34,12 @@
 </header>
 
 <section class="vf-card">
-  {#if items.length === 0}
-    <p class="muted">Loading provider status…</p>
+  {#if phase === 'loading'}
+    <StatusNote kind="loading" message="Loading provider status…" />
+  {:else if phase === 'error'}
+    <StatusNote kind="error" title="Couldn’t load provider status" message={loadError} onretry={load} />
+  {:else if items.length === 0}
+    <StatusNote kind="empty" message="No providers reported by the API." />
   {:else}
     <div class="provider-grid">
       {#each items as i}

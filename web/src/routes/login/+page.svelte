@@ -1,15 +1,18 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
+
 	let { data, form } = $props<{
 		data: { next: string };
 		form?: { errors?: Record<string, string>; email?: string };
 	}>();
 
-	// Initialize from form result. Captured on first render; later
-	// updates from a redirect+re-render will re-instantiate this
-	// component (form action result). This matches the legacy
-	// behavior of "echo server error back into the input".
-	let email = $state(form?.email || "");
-	let password = $state("");
+	// Plain (non-enhanced) form POST: a failed login re-renders this
+	// page from the server with `form` set, so the email is seeded from
+	// it ONCE on first render (untrack = intentional, no reactive link).
+	// It stays a bound $state, not a `value={...}` attribute: Svelte
+	// hydration would otherwise overwrite what the user already typed
+	// while the JS bundle was still loading.
+	let email = $state(untrack(() => form?.email ?? ''));
 	let submitting = $state(false);
 
 	function onSubmit() {
@@ -19,8 +22,20 @@
 
 <svelte:head><title>Log in · Video Factory</title></svelte:head>
 
+<!-- bfcache can restore this page after "Back" with the button still
+     disabled; reset it. -->
+<svelte:window onpageshow={(e) => { if (e.persisted) submitting = false; }} />
+
 <div class="auth-page">
-	<form class="auth-card" method="POST" onsubmit={onSubmit}>
+	<!-- A-2: the route only has named actions, so the form must target
+	     `?/login`. `next` rides along in the query (kept across a failed
+	     attempt) and in the hidden field. -->
+	<form
+		class="auth-card"
+		method="POST"
+		action={`?/login&next=${encodeURIComponent(data.next)}`}
+		onsubmit={onSubmit}
+	>
 		<h1>Welcome back</h1>
 		<p class="sub">Sign in to your Video Factory workspace.</p>
 
@@ -50,7 +65,6 @@
 				name="password"
 				autocomplete="current-password"
 				required
-				bind:value={password}
 				aria-invalid={!!form?.errors?.password}
 			/>
 			{#if form?.errors?.password}

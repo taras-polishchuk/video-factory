@@ -444,6 +444,11 @@ tbody tr {
 tbody tr:hover { background: var(--vf-surface-1); }
 tbody tr:last-child td { border-bottom: 0; }
 
+/* Wide tables scroll inside their card instead of stretching the page
+   (390px viewports overflowed horizontally). */
+.table-scroll { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.table-scroll > table { min-width: 560px; }
+
 /* ─── Layout helpers ────────────────────────────────────── */
 .vf-row, .row {
   display: flex;
@@ -490,4 +495,13 @@ tbody tr:last-child td { border-bottom: 0; }
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Visually hidden but still focusable / announced by screen readers. */
+.sr-only {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  overflow: hidden; clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
 }

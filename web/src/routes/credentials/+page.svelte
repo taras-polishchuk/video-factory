@@ -1,6 +1,7 @@
 <script>
-  import { api } from '$lib/api-client.js';
-  import { onMount } from 'svelte';
+  import { api, describeError } from '$lib/api-client.js';
+  import StatusNote from '$lib/components/StatusNote.svelte';
+  import { untrack } from 'svelte';
 
   let { data } = $props();
 
@@ -20,20 +21,32 @@
   // resolves the active workspace from the session.
   let company = $derived(data.activeWorkspace || null);
   let items = $state([]);
+  let phase = $state('loading'); // loading | ready | error
+  let loadError = $state('');
   let editing = $state({});   // provider -> { value: '', saving: false, error: '' }
   let flash = $state({ kind: '', message: '' });
 
-  onMount(async () => {
-    if (company) await reload();
+  $effect(() => {
+    if (company) untrack(reload);
   });
 
   async function reload() {
     if (!company) return;
     try {
       items = await api.listCredentials(company.workspace_id);
+      phase = 'ready';
     } catch (e) {
-      flash = { kind: 'error', message: e.message };
+      loadError = describeError(e);
+      // Keep what is already on screen after a failed refresh; only
+      // the first load turns into the error state.
+      if (phase === 'loading') phase = 'error';
+      else flash = { kind: 'error', message: loadError };
     }
+  }
+
+  function retry() {
+    phase = 'loading';
+    return reload();
   }
 
   function providerRecord(p) {
@@ -63,7 +76,7 @@
       await reload();
       flash = { kind: 'ok', message: `${p} saved (fingerprint will update)` };
     } catch (e) {
-      editing = { ...editing, [p]: { ...editing[p], saving: false, error: e.message } };
+      editing = { ...editing, [p]: { ...editing[p], saving: false, error: describeError(e) } };
     }
   }
 
@@ -74,7 +87,7 @@
       await reload();
       flash = { kind: 'ok', message: `${p} deleted` };
     } catch (e) {
-      flash = { kind: 'error', message: e.message };
+      flash = { kind: 'error', message: describeError(e) };
     }
   }
 
@@ -107,12 +120,16 @@
 </header>
 
 {#if flash.message}
-  <div class="flash {flash.kind}">{flash.message}</div>
+  <div class="flash {flash.kind}" role={flash.kind === 'error' ? 'alert' : 'status'}>{flash.message}</div>
 {/if}
 
 <section class="vf-card">
   {#if !company}
     <p class="muted">Select a workspace to manage credentials.</p>
+  {:else if phase === 'loading'}
+    <StatusNote kind="loading" message="Loading saved credentials…" />
+  {:else if phase === 'error'}
+    <StatusNote kind="error" title="Couldn’t load credentials" message={loadError} onretry={retry} />
   {:else}
     <div class="provider-list">
       {#each PROVIDERS as p}
@@ -133,32 +150,38 @@
           <div class="provider-actions">
             {#if editing[p.id]}
               <div class="editor">
+                <label class="sr-only" for="cred-{p.id}">Secret for {p.label}</label>
                 <input
+                  id="cred-{p.id}"
+                  name="secret-{p.id}"
                   type="password"
                   autocomplete="off"
                   placeholder="paste plaintext secret"
                   bind:value={editing[p.id].value}
                   disabled={editing[p.id].saving}
+                  aria-invalid={!!editing[p.id].error}
+                  aria-describedby={editing[p.id].error ? `cred-${p.id}-err` : undefined}
                 />
                 <button
+                  type="button"
                   class="primary"
-                  on:click={() => saveCredential(p.id)}
+                  onclick={() => saveCredential(p.id)}
                   disabled={editing[p.id].saving}
                 >
                   {editing[p.id].saving ? 'saving…' : 'save'}
                 </button>
-                <button class="ghost" on:click={() => cancelEditor(p.id)} disabled={editing[p.id].saving}>
+                <button type="button" class="ghost" onclick={() => cancelEditor(p.id)} disabled={editing[p.id].saving}>
                   cancel
                 </button>
                 {#if editing[p.id].error}
-                  <p class="error">{editing[p.id].error}</p>
+                  <p class="error" id="cred-{p.id}-err" role="alert">{editing[p.id].error}</p>
                 {/if}
               </div>
             {:else if rec}
-              <button class="ghost" on:click={() => openEditor(p.id)}>rotate</button>
-              <button class="danger" on:click={() => deleteCredential(p.id)}>delete</button>
+              <button type="button" class="ghost" onclick={() => openEditor(p.id)}>rotate</button>
+              <button type="button" class="danger" onclick={() => deleteCredential(p.id)}>delete</button>
             {:else}
-              <button class="primary" on:click={() => openEditor(p.id)}>add secret</button>
+              <button type="button" class="primary" onclick={() => openEditor(p.id)}>add secret</button>
             {/if}
           </div>
         </article>
@@ -197,3 +220,66 @@
     </li>
   </ul>
 </section>
+
+<style>
+  .page-header { margin-bottom: var(--vf-sp-7); }
+  .header-row {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    gap: var(--vf-sp-5); flex-wrap: wrap;
+  }
+  .eyebrow {
+    font-size: var(--vf-fs-cap-sm); text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--vf-text-secondary);
+    margin: 0 0 var(--vf-sp-2);
+  }
+  .sub { color: var(--vf-text-secondary); max-width: 640px; margin-top: var(--vf-sp-3); }
+  .muted { color: var(--vf-text-secondary); }
+  .small { font-size: var(--vf-fs-cap); margin: var(--vf-sp-1) 0 0; }
+  .company-chip {
+    font-size: var(--vf-fs-cap); color: var(--vf-text-secondary);
+    padding: 4px 12px; border-radius: var(--vf-radius-pill);
+    background: var(--vf-surface-1); border: 1px solid var(--vf-border);
+  }
+
+  .flash {
+    padding: var(--vf-sp-3) var(--vf-sp-4); margin-bottom: var(--vf-sp-4);
+    border-radius: var(--vf-radius-md); font-size: var(--vf-fs-ui);
+    border: 1px solid var(--vf-border);
+  }
+  .flash.ok { background: var(--vf-surface-1); color: var(--vf-text-primary); border-color: rgba(110, 232, 110, 0.35); }
+  .flash.error { background: var(--vf-error-surface); color: var(--vf-error-text); border-color: rgba(248, 113, 113, 0.25); }
+
+  .provider-list { display: flex; flex-direction: column; }
+  .provider-row {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: var(--vf-sp-5); flex-wrap: wrap;
+    padding: var(--vf-sp-4) 0;
+    border-bottom: 1px solid var(--vf-border-subtle);
+  }
+  .provider-row:last-child { border-bottom: 0; }
+  .provider-meta { min-width: 0; flex: 1 1 260px; }
+  .provider-meta h3 { margin: 0 0 var(--vf-sp-1); }
+  .env-name { font-size: var(--vf-fs-cap-sm); }
+  .provider-actions { display: flex; gap: var(--vf-sp-2); align-items: center; flex-wrap: wrap; }
+  .editor { display: flex; gap: var(--vf-sp-2); align-items: center; flex-wrap: wrap; flex: 1 1 320px; }
+  .editor input { flex: 1 1 200px; min-width: 0; width: auto; }
+  .editor .error { flex-basis: 100%; margin: 0; color: var(--vf-error-text); font-size: var(--vf-fs-cap); }
+
+  .provider-actions button, .editor button {
+    padding: 8px 14px; border-radius: var(--vf-radius-md);
+    border: 1px solid var(--vf-border); background: var(--vf-surface-2);
+    color: var(--vf-text-primary); font: inherit; font-size: var(--vf-fs-ui);
+    cursor: pointer; min-height: 36px;
+  }
+  .provider-actions button:disabled, .editor button:disabled { opacity: 0.6; cursor: not-allowed; }
+  button.primary { background: var(--vf-butter-green); color: #0a0909; border-color: transparent; font-weight: var(--vf-fw-semibold); }
+  button.ghost { background: transparent; }
+  button.danger { background: transparent; color: var(--vf-error-text); border-color: rgba(248, 113, 113, 0.35); }
+
+  .explain { margin: 0; padding-left: var(--vf-sp-5); display: flex; flex-direction: column; gap: var(--vf-sp-3); color: var(--vf-text-secondary); }
+  .explain strong { color: var(--vf-text-primary); }
+
+  @media (max-width: 880px) {
+    .provider-actions, .editor { width: 100%; }
+  }
+</style>

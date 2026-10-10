@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
+
 	let { form } = $props<{
 		form?: {
 			errors?: Record<string, string>;
@@ -7,9 +9,12 @@
 		};
 	}>();
 
-	let email = $state(form?.email || "");
-	let password = $state("");
-	let workspace_name = $state(form?.workspace_name || "");
+	// Plain form POST: a failed signup re-renders from the server with
+	// `form` set; seed once from it (untrack = intentional). Bound
+	// $state, not `value={...}`, so hydration cannot wipe text typed
+	// before the JS bundle finished loading.
+	let email = $state(untrack(() => form?.email ?? ''));
+	let workspace_name = $state(untrack(() => form?.workspace_name ?? ''));
 	let submitting = $state(false);
 
 	function onSubmit() {
@@ -18,6 +23,8 @@
 </script>
 
 <svelte:head><title>Create an account · Video Factory</title></svelte:head>
+
+<svelte:window onpageshow={(e) => { if (e.persisted) submitting = false; }} />
 
 <div class="auth-page">
 	<form class="auth-card" method="POST" onsubmit={onSubmit}>
@@ -51,7 +58,6 @@
 				autocomplete="new-password"
 				minlength="8"
 				required
-				bind:value={password}
 				aria-invalid={!!form?.errors?.password}
 			/>
 			{#if form?.errors?.password}

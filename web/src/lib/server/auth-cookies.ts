@@ -10,8 +10,9 @@
 
 import type { Cookies } from "@sveltejs/kit";
 import { env } from "$env/dynamic/private";
-import { ApiError, api_request } from "./api";
-import { fail } from "@sveltejs/kit";
+import { ApiError, Auth } from "./api";
+import { fail, redirect } from "@sveltejs/kit";
+import { same_origin_path } from "./safe-redirect";
 
 const API_BASE = env.VIDEO_FACTORY_API_URL || "http://127.0.0.1:8000";
 
@@ -62,7 +63,10 @@ function parse_cookie_attrs(raw: string): ParsedAttrs {
 }
 
 // Shared "switch workspace" form action used by the
-// WorkspaceSwitcher component (POST /login?/switch).
+// WorkspaceSwitcher component (POST /login?/switch&back=<path>).
+// Calls the API with the session's CSRF token (the endpoint rejects the
+// call otherwise), stores the choice, then bounces back to `back` so the
+// user stays on the page they were looking at.
 export async function switch_workspace_action({ request, cookies, url }: {
 	request: Request;
 	cookies: Cookies;
@@ -78,11 +82,7 @@ export async function switch_workspace_action({ request, cookies, url }: {
 		return fail(401, { errors: { _form: "not signed in" } });
 	}
 	try {
-		await api_request("/auth/switch-workspace", {
-			method: "POST",
-			cookie: `vf_session=${cookie}`,
-			body: { workspace_id },
-		});
+		await Auth.switch_workspace(`vf_session=${cookie}`, workspace_id);
 		cookies.set("vf_active_workspace", workspace_id, {
 			path: "/",
 			sameSite: "lax",
@@ -94,6 +94,5 @@ export async function switch_workspace_action({ request, cookies, url }: {
 		}
 		return fail(503, { errors: { _form: "switch failed" } });
 	}
-	const back = url.searchParams.get("back") || "/";
-	return { ok: true, back };
+	throw redirect(303, same_origin_path(url.searchParams.get("back")));
 }
