@@ -42,3 +42,8 @@ caddy-data/
 # Logs
 *.log
 video_factory.egg-info/
+
+# Disabled orphan QA tests from before SECURITY S1a (anonymous /api/v1/* access)
+tests/test_wave6_qa.py.bak-pre-s1a
+tests/test_wave6_qa_blocker_repro.py.bak-pre-s1a
+tests/test_wave6a_qa_*.bak-pre-s1a
