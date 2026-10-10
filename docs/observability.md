@@ -55,7 +55,7 @@ and the deploy smoke check. It does not touch the DB either.
 
 | Check | Passes when | Reason codes |
 |---|---|---|
-| `db` | The DB file exists, `sqlite_master` is not empty, and `BEGIN IMMEDIATE; ROLLBACK` gets the write lock within 100 ms (`Repo.readiness_probe`, run in the threadpool). Nothing is written. | `db_file_missing` (file deleted under the running process), `db_file_replaced` (a different file now sits at the DB path), `db_schema_missing` (file recreated empty), `db_locked` (another connection holds the write lock), exception class (e.g. `OperationalError`) |
+| `db` | The DB file exists, `sqlite_master` is not empty, and `BEGIN IMMEDIATE; ROLLBACK` gets the write lock within 100 ms (`Repo.readiness_probe`, run on a dedicated thread). Nothing is written. | `db_file_missing` (file deleted under the running process), `db_file_replaced` (a different file now sits at the DB path), `db_schema_missing` (file recreated empty), `db_locked` (another connection holds the write lock), exception class (e.g. `OperationalError`) |
 | `vault_key` | `VIDEO_FACTORY_SECRET_KEY` builds a Fernet (32 url-safe base64 bytes) | `SecretKeyMissing`, `SecretKeyInvalid` |
 | `master_key` | artifact HMAC key resolves. With `VIDEO_FACTORY_ENV=production` the static dev fallback key is refused. | `dev_key_in_use`, exception class |
 

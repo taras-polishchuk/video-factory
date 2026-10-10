@@ -170,6 +170,13 @@ def create_app(*, repo: Optional[Repo] = None,
     async def healthz():
         return {"ok": True}
 
+    # One long-lived thread runs the DB readiness probe (QA-N2). Its
+    # cached connection is reused probe after probe, so a probe costs
+    # ~2 ms instead of a fresh SQLCipher key derivation (~130 ms) on
+    # every short-lived anyio worker thread.
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    _readyz_pool = _TPE(max_workers=1, thread_name_prefix="vf-readyz")
+
     @app.get("/readyz")
     async def readyz():
         """Readiness check: DB + vault key + master key.
@@ -190,7 +197,7 @@ def create_app(*, repo: Optional[Repo] = None,
         leak through an unauthenticated probe. The DB check
         (``Repo.readiness_probe``, QA-N2) really touches the file:
         it must exist, have a schema, and give up its write lock
-        within 100 ms. It runs in the threadpool, so a locked DB
+        within 100 ms. It runs on a dedicated thread, so a locked DB
         answers 503 fast and never blocks the event loop.
         """
         checks: dict[str, bool] = {}
@@ -198,8 +205,9 @@ def create_app(*, repo: Optional[Repo] = None,
         warnings: dict[str, str] = {}
         # 1) DB present, readable and writable (not write-locked).
         try:
-            from starlette.concurrency import run_in_threadpool
-            reason = await run_in_threadpool(repo.readiness_probe)
+            import asyncio as _asyncio
+            reason = await _asyncio.get_running_loop().run_in_executor(
+                _readyz_pool, repo.readiness_probe)
             checks["db"] = reason is None
             if reason is not None:
                 errors["db"] = reason
