@@ -936,6 +936,23 @@ def create_app(*, repo: Optional[Repo] = None,
         new_customer_id = result.get("customer_id") or existing_customer
         if new_customer_id and new_customer_id != existing_customer:
             repo.upsert_stripe_customer(workspace_id, new_customer_id)
+        # B1: fail closed on an empty checkout url.
+        if not (result.get("url") or "").strip():
+            repo.append_audit(
+                event="billing.checkout_failed",
+                context={
+                    "workspace_id": workspace_id,
+                    "plan": plan,
+                    "error": "stripe returned an empty checkout url",
+                },
+                user_id=ctx.user_id,
+                workspace_id=workspace_id,
+                actor=ctx.email,
+            )
+            return JSONResponse(
+                {"error": "stripe upstream error on checkout"},
+                status_code=502,
+            )
         # Audit without the Stripe IDs (per brief: no Stripe IDs
         # in audit).  Record only workspace + user + plan + the
         # returned Checkout Session id (cs_test_*) so the operator
@@ -1001,6 +1018,22 @@ def create_app(*, repo: Optional[Repo] = None,
                 context={
                     "workspace_id": workspace_id,
                     "error": str(e),
+                },
+                user_id=ctx.user_id,
+                workspace_id=workspace_id,
+                actor=ctx.email,
+            )
+            return JSONResponse(
+                {"error": "stripe upstream error on portal"},
+                status_code=502,
+            )
+        # B1: fail closed on an empty portal url.
+        if not (result.get("url") or "").strip():
+            repo.append_audit(
+                event="billing.portal_failed",
+                context={
+                    "workspace_id": workspace_id,
+                    "error": "stripe returned an empty portal url",
                 },
                 user_id=ctx.user_id,
                 workspace_id=workspace_id,
@@ -1383,8 +1416,11 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.get("/api/v1/jobs")
     async def list_jobs(
+        response: Response,
         company_id: Optional[str] = None,
         state: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
         ctx: AuthContext = Depends(get_current_user),
     ):
         # S1a (A1 F2/F13): never list across tenants.  With
@@ -1393,13 +1429,13 @@ def create_app(*, repo: Optional[Repo] = None,
         if company_id:
             wid = repo.workspace_id_for_company(company_id) or company_id
             _member_or_404(ctx, wid)
-            return repo.list_jobs(workspace_id=wid, state=state)
-        rows: list[dict] = []
-        for m in repo.list_workspaces_for_user(ctx.user_id):
-            rows.extend(repo.list_jobs(workspace_id=m["workspace_id"],
-                                       state=state))
-        rows.sort(key=lambda j: j.get("created_at") or "", reverse=True)
-        return rows
+            return _page(response, repo.list_jobs_page(
+                workspace_id=wid, state=state, limit=limit, cursor=cursor))
+        # Multi-workspace list: paginate per-workspace then take a
+        # best-effort window. The S3 cursor encodes the workspace id
+        # and offset.
+        return _page(response, repo.list_jobs_page(
+            company_id=None, state=state, limit=limit, cursor=cursor))
 
     @app.get("/api/v1/jobs/{job_id}")
     async def get_job(job_id: str,

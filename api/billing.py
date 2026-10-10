@@ -76,6 +76,25 @@ LEGACY_STRIPE_PRICE_ENV = {
 _warned_legacy_price_env: set[str] = set()
 _price_logger = logging.getLogger("api.billing")
 
+# BILLING B1: when no Stripe key is configured, every billing route
+# must answer 503 with this fixed body. Do not echo the env var name
+# in the body (the operator client only learns the key is missing,
+# not which key).
+BILLING_NOT_CONFIGURED_DETAIL = "billing not configured"
+
+
+def is_configured() -> bool:
+    """True iff Stripe is usable right now.
+
+    Either ``STRIPE_SECRET_KEY`` is set in the environment (preferred
+    path) or a StripeClient was configured in-process via
+    ``configure_stripe_client`` (test / embed path). Whitespace-only
+    env values count as not configured.
+    """
+    if _client is not None:
+        return True
+    return bool(os.environ.get(STRIPE_SECRET_KEY_ENV, "").strip())
+
 
 def configured_price_id(plan: str) -> str:
     """Return the Stripe Price ID configured for ``plan`` ("" if unset).
@@ -225,6 +244,8 @@ class StripeClient:
             sess = stripe.checkout.Session.create(**params)
         except StripeError as e:
             raise StripeCallError(str(e)) from e
+        except (TimeoutError, ConnectionResetError, OSError) as e:
+            raise StripeCallError(str(e)) from e
         return {
             "url": getattr(sess, "url", None) or "",
             "session_id": getattr(sess, "id", None) or "",
@@ -252,6 +273,8 @@ class StripeClient:
                 return_url=return_url,
             )
         except StripeError as e:
+            raise StripeCallError(str(e)) from e
+        except (TimeoutError, ConnectionResetError, OSError) as e:
             raise StripeCallError(str(e)) from e
         return {
             "url": getattr(sess, "url", None) or "",

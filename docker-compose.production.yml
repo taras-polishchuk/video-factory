@@ -127,6 +127,16 @@ services:
       # S1b: the SvelteKit server signs its calls to the pre-session
       # /auth/* routes (X-VF-Internal-Token) with the session secret.
       VIDEO_FACTORY_SESSION_SECRET: ${VIDEO_FACTORY_SESSION_SECRET:?VIDEO_FACTORY_SESSION_SECRET must be set}
+      # Only small form posts reach SvelteKit; uploads go browser ->
+      # Caddy -> /api/* directly.
+      BODY_SIZE_LIMIT: 1M
+      # Server-side calls (hooks.server.ts, +page.server.ts) go straight
+      # to the API container, not back out through Caddy.
+      VIDEO_FACTORY_API_URL: http://api:8000
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 0.5
+    pids_limit: 128
     depends_on:
       api:
         condition: service_healthy
