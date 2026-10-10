@@ -735,7 +735,12 @@ def test_f15_failed_rotation_leaks_no_key_material(make_app, caplog, capsys):
     wrong_old = "s1b-not-the-real-old-key-" + "W" * 20
     r = _rotate(app, sid, {"old_key": wrong_old, "new_key": NEW_KEY,
                            "current_password": PASSWORD})
-    assert r.status_code in (400, 500, 503), r.text
+    # Wrong-old-key is a caller error, not an infra fault: 403
+    # (the admin gate is in scope on this endpoint, so the
+    # caller-error path returns 403, not 500).  The global
+    # `key_rotation.failed` flag MUST stay untouched — covered
+    # by the dedicated test in test_qa_s1b_session.py.
+    assert r.status_code == 403, r.text
     out = capsys.readouterr()
     for blob in (r.text, caplog.text, out.out, out.err, _all_audit_text(repo)):
         for k in (wrong_old, NEW_KEY, OLD_KEY):

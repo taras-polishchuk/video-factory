@@ -161,6 +161,23 @@ async def handle_rotate(request: Request, ctx, repo) -> dict:
         raise HTTPException(503, _clean(e))
     except key_rotation.KeyFingerprintMissing as e:
         raise HTTPException(400, _clean(e))
+    except key_rotation.BadOldKey as e:
+        # Caller-error path (operator supplied an `old_key` that
+        # does not match the live DB).  The endpoint is gated on
+        # VIDEO_FACTORY_PLATFORM_ADMINS, so the gate is in scope
+        # for this request → 403 is the correct shape.  We
+        # deliberately do NOT log this as an error: a wrong-old-key
+        # attempt is a 4xx, not an operational incident.  The
+        # `key.rotation_rejected_caller_error` audit row emitted
+        # inside `rotate()` already records the attempt for
+        # forensic review.
+        _log.info(
+            "admin key rotation rejected: wrong old_key",
+            extra={"old_key_fingerprint": fp_old,
+                   "new_key_fingerprint": fp_new,
+                   "error_class": type(e).__name__},
+        )
+        raise HTTPException(403, _clean(e))
     except key_rotation.RotationFailed as e:
         _log.error(
             "admin key rotation failed",
