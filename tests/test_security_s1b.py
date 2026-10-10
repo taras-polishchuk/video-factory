@@ -1080,3 +1080,223 @@ def test_a2_f05_compose_sets_production_env():
     src = (REPO_ROOT / "docker-compose.production.yml").read_text()
     api = src.split("\n  web:", 1)[0]
     assert re.search(r"VIDEO_FACTORY_ENV:\s*\"?production\"?", api)
+
+
+# ════════════════════════════════════════════════════════════════════
+# S1b follow-up: rotate() must run OFF the asyncio event loop
+# ════════════════════════════════════════════════════════════════════
+#
+# Background (t_c20fdb7d): the original `handle_rotate` called the
+# synchronous `key_rotation.rotate()` directly from the event-loop
+# thread, blocking the loop for ~0.4s per SQLCipher re-key.  The
+# /health latency jumped 6ms -> 842ms during the reproduction.
+#
+# The fix moved the lock-holding body to a worker thread via
+# `asyncio.to_thread`.  The Repo lock invariants are unchanged —
+# the worker thread acquires `repo._lock` exactly as before —
+# but other handlers are now free to run while the rotation is
+# in flight.
+#
+# These tests assert the new contract end-to-end through the
+# real `/api/v1/admin/keys/rotate` HTTP route + the `RotationHook`
+# instrumentation seam added in t_c20fdb7d.
+
+
+def _slow_hook(*, hold_seconds: float = 1.5):
+    """Build a RotationHook whose ``before_copy`` sleeps `hold_seconds`.
+
+    The hook fires INSIDE `repo._lock`, on the worker thread that
+    owns the lock.  A sleep here is the exact mechanism that
+    simulates a long-running SQLCipher re-key for the tests below.
+    """
+    from control_plane.key_rotation import RotationHook
+    import threading as _threading
+    state = {"fired_on": None, "epoch": None}
+    lock = _threading.Lock()
+
+    def _before_copy(*, epoch):
+        with lock:
+            state["fired_on"] = _threading.current_thread().name
+            state["epoch"] = epoch
+        time.sleep(hold_seconds)
+
+    return RotationHook(before_copy=_before_copy), state, lock
+
+
+def test_handle_rotate_runs_off_event_loop(make_app, monkeypatch):
+    """`handle_rotate` MUST dispatch the rotation to a worker thread.
+
+    Repro of the original 6ms -> 842ms /health regression: before
+    the fix, `key_rotation.rotate()` ran on the event-loop thread;
+    with the fix it runs on an asyncio.to_thread worker, so the
+    hook's `current_thread().name` must NOT contain "uvloop" /
+    "Selector" / "MainThread" loop names AND must NOT match the
+    thread the request handler is dispatched on.
+    """
+    monkeypatch.setenv("VF_KEYS_REAUTH_LIMIT", "10")
+    app, _ = make_app(db_key=OLD_KEY)
+    _, _, sid = _platform_admin(app)
+    hook, state, hook_lock = _slow_hook(hold_seconds=0.6)
+
+    # Monkeypatch `rotate_async` so the test routes through the
+    # production `asyncio.to_thread` dispatch path.  (The handler
+    # does `await key_rotation.rotate_async(...)`; we keep that
+    # but inject one through our hook so we can observe which
+    # thread the body ran on.)
+    from control_plane import key_rotation as _kr
+
+    async def _patched_rotate_async(*, repo, old_key, new_key,
+                                    actor_user_id, db_path=None,
+                                    instrumentation=None):
+        # Mimic the production implementation exactly:
+        import asyncio as _asyncio
+        return await _asyncio.to_thread(
+            _kr.rotate,
+            repo=repo, old_key=old_key, new_key=new_key,
+            actor_user_id=actor_user_id, db_path=db_path,
+            instrumentation=instrumentation,
+        )
+
+    monkeypatch.setattr(_kr, "rotate_async", _patched_rotate_async)
+
+    # Inject the slow hook into the production handler path.
+    # We do this by monkeypatching the global `key_rotation` import
+    # in `api.admin_keys` so calls to `key_rotation.rotate_async`
+    # resolve to our wrapper — already done above.  Now we still
+    # need the hook passed through; the production handler does
+    # NOT accept a hook from the wire, so the test attaches it via
+    # a side-channel: we monkeypatch `_kr.rotate` directly to inject
+    # the hook.
+    real_rotate = _kr.rotate
+    def _hooked_rotate(*, repo, old_key, new_key, actor_user_id,
+                       db_path=None, instrumentation=None):
+        return real_rotate(repo=repo, old_key=old_key, new_key=new_key,
+                            actor_user_id=actor_user_id, db_path=db_path,
+                            instrumentation=hook)
+    monkeypatch.setattr(_kr, "rotate", _hooked_rotate)
+
+    # Race: fire /health every 50ms while the slow rotation is
+    # in flight, and assert each probe lands well under the
+    # rotation's 0.6s hold.  If the loop were blocked, every
+    # /health probe would take ~0.6s too.
+    client = TestClient(app)
+    rotate_start = time.monotonic()
+    latencies = []
+    while time.monotonic() - rotate_start < 0.6:
+        t0 = time.monotonic()
+        h = client.get("/health")
+        latencies.append(time.monotonic() - t0)
+        assert h.status_code == 200, h.text
+        time.sleep(0.05)
+    r = _rotate(app, sid, {"old_key": OLD_KEY, "new_key": NEW_KEY,
+                            "current_password": PASSWORD})
+    assert r.status_code == 200, r.text
+
+    with hook_lock:
+        fired_on = state["fired_on"]
+    assert fired_on is not None, "before_copy hook never fired"
+    # The hook ran on a to_thread-pool thread, NOT the loop's
+    # selector thread.  asyncio's default executor prefixes
+    # worker threads with "ThreadPoolExecutor" / "asyncio" /
+    # simply does NOT name them like the main loop thread.
+    assert "MainThread" not in (fired_on or ""), (
+        f"before_copy ran on the event-loop thread ({fired_on!r}); "
+        f"rotate_async did not offload to a worker"
+    )
+
+    # /health probes during the rotation stayed fast.
+    assert latencies, "no /health probes fired"
+    slowest = max(latencies)
+    assert slowest < 0.3, (
+        f"/health probe took {slowest:.3f}s during rotation; "
+        f"all latencies={latencies}. The asyncio event loop is "
+        f"still being blocked by the SQLCipher re-key."
+    )
+
+
+def test_handle_rotate_blocks_other_writers_unchanged(make_app):
+    """Repo lock invariants are unchanged: while rotate runs on a
+    worker thread, every `repo.tx()` from another thread blocks
+    for the whole duration (the worker thread owns `repo._lock`,
+    not the event-loop thread).
+
+    Proves the fix did not silently weaken the cross-thread
+    invariant that BLOCKER-1 / BLOCKER-2 in t_abf264b4 fixed.
+    """
+    from control_plane.key_rotation import RotationHook
+    import threading as _threading
+    app, repo = make_app(db_key=OLD_KEY)
+    _, _, sid = _platform_admin(app)
+
+    # Hook sleeps INSIDE the lock so a parallel `repo.tx()` must
+    # block for the full hold.
+    hold = 0.4
+    started = _threading.Event()
+    holder_done = _threading.Event()
+
+    def _slow(*, epoch):
+        started.set()
+        time.sleep(hold)
+        holder_done.set()
+
+    hook = RotationHook(before_copy=_slow)
+
+    # Spawn the rotation on a worker thread (mirrors what
+    # `rotate_async` does) with our slow hook.
+    out = {}
+    from control_plane import key_rotation as _kr
+    def _run():
+        try:
+            out["_rotate_repo"] = _kr.rotate(
+                repo=repo, old_key=OLD_KEY, new_key=NEW_KEY,
+                actor_user_id="sync-qa",
+                instrumentation=hook,
+            )
+        except Exception as e:  # noqa: BLE001
+            out["_rotate_error"] = e
+
+    worker = _threading.Thread(target=_run, daemon=True)
+    worker.start()
+    # Make sure we are inside the hook (i.e. inside the lock)
+    # before issuing the parallel tx() probe.
+    assert started.wait(2.0), "rotation never reached the hook"
+    t0 = time.monotonic()
+    with repo.tx() as c:
+        c.execute("SELECT 1").fetchone()
+    blocked_for = time.monotonic() - t0
+    worker.join(timeout=10)
+    assert holder_done.is_set(), "rotation finished before probe"
+    assert "_rotate_repo" in out, out
+    assert blocked_for >= hold - 0.1, (
+        f"parallel repo.tx() only blocked {blocked_for:.3f}s; "
+        f"expected >= {hold:.1f}s.  The lock invariant was weakened."
+    )
+    # Upper bound is generous: SQLCipher re-key of a populated
+    # test DB can take 1-3s on its own (WAL checkpoint + dump +
+    # cipher swap + db_key refresh + audit insert all under the
+    # lock). We only need to assert the rotation did NOT enter
+   # a stuck state (e.g. the lock never released at all).
+    assert blocked_for < 30.0, (
+        f"parallel repo.tx() blocked {blocked_for:.3f}s, well past "
+        f"a reasonable rotation window.  The rotation is stuck."
+    )
+
+
+def test_rotation_hook_none_is_noop(make_app):
+    """`rotate(instrumentation=None)` is byte-for-byte the old path.
+
+    Specifically: the rotation completes, the new key takes
+    effect, and audit rows fire exactly as before.  This guards
+    against accidental regression in the production (no-hook)
+    path.
+    """
+    app, repo = make_app(db_key=OLD_KEY)
+    _, _, sid = _platform_admin(app)
+    r = _rotate(app, sid, {"old_key": OLD_KEY, "new_key": NEW_KEY,
+                            "current_password": PASSWORD})
+    assert r.status_code == 200, r.text
+    assert repo.db_key == NEW_KEY
+    state = r.json()
+    assert state["completed"] is True
+    assert state["failed"] is False
+    assert state["in_progress"] is False

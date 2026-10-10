@@ -151,7 +151,7 @@ async def handle_rotate(request: Request, ctx, repo) -> dict:
         return key_rotation.redact_keys(str(exc), old_key, new_key)
 
     try:
-        return key_rotation.rotate(
+        return await key_rotation.rotate_async(
             repo=repo,
             old_key=old_key,
             new_key=new_key,

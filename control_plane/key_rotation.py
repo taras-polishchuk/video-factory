@@ -212,6 +212,57 @@ def rotation_state(repo) -> dict:
     }
 
 
+# ── instrumentation hook ──────────────────────────────────────────────
+#
+# Tests + production observability need a way to assert "the asyncio
+# event loop is free during a rotation".  A small, sync-only hook is
+# the cheapest way to expose the inside-of-the-lock boundary without
+# changing the public surface or the lock semantics.
+#
+#   * `before_copy(epoch)` fires once per rotation, INSIDE
+#     `repo._lock`, immediately before `copy_cipher_to_cipher`.  The
+#     body runs synchronously on the worker thread that owns the
+#     lock — slow hooks will block the rotation (intentional: tests
+#     install slow hooks to simulate a long-running re-key and
+#     assert other handlers stay responsive on the event loop).
+#   * `epoch` is the Repo epoch captured at the moment the hook
+#     fires; useful for assertions like "the rotating thread holds
+#     the lock right now" or "no other thread has touched _conn
+#     since we bumped the epoch".
+#
+# The hook never escapes this module: callers pass a `RotationHook`
+# (or None) as the `instrumentation` kwarg to `rotate()` /
+# `rotate_async()`.
+
+class RotationHook:
+    """Optional observability + test instrumentation for `rotate()`.
+
+    Sync-only by design: the hook runs inside `repo._lock` on the
+    thread that owns the lock.  A slow hook is intentional — it is
+    the exact mechanism the new S1b tests use to assert that the
+    asyncio event loop is NOT blocked while a rotation is in flight.
+    """
+
+    __slots__ = ("_before_copy",)
+
+    def __init__(self, *, before_copy=None) -> None:
+        self._before_copy = before_copy
+
+    def before_copy(self, *, epoch: int) -> None:
+        if self._before_copy is not None:
+            try:
+                self._before_copy(epoch=epoch)
+            except Exception:
+                # Hooks are observability, not control flow.  A
+                # buggy hook MUST NOT break the rotation; the lock
+                # and the cipher file are already live state.
+                import logging as _logging
+                _logging.getLogger(__name__).exception(
+                    "rotation hook before_copy raised; "
+                    "ignoring (rotation will proceed)"
+                )
+
+
 # ── write gate ───────────────────────────────────────────
 
 def credential_writes_allowed(repo) -> bool:
@@ -247,7 +298,8 @@ def writes_allowed(repo) -> bool:
 # ── the rotation itself ──────────────────────────────────────────
 
 def rotate(*, repo, old_key: str, new_key: str,
-            actor_user_id: str, db_path: Optional[str] = None
+            actor_user_id: str, db_path: Optional[str] = None,
+            instrumentation: Optional["RotationHook"] = None
             ) -> dict:
     """Run the full rotation.  Returns a status summary dict.
 
@@ -268,6 +320,11 @@ def rotate(*, repo, old_key: str, new_key: str,
         Filesystem path to the live DB.  Defaults to
         `repo.db_path`.  Passed so callers can dry-run against a
         test path without mutating the production Repo object.
+    instrumentation: RotationHook | None
+        Optional observability hook.  Fires once inside `repo._lock`
+        right before `copy_cipher_to_cipher`.  See :class:`RotationHook`
+        for the contract; in production this is `None` and the
+        rotation is unchanged.
 
     Raises
     ------
@@ -313,6 +370,14 @@ def rotate(*, repo, old_key: str, new_key: str,
     #      bypasses the lock (e.g. a direct `repo._conn().execute`
     #      from a runner), the flag still surfaces a
     #      `RotationInProgress` error.
+    #
+    # Wave 5 follow-up-3 (t_c20fdb7d): `rotate()` is synchronous
+    # and the asyncio handler that invokes us (`handle_rotate`)
+    # used to call us directly on the event-loop thread, blocking
+    # the loop for ~0.4s per SQLCipher re-key.  Async callers MUST
+    # dispatch through :func:`rotate_async` so the loop stays
+    # responsive; this function's contract is unchanged (it still
+    # acquires the lock on the calling thread).
     with repo._lock:  # noqa: SLF001 — rotation owns the lock
         return _rotate_locked(
             repo=repo,
@@ -320,17 +385,56 @@ def rotate(*, repo, old_key: str, new_key: str,
             new_key=new_key,
             actor_user_id=actor_user_id,
             db_path=db_path,
+            instrumentation=instrumentation,
         )
 
 
+async def rotate_async(*, repo, old_key: str, new_key: str,
+                       actor_user_id: str,
+                       db_path: Optional[str] = None,
+                       instrumentation: Optional["RotationHook"] = None
+                       ) -> dict:
+    """Async wrapper around :func:`rotate`.
+
+    Dispatches the (synchronous, lock-holding) rotation body to a
+    worker thread via :func:`asyncio.to_thread` so the asyncio
+    event loop is free during the ~0.4s SQLCipher re-key.  The
+    Repo lock invariants are unchanged: the worker thread acquires
+    `repo._lock` exactly as the synchronous path does, so every
+    `Repo.tx()` call from another thread still blocks for the full
+    rotation window.
+
+    Use this from any `async def` API handler; the sync `rotate()`
+    remains for tests and one-shot scripts.
+    """
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(
+        rotate,
+        repo=repo,
+        old_key=old_key,
+        new_key=new_key,
+        actor_user_id=actor_user_id,
+        db_path=db_path,
+        instrumentation=instrumentation,
+    )
+
+
 def _rotate_locked(*, repo, old_key: str, new_key: str,
-                    actor_user_id: str, db_path: str) -> dict:
+                    actor_user_id: str, db_path: str,
+                    instrumentation: Optional["RotationHook"] = None
+                    ) -> dict:
     """Inner rotation body.  Caller MUST hold `repo._lock`.
 
     Factored out of :func:`rotate` so the lock-acquisition step
     is visible at a glance in the public function.  Everything
     from the WAL checkpoint through the cipher swap and the
     ``db_key`` refresh runs under the lock.
+
+    When ``instrumentation`` is provided, its ``before_copy``
+    callback fires once inside the lock, immediately before
+    ``copy_cipher_to_cipher`` — this is the seam S1b tests use to
+    assert that the asyncio event loop stays responsive while a
+    rotation is in flight.
     """
     # ── 1. Acquire the in-progress flag ────────────────────────
     # Force a WAL checkpoint on the live Repo connection first so
@@ -404,6 +508,15 @@ def _rotate_locked(*, repo, old_key: str, new_key: str,
                     shutil.copy2(src, backup_path.with_suffix(
                         backup_path.suffix + ext
                     ))
+        # ── Instrumentation seam (t_c20fdb7d) ────────────────────
+        # Fires INSIDE `repo._lock`, immediately before the
+        # SQLCipher re-key.  Tests install a hook here that sleeps
+        # N seconds; with the old synchronous path the asyncio
+        # event loop would block for those N seconds, with
+        # `rotate_async` it does NOT.  In production this is a
+        # cheap no-op (None).
+        if instrumentation is not None:
+            instrumentation.before_copy(epoch=repo._epoch)  # noqa: SLF001
         # Open OLD with src_key + write NEW with dst_key.  We use
         # copy_cipher_to_cipher (NOT migrate_plaintext_to_cipher)
         # because the LIVE DB is already encrypted with src_key —
@@ -550,11 +663,13 @@ __all__ = [
     "EVENT_STARTED",
     "KeyFingerprintMissing",
     "RotationFailed",
+    "RotationHook",
     "RotationInProgress",
     "can_open_with_key",
     "credential_writes_allowed",
     "ensure_table",
     "rotate",
+    "rotate_async",
     "rotation_state",
     "writes_allowed",
 ]
