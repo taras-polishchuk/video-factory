@@ -79,10 +79,10 @@ _SECRET_SHAPES = {
     # name: (text, body marker that must not survive in any form)
     "email": ("carolxlongxlocal.part@leakmail.example", "carolx"),
     "pct-email": ("carolxlongxlocal.part%40leakmail.example", "carolx"),
-    "bearer": ("Bearer QAbearerTOKEN0123456789abcdefXYZ", "QAbear"),
-    "basic": ("Basic QAbasicCRED0123456789abcdefXYZ==", "QAbasi"),
-    "stripe": ("sk_live_QAstripeSECRET0123456789abc", "QAstri"),
-    "whsec": ("whsec_QAwebhookSECRET0123456789", "QAwebh"),
+    "bearer": ("Bearer QAbearerFAKE_PREFIXED_deterministic", "QAbear"),
+    "basic": ("Basic QAbasicFAKE_PREFIXED_deterministic==", "QAbasi"),
+    "stripe": ("sk_test_FAKE_PREFIX_QAstripeSECRET0123456789abc", "QAstri"),
+    "whsec": ("whsec_QAwebhookFAKE_PREFIXED_deterministic", "QAwebh"),
     "fernet": ("gAAAAAQAfernetTOKEN0123456789abcdefghijkl==", "QAfern"),
 }
 
@@ -112,7 +112,7 @@ _HOSTILE = {
     "dash": "-",
     "wks-prefix": "wks_",
     "bearer-words": "Bearer ",
-    "sk-prefix": "sk_live_",
+    "sk-prefix": "sk_test_FAKE_PREFIX_",
     "fernet-prefix": "gAAAAA",
     "short-id": "u_1",
     "domain-dots": "a@b.",
