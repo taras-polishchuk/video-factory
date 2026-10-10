@@ -17,7 +17,16 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from core.repo import Forbidden, NotFound, Repo
 from core.runners import JobRunner, Singleton
+from core.text_safety import validated_topic
 from auth.dependencies import get_current_user  # noqa: E402  (module-scope)
+
+
+def _topic_or_422(payload: dict) -> str:
+    """SECURITY S1c: 1..200 chars after control-char strip; never echoed."""
+    try:
+        return validated_topic(payload["topic"])
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 def create_app(*, repo: Optional[Repo] = None,
@@ -472,6 +481,7 @@ def create_app(*, repo: Optional[Repo] = None,
         for f in required:
             if f not in payload:
                 raise HTTPException(400, f"missing {f}")
+        topic = _topic_or_422(payload)
         # Wave 6b: live-provider gate (plan + workspace flag)
         # must fire BEFORE any DB write or provider call.  The
         # global env flags (LIVE_PROVIDER_TESTS / SMOKE_TEST_PASSED)
@@ -552,7 +562,7 @@ def create_app(*, repo: Optional[Repo] = None,
             )
         job = repo.create_job(
             workspace_id=wid,
-            topic=payload["topic"],
+            topic=topic,
             language=payload["language"],
             duration_seconds=int(payload["duration_seconds"]),
             platforms=list(payload["platforms"]),
@@ -1201,6 +1211,7 @@ def create_app(*, repo: Optional[Repo] = None,
         for f in required:
             if f not in payload:
                 raise HTTPException(400, f"missing {f}")
+        topic = _topic_or_422(payload)
         # Wave 6b: resolve the legacy company_id to a workspace_id
         # so the live-provider gate and the FREE-tier job quota
         # both see the same plan + flag as the workspace-scoped
@@ -1281,7 +1292,7 @@ def create_app(*, repo: Optional[Repo] = None,
             )
         job = repo.create_job(
             company_id=company_id,
-            topic=payload["topic"],
+            topic=topic,
             language=payload["language"],
             duration_seconds=int(payload["duration_seconds"]),
             platforms=list(payload["platforms"]),

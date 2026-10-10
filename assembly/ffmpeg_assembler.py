@@ -15,6 +15,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from assembly.ffmpeg_safe import (
+    AUDIO_INPUT_GUARD,
+    AUDIO_SUFFIXES,
+    CLIP_SUFFIXES,
+    CONCAT_INPUT_GUARD,
+    PROBE_GUARD,
+    media_suffix,
+    write_concat_list,
+)
 from control_plane.storage import Storage
 from render_plane.mock_renderer import MOCK_SENTINEL
 
@@ -36,8 +45,8 @@ def ffprobe_or_none(path: str) -> Optional[dict]:
     try:
         out = subprocess.check_output(
             [
-                "ffprobe", "-v", "error", "-show_format", "-show_streams",
-                "-of", "json", path,
+                "ffprobe", "-v", "error", *PROBE_GUARD,
+                "-show_format", "-show_streams", "-of", "json", path,
             ],
             stderr=subprocess.STDOUT,
             timeout=15,
@@ -204,18 +213,20 @@ def stitch_scene_clips(
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
-        # Resolve clip paths via storage.get()
+        # Resolve clip paths via storage.get(). SECURITY S1c: ref names
+        # can come from a provider response, so local copies get our own
+        # portable names and the concat list only holds those (relative,
+        # ffmpeg safe mode). This also stops two refs with the same
+        # basename from overwriting each other.
         clip_paths: List[str] = []
-        concat_file = tmpdir / "concat.txt"
-        concat_lines: List[str] = []
-        for ref in clip_refs:
+        clip_names: List[str] = []
+        for idx, ref in enumerate(clip_refs, start=1):
             data = storage.get(ref)
-            p = tmpdir / Path(ref).name
+            p = tmpdir / f"clip_{idx:04d}{media_suffix(ref, CLIP_SUFFIXES, '.mp4')}"
             p.write_bytes(data)
             clip_paths.append(str(p))
-            # Use absolute path with single-quote escaping.
-            concat_lines.append(f"file '{p.as_posix()}'")
-        concat_file.write_text("\n".join(concat_lines) + "\n")
+            clip_names.append(p.name)
+        concat_file = write_concat_list(tmpdir / "concat.txt", clip_names)
 
         if all_mock:
             # Don't try to concat sentinel headers through ffmpeg; they
@@ -232,19 +243,26 @@ def stitch_scene_clips(
             }
 
         out_path = tmpdir / "stitched.mp4"
+        # Inputs first (each with its guard), then output options. The old
+        # order put -t/-c:v/-vf in front of the audio -i, which ffmpeg
+        # rejects as input options.
         cmd: List[str] = [
-            ffmpeg_binary, "-y", "-f", "concat", "-safe", "0",
+            ffmpeg_binary, "-y", *CONCAT_INPUT_GUARD, "-f", "concat",
             "-i", str(concat_file),
+        ]
+        if audio_ref is not None:
+            audio_path = tmpdir / f"audio{media_suffix(audio_ref, AUDIO_SUFFIXES, '.m4a')}"
+            audio_path.write_bytes(storage.get(audio_ref))
+            cmd.extend([*AUDIO_INPUT_GUARD, "-i", str(audio_path)])
+        cmd.extend([
             "-t", str(int(max(1, target_duration_seconds))),
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-r", "30",
             "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-        ]
+        ])
         if audio_ref is not None:
-            audio_path = tmpdir / Path(audio_ref).name
-            audio_path.write_bytes(storage.get(audio_ref))
-            cmd.extend(["-i", str(audio_path), "-c:a", "aac", "-shortest"])
+            cmd.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest"])
         else:
             cmd.extend(["-an"])
         cmd.append(str(out_path))
