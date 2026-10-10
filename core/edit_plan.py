@@ -132,6 +132,14 @@ def render_plan_to_storage(*, plan: EditPlan, storage, output_key: str) -> Optio
         }
 
 
+# The mock plan renders flat-colour synthetic clips with one text
+# overlay. Encoder quality is irrelevant for that content, while the
+# libx264 default preset ("medium") costs ~3x the CPU of "ultrafast"
+# for the same playable H.264 MP4. Encode cost is what made the mock
+# job path slow (and wall-clock-sensitive) on a loaded host.
+_MOCK_X264_PRESET = "ultrafast"
+
+
 def _dimensions_for(aspect: str) -> tuple:
     return {
         "9:16": (1080, 1920),
@@ -148,7 +156,8 @@ def _ffmpeg_synthetic_clip(*, out: str, duration: float, width: int,
         "-f", "lavfi", "-i", f"color=c={color}:s={width}x{height}:d={duration}:r=30",
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
         "-vf", f"drawtext=text='{label}':fontcolor=white:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+        "-c:v", "libx264", "-preset", _MOCK_X264_PRESET,
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
         out,
     ]
     try:
@@ -163,7 +172,8 @@ def _ffmpeg_concat(*, concat: str, out: str, width: int, height: int,
     cmd = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat,
         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:v", "libx264", "-preset", _MOCK_X264_PRESET,
+        "-pix_fmt", "yuv420p", "-r", "30",
         "-an", out,
     ]
     try:

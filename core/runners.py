@@ -243,12 +243,48 @@ class JobRunner:
             raise  # re-raise so caller knows the durability path failed
 
     def submit(self, job_id: str) -> None:
-        """Schedule a job. Returns immediately; runs in background."""
-        if job_id in self._active_jobs and self._active_jobs[job_id].is_alive():
-            return
-        t = threading.Thread(target=self._run, args=(job_id,), daemon=True, name=f"job-{job_id}")
-        self._active_jobs[job_id] = t
-        t.start()
+        """Schedule a job. Returns immediately; runs in background.
+
+        The check-then-start is done under ``self._lock`` so two
+        concurrent submits of the same job (e.g. a double-clicked
+        retry) cannot both start a pipeline thread for it.
+        """
+        with self._lock:
+            existing = self._active_jobs.get(job_id)
+            if existing is not None and existing.is_alive():
+                return
+            t = threading.Thread(target=self._run, args=(job_id,), daemon=True,
+                                 name=f"job-{job_id}")
+            self._active_jobs[job_id] = t
+            t.start()
+
+    def wait(self, job_id: str, timeout: Optional[float] = None) -> bool:
+        """Block until the background thread for ``job_id`` finishes.
+
+        Returns True when no pipeline thread for the job is running
+        any more (finished, or never submitted to this runner) and
+        False if ``timeout`` elapsed first. Callers that need a
+        completion signal (graceful shutdown, CLI, tests) use this
+        instead of polling the job row against a wall-clock deadline.
+        """
+        with self._lock:
+            t = self._active_jobs.get(job_id)
+        if t is None:
+            return True
+        t.join(timeout)
+        return not t.is_alive()
+
+    def wait_all(self, timeout: Optional[float] = None) -> bool:
+        """Block until every pipeline thread started by this runner
+        has finished. ``timeout`` is a total budget in seconds.
+        Returns True when all threads are done."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lock:
+            threads = list(self._active_jobs.values())
+        for t in threads:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            t.join(remaining)
+        return not any(t.is_alive() for t in threads)
 
     def _stage_started(self, job_id: str, key: str, ordinal: int) -> tuple[float, str]:
         from core.repo import now_iso

@@ -1083,7 +1083,7 @@ class Repo:
             "live_enabled, owner_user_id, stripe_customer_id, "
             "stripe_subscription_id, current_period_end, "
             "created_at, updated_at "
-            "FROM workspaces ORDER BY created_at"
+            "FROM workspaces ORDER BY created_at, rowid"
         ).fetchall()
         return [self._row_workspace_full(r) for r in rows]
 
@@ -2234,7 +2234,7 @@ class Repo:
         rows = self._conn().execute(
             "SELECT m.workspace_id, m.role, w.slug, w.name, w.plan, w.status "
             "FROM memberships m JOIN workspaces w ON w.workspace_id = "
-            "m.workspace_id WHERE m.user_id=? ORDER BY w.created_at",
+            "m.workspace_id WHERE m.user_id=? ORDER BY w.created_at, w.rowid",
             (user_id,),
         ).fetchall()
         return [

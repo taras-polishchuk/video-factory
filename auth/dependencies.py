@@ -142,7 +142,7 @@ def list_workspaces_for_user(repo, user_id: str) -> list[dict]:
     rows = repo._conn().execute(
         "SELECT m.workspace_id, m.role, w.slug, w.name, w.plan "
         "FROM memberships m JOIN workspaces w ON w.workspace_id = m.workspace_id "
-        "WHERE m.user_id=? ORDER BY w.created_at",
+        "WHERE m.user_id=? ORDER BY w.created_at, w.rowid",
         (user_id,),
     ).fetchall()
     return [
