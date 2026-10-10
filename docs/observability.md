@@ -85,6 +85,9 @@ Producers coerce anything outside the allowed set to `unknown`.
 | `video_factory_webhook_receipts_total` | counter | `source` | source: `stripe`, `heygen`, `internal`, `unknown` | Not wired yet (follow-up). Exposes HELP/TYPE only. |
 | `video_factory_errors_total` | counter | `class` | class: `auth`, `validation`, `quota`, `vault`, `repo`, `runtime`, `unknown` | Global 500 handler increments `class="runtime"`. Other classes reserved. |
 | `video_factory_request_duration_seconds` | histogram | `route`, `method`, `status` | method: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `OTHER` | HTTP middleware, every request except `/metrics`. |
+| `video_factory_job_queue_depth` | gauge | none | - | JobRunner FIFO length (jobs accepted, waiting for a slot). Read at scrape time. |
+| `video_factory_jobs_active` | gauge | none | - | Jobs executing now, never above the cap. Read at scrape time. |
+| `video_factory_jobs_concurrency_limit` | gauge | none | - | `VIDEO_FACTORY_MAX_CONCURRENT_JOBS` (default 2). |
 
 Free-form but bounded labels:
 
