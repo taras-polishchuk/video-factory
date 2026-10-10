@@ -101,26 +101,71 @@ class JsonLogFormatter(logging.Formatter):
 
 
 # Query-string keys whose values must never reach logs or Sentry
-# (OIDC ``code``/``state``, password-reset tokens, emails, ...).
+# (OIDC ``code``/``state``/``login_hint``/``nonce``, password-reset
+# tokens, emails, one-time codes, ...). Substring match on the key,
+# case-insensitive: ``pass`` also covers ``password``/``passwd``,
+# ``mail`` covers ``email``, ``hint`` covers ``login_hint`` and
+# ``id_token_hint`` (QA-N5).
 _SENSITIVE_QUERY_KEY_RE = re.compile(
-    r"(token|code|state|password|passwd|secret|key|email|session|auth|sig)",
+    r"(token|code|state|pass|pwd|secret|key|mail|session|auth|sig|jwt|otp"
+    r"|hint|bearer|nonce|ticket|cred|saml)",
     re.IGNORECASE,
 )
+# A value that carries its own query string (``next=/cb?code=...``,
+# a full redirect URL, a ``#access_token=...`` fragment) is redacted
+# recursively, at most this deep. Deeper nesting is dropped whole.
+_MAX_QS_DEPTH = 3
 
 
 def redact_query_string(qs: str) -> str:
-    """Return ``qs`` with the values of sensitive keys replaced."""
+    """Return ``qs`` with sensitive values replaced by ``[Filtered]``.
+
+    * values of sensitive keys (``_SENSITIVE_QUERY_KEY_RE``) are
+      replaced whole;
+    * every other key and value is URL-decoded and run through
+      ``scrub_text`` (so ``contact=alice%40example.com`` loses the
+      email, QA-N3);
+    * a value that is itself a URL / query (``next=/cb?code=...``)
+      is redacted the same way, recursively (QA-N5).
+    """
     if not qs:
         return qs
+    return _redact_qs(qs, 0)[0]
+
+
+def _redact_qs(qs: str, depth: int) -> tuple[str, bool]:
+    """``(redacted query string, anything changed?)``."""
     try:
         pairs = parse_qsl(qs, keep_blank_values=True)
     except Exception:  # noqa: BLE001
-        return "[Filtered]"
-    out = [
-        (k, "[Filtered]" if _SENSITIVE_QUERY_KEY_RE.search(k) else v)
-        for k, v in pairs
-    ]
-    return urlencode(out, safe="[]")
+        return FILTERED, True
+    out = []
+    changed = False
+    for k, v in pairs:
+        if _SENSITIVE_QUERY_KEY_RE.search(k):
+            out.append((k, FILTERED))
+            changed = True
+            continue
+        nk = scrub_text(k)
+        nv = _redact_qs_value(v, depth)
+        changed = changed or nk != k or nv != v
+        out.append((nk, nv))
+    return urlencode(out, safe="[]"), changed
+
+
+def _redact_qs_value(v: str, depth: int) -> str:
+    v = scrub_text(v)
+    if "=" not in v:
+        return v
+    if depth >= _MAX_QS_DEPTH:
+        return FILTERED
+    cuts = [i for i in (v.find("?"), v.find("#")) if i >= 0]
+    cut = min(cuts) if cuts else -1
+    head, tail = (v[:cut + 1], v[cut + 1:]) if cut >= 0 else ("", v)
+    red, changed = _redact_qs(tail, depth + 1)
+    # Untouched nested values keep their original spelling (no
+    # re-encoding of an innocent ``a=b`` or base64 ``==`` padding).
+    return head + red if changed else v
 
 
 def _uvicorn_access_fields(record: logging.LogRecord) -> dict[str, Any]:
@@ -482,12 +527,16 @@ def capture_exception(exc: BaseException, *, request_id: Optional[str] = None,
 
 # ── request ids ───────────────────────────────────────────────────
 
-_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{8,64}")
 
 
 def request_id_from(incoming: Optional[str]) -> str:
-    """Reuse a well-formed inbound ``X-Request-ID``; otherwise mint one."""
-    if incoming and _REQUEST_ID_RE.match(incoming):
+    """Reuse a well-formed inbound ``X-Request-ID``; otherwise mint one.
+
+    ``fullmatch``: ``re.match`` with ``$`` would accept a trailing
+    newline (QA-N6).
+    """
+    if incoming and _REQUEST_ID_RE.fullmatch(incoming):
         return incoming
     return uuid.uuid4().hex
 
@@ -507,6 +556,23 @@ _SENSITIVE_HEADER_PARTS = ("token", "secret", "signature", "api-key",
                            "apikey", "auth", "csrf", "session")
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# ``_EMAIL_RE`` documents the email shape, but it is NOT run with
+# ``re.sub``: with no ``@`` in a long ``[A-Za-z0-9._%+-]`` run every
+# start offset rescans the run, so the cost is O(n^2) (QA-N1: 32 KB
+# took seconds on the event loop). ``_scrub_emails`` finds the same
+# matches in one linear pass.
+_EMAIL_LOCAL_CHARS = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-"
+)
+_EMAIL_DOMAIN_RUN_RE = re.compile(r"[A-Za-z0-9.-]*")
+_ASCII_LETTERS_RE = re.compile(r"[A-Za-z]*")
+# Longest string the scrubber looks at. Longer input is cut first so
+# the 500 path stays cheap whatever an exception message or query
+# carries. The cut drops a trailing partial token so half an email or
+# key never survives unscrubbed.
+MAX_SCRUB_CHARS = 8192
+TRUNCATED = "[truncated]"
+_TOKEN_CHARS = _EMAIL_LOCAL_CHARS + "@~/=_"
 # Video Factory ids: ``wks_<hex>`` / ``usr_<hex>`` / ``ses_<hex>`` /
 # ``cred_<hex>`` (core.repo.new_id), plus the short ``ws_`` / ``u_``
 # forms used in docs and tests. At least one digit is required so
@@ -522,9 +588,68 @@ _SECRET_RE = re.compile(
 )
 
 
+def _email_domain_end(s: str, start: int) -> int:
+    """End index of ``[A-Za-z0-9.-]+\\.[A-Za-z]{2,}`` matched at ``start``.
+
+    Same answer as the greedy regex (the right-most ``.`` that is
+    followed by two or more letters, then the whole letter run), in
+    one pass over the domain run. ``-1`` when there is no match.
+    """
+    m = _EMAIL_DOMAIN_RUN_RE.match(s, start)
+    run_end = m.end() if m else start
+    k = s.rfind(".", start + 1, run_end)
+    while k != -1:
+        m = _ASCII_LETTERS_RE.match(s, k + 1)
+        letters_end = m.end() if m else k + 1
+        if letters_end - (k + 1) >= 2:
+            return letters_end
+        k = s.rfind(".", start + 1, k)
+    return -1
+
+
+def _scrub_emails(s: str, at: str) -> str:
+    """Linear-time ``_EMAIL_RE.sub("[email]", s)`` with ``at`` as the
+    separator (``"@"``, or ``"%40"`` for percent-encoded addresses).
+
+    Walks the separators left to right. The local part is the run of
+    ``_EMAIL_LOCAL_CHARS`` right before the separator, but never
+    reaching back past the previous separator or replacement, so every
+    character is looked at a bounded number of times.
+    """
+    out: list[str] = []
+    pos = 0      # s[:pos] is already emitted
+    floor = 0    # a local part may not start before this index
+    i = s.find(at)
+    while i != -1:
+        after = i + len(at)
+        seg = s[max(pos, floor):i]
+        local = len(seg) - len(seg.rstrip(_EMAIL_LOCAL_CHARS))
+        floor = after
+        if local:
+            end = _email_domain_end(s, after)
+            if end != -1:
+                out.append(s[pos:i - local])
+                out.append("[email]")
+                pos = floor = end
+        i = s.find(at, after)
+    if not out:
+        return s
+    out.append(s[pos:])
+    return "".join(out)
+
+
 def scrub_text(s: str) -> str:
-    """Redact emails, VF ids, bearer tokens and known secret shapes."""
-    s = _EMAIL_RE.sub("[email]", s)
+    """Redact emails, VF ids, bearer tokens and known secret shapes.
+
+    Linear in ``len(s)`` and capped at ``MAX_SCRUB_CHARS`` (QA-N1):
+    it runs synchronously inside the async 500 handler.
+    """
+    if len(s) > MAX_SCRUB_CHARS:
+        s = s[:MAX_SCRUB_CHARS].rstrip(_TOKEN_CHARS) + TRUNCATED
+    if "@" in s:
+        s = _scrub_emails(s, "@")
+    if "%40" in s:
+        s = _scrub_emails(s, "%40")
     s = _BEARER_RE.sub(lambda m: f"{m.group(1)} {FILTERED}", s)
     s = _SECRET_RE.sub(FILTERED, s)
     s = _ID_RE.sub("[id]", s)

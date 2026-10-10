@@ -26,7 +26,7 @@ dashboard references a series that does not exist.
 | | `/healthz` | `/readyz` |
 |---|---|---|
 | Question | Is the process alive? | Can it serve real traffic now? |
-| Touches DB | No | Yes, one `SELECT 1` |
+| Touches DB | No | Yes: file check, schema read, write-lock probe (100 ms max) |
 | Success | `200 {"ok": true}` | `200`, `status: "ready"` |
 | Failure | Process dead, no answer | `503`, `status: "unready"` |
 | On failure, orchestrator should | Restart the container | Stop routing traffic. Do NOT restart. |
@@ -55,12 +55,19 @@ and the deploy smoke check. It does not touch the DB either.
 
 | Check | Passes when | Reason codes |
 |---|---|---|
-| `db` | `SELECT 1` returns `1` | exception class (e.g. `OperationalError`), `unhealthy` |
+| `db` | The DB file exists, `sqlite_master` is not empty, and `BEGIN IMMEDIATE; ROLLBACK` gets the write lock within 100 ms (`Repo.readiness_probe`, run on a dedicated thread). Nothing is written. | `db_file_missing` (file deleted under the running process), `db_file_replaced` (a different file now sits at the DB path), `db_schema_missing` (file recreated empty), `db_locked` (another connection holds the write lock), exception class (e.g. `OperationalError`) |
 | `vault_key` | `VIDEO_FACTORY_SECRET_KEY` builds a Fernet (32 url-safe base64 bytes) | `SecretKeyMissing`, `SecretKeyInvalid` |
 | `master_key` | artifact HMAC key resolves. With `VIDEO_FACTORY_ENV=production` the static dev fallback key is refused. | `dev_key_in_use`, exception class |
 
 The production flag is `VIDEO_FACTORY_ENV=production`, the same flag
 that turns on `Secure` session cookies (`auth.session.is_production`).
+`VF_HTTPS=1` alone only turns on `Secure` cookies; it does NOT count as
+production for the dev-key refusal above. `docker-compose.production.yml`
+sets `VIDEO_FACTORY_ENV=production` on the api service.
+
+A long write transaction (over 100 ms) inside the app also reads as
+`db_locked` while it runs. Alert on `/readyz` failing for minutes, not
+on one probe.
 
 ---
 
@@ -90,6 +97,20 @@ Free-form but bounded labels:
 Histogram buckets (seconds): `0.005`, `0.01`, `0.025`, `0.05`, `0.1`,
 `0.25`, `0.5`, `1`, `2.5`, `5`, `10`. The histogram also exposes the
 standard `_bucket`, `_count`, `_sum` and `_created` series.
+
+`_created` series (`prometheus_client` default, one per labelled child,
+type `gauge`, value = Unix time the child was first used). Every counter
+and the histogram emit one as soon as it has a sample:
+
+| Created series | Belongs to |
+|---|---|
+| `video_factory_jobs_created` | counter `video_factory_jobs_total` |
+| `video_factory_live_submits_created` | counter `video_factory_live_submits_total` |
+| `video_factory_webhook_receipts_created` | counter `video_factory_webhook_receipts_total` |
+| `video_factory_errors_created` | counter `video_factory_errors_total` |
+| `video_factory_request_duration_seconds_created` | histogram `video_factory_request_duration_seconds` |
+
+They carry the same labels as their parent. Dashboards do not need them.
 
 ### Useful queries
 
@@ -214,13 +235,24 @@ Enforced by `api.observability.scrub_event`, installed both as
 * Headers `Authorization`, `Cookie`, `Set-Cookie`, `Stripe-Signature`
   and any header whose name contains `token`, `secret`, `signature`,
   `api-key`, `auth`, `csrf` or `session` become `[Filtered]`.
-* Query values for keys like `code`, `state`, `token`, `password`,
-  `email`, `key` become `[Filtered]`.
+* Query values for keys like `code`, `state`, `token`, `pass`/`pwd`,
+  `email`, `key`, `jwt`, `otp`, `*_hint`, `nonce` become `[Filtered]`
+  (substring match on the key). Other query keys and values are
+  URL-decoded and scanned like any string below, so
+  `?contact=alice%40example.com` becomes `contact=[email]`. A value
+  that carries its own query or fragment (`next=/cb?code=...`,
+  `#access_token=...`) is redacted the same way, 3 levels deep.
+  The access log `path` field uses the same redaction.
 * `user` keeps only `id`.
 * Every remaining string (exception value, message, breadcrumbs,
   source context lines) is scanned: emails become `[email]`, Video
   Factory ids (`wks_…`, `usr_…`, `ses_…`, `cred_…`, `ws_…`, `u_…`)
   become `[id]`, `Bearer …` / `Basic …` credentials, Stripe keys
   (`sk_live_…`, `whsec_…`) and Fernet tokens become `[Filtered]`.
+  Percent-encoded addresses (`alice%40example.com`) count as emails.
+* The scan is linear in the string length, and any string longer than
+  8192 chars is cut first (`[truncated]`, a half token at the cut is
+  dropped). Scrubbing runs inside the async 500 handler, so it must
+  stay cheap whatever the request carried.
 * No frame local variables are sent (a credentials `PUT` would
   otherwise ship the plaintext provider secret).
