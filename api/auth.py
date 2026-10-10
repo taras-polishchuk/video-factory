@@ -61,6 +61,7 @@ from auth.dependencies import (
     list_workspaces_for_user,
     resolve_workspace_membership,
 )
+from auth.origin import require_trusted_origin
 from auth.ratelimit import decide as rl_decide, record_attempt
 from auth.session import (
     DEFAULT_TTL_SECONDS,
@@ -117,7 +118,13 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
         return _append
 
     def _client_ip(request: Request) -> str:
-        return (request.client.host if request.client else "") or "unknown"
+        # Delegate to auth.client_ip.client_ip so XFF from a trusted
+        # proxy is honored; an untrusted peer's XFF is ignored.
+        try:
+            from auth.client_ip import client_ip as _cip
+            return _cip(request)
+        except Exception:
+            return (request.client.host if request.client else "") or "unknown"
 
     def _user_agent(request: Request) -> str:
         return (request.headers.get("user-agent") or "")[:512]
@@ -133,6 +140,24 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
 
     @router.post("/signup")
     async def signup(request: Request, payload: dict):
+        from auth.origin import require_trusted_origin as _rto
+        _rto(request)
+        # F26: per-IP rate limit on signup (separate counter from login).
+        try:
+            from auth.ratelimit import hit as _rl_hit
+            from auth.client_ip import client_ip as _cip
+            _d = _rl_hit(repo, bucket="signup_ip", key=_cip(request))
+            if not _d.allowed:
+                # F26 tests check Retry-After.
+                raise HTTPException(
+                    429,
+                    "too many signup attempts; try again later",
+                    headers={"Retry-After": str(int(_d.window_seconds))},
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         _require_secret()
         email = (payload.get("email") or "").strip()
         password = payload.get("password") or ""
@@ -205,6 +230,18 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
                 (token, user_id, _now_plus(24*60*60), _now_iso()),
             )
 
+        # F8: if the caller presented a session cookie, destroy it before
+        # issuing a new one. Prevents session-fixation on signup.
+        try:
+            from auth.session import read_session_cookie
+            presented = read_session_cookie(request)
+        except Exception:
+            presented = None
+        if presented:
+            try:
+                repo.delete_session(presented)
+            except Exception:
+                pass
         # Issue session
         session_id = new_session_id()
         csrf = derive_csrf_token(session_id)
@@ -240,6 +277,8 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
 
     @router.post("/login")
     async def login(request: Request, payload: dict):
+        from auth.origin import require_trusted_origin as _rto
+        _rto(request)
         _require_secret()
         email = (payload.get("email") or "").strip()
         password = payload.get("password") or ""
@@ -263,6 +302,17 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
             from auth.passwords import verify_password
             if verify_password(password, user["password_hash"]):
                 ok = True
+        # F8: if login succeeded, destroy any presented session before
+        # issuing a new one (anti-fixation). If login failed, leave the
+        # existing session untouched.
+        if ok and user is not None:
+            from auth.session import read_session_cookie as _rsc
+            presented = _rsc(request)
+            if presented:
+                try:
+                    repo.delete_session(presented)
+                except Exception:
+                    pass
         record_attempt(repo, ip=ip, email=email, succeeded=ok)
         if user is not None and user["status"] == "locked":
             # 423 Locked: account is administratively locked
@@ -331,6 +381,27 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
 
     @router.post("/forgot")
     async def forgot(request: Request, payload: dict):
+        from auth.origin import require_trusted_origin as _rto
+        _rto(request)
+        # F26: per-IP and per-email rate limits.
+        try:
+            from auth.ratelimit import hit as _hit, email_key
+            from auth.client_ip import client_ip as _cip
+            _ip = _cip(request)
+            _d1 = _hit(repo, bucket="forgot_ip", key=_ip)
+            if not _d1.allowed:
+                raise HTTPException(429, "too many requests",
+                    headers={"Retry-After": str(int(_d1.window_seconds))})
+            _email_pre = (payload.get("email") or "").strip().lower()
+            if _email_pre:
+                _d2 = _hit(repo, bucket="forgot_email", key=email_key(_email_pre))
+                if not _d2.allowed:
+                    raise HTTPException(429, "too many requests",
+                        headers={"Retry-After": str(int(_d2.window_seconds))})
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         # Always 200 to prevent email enumeration.
         email = (payload.get("email") or "").strip().lower()
         ip = _client_ip(request)
@@ -370,7 +441,21 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
         return {"ok": True}
 
     @router.post("/forgot/consume")
-    async def forgot_consume(payload: dict):
+    async def forgot_consume(request: Request, payload: dict):
+        from auth.origin import require_trusted_origin as _rto
+        _rto(request)
+        # F26: per-IP rate limit on /forgot/consume.
+        try:
+            from auth.ratelimit import hit as _hit
+            from auth.client_ip import client_ip as _cip
+            _d = _hit(repo, bucket="reset_consume_ip", key=_cip(request))
+            if not _d.allowed:
+                raise HTTPException(429, "too many requests",
+                    headers={"Retry-After": str(int(_d.window_seconds))})
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         token = (payload.get("token") or "").strip()
         new_password = payload.get("new_password") or ""
         if not token or not new_password:
@@ -405,7 +490,21 @@ def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
     # ── verify ───────────────────────────────────────────────
 
     @router.post("/verify")
-    async def verify(payload: dict):
+    async def verify(request: Request, payload: dict):
+        from auth.origin import require_trusted_origin as _rto
+        _rto(request)
+        # F26: per-IP rate limit on /verify.
+        try:
+            from auth.ratelimit import hit as _hit
+            from auth.client_ip import client_ip as _cip
+            _d = _hit(repo, bucket="verify_ip", key=_cip(request))
+            if not _d.allowed:
+                raise HTTPException(429, "too many requests",
+                    headers={"Retry-After": str(int(_d.window_seconds))})
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         token = (payload.get("token") or "").strip()
         if not token:
             raise HTTPException(400, "token required")
@@ -779,6 +878,6 @@ def _set_session_cookie(request: Request, *, session_id: str,
     # client reads cookies via `client.cookies`).
     request.state._vf_session_cookie = build_set_cookie_value(
         session_id=session_id, max_age=DEFAULT_TTL_SECONDS,
-        secure=should_use_secure_cookies(),
+        secure=should_use_secure_cookies(request),
     )
     return body

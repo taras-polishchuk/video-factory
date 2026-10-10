@@ -263,3 +263,12 @@ def should_use_secure_cookies(request=None) -> bool:
         except Exception:  # noqa: BLE001 - malformed scope: fall through
             pass
     return False
+
+
+def read_session_cookie(request) -> Optional[str]:
+    """Return the raw session id from the vf_session cookie, or None.
+
+    Used by F8 (session fixation: destroy any presented session before
+    issuing a new one on signup/login).
+    """
+    return request.cookies.get(SESSION_COOKIE_NAME)
