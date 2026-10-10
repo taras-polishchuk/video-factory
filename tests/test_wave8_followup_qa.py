@@ -371,7 +371,8 @@ def test_qa_guard_live_readyz_key_matrix(live, env, drop, want_status, want_erro
     st, body, _ = s.req("GET", "/readyz")
     j = json.loads(body)
     assert st == want_status, body
-    assert set(j) == {"status", "checks", "errors", "warnings"}, j
+    assert set(j) >= {"status", "checks", "errors", "warnings"}, j
+    # E1 adds an informational "info" block; it never affects readiness.
     assert all(isinstance(v, bool) for v in j["checks"].values()), j
     assert j["status"] == ("ready" if want_status == 200 else "unready")
     if want_error:

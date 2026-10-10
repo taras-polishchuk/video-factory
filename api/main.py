@@ -313,6 +313,10 @@ def create_app(*, repo: Optional[Repo] = None,
                 "checks": checks,
                 "errors": errors,
                 "warnings": warnings,
+                # E1: email transport status never affects readiness, but
+                # an operator probing /readyz wants to know if the mailer
+                # can deliver verification / reset links.
+                "info": {"email": mailer.status().get("email", "not_configured")},
             },
             status_code=200 if ready else 503,
         )
@@ -1745,10 +1749,14 @@ def create_app(*, repo: Optional[Repo] = None,
         def _stripe_init_error() -> dict:
             return {"ok": False, "error": _stripe_err_msg}
 
-        # The route is intentionally NOT registered when no secret is
-        # configured: a 503 here would be misleading (the route "is"
-        # there but cannot process), and Wave 6c QA pins the contract
-        # that callers see 404 + the diagnostic on /_stripe_init_error.
+        # B1: register the route but refuse (503). Nothing is read,
+        # verified, recorded or processed: with no secret no signature
+        # can be trusted, so no payload is. Wave 6c QA pins the same
+        # contract (503 + /_stripe_init_error diagnostic).
+
+        @app.post("/api/v1/webhooks/stripe")
+        async def _stripe_webhook_unconfigured() -> None:
+            raise HTTPException(503, "stripe webhook not configured")
 
     # ── auth (Wave 1) ────────────────────────────────────────
 

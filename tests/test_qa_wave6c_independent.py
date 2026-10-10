@@ -507,9 +507,9 @@ def test_missing_secret_webhook_route_unregistered(
     body = r.json()
     assert body["ok"] is False
     assert "STRIPE_WEBHOOK_SECRET" in body["error"]
-    # Webhook route is NOT registered → 404.
+    # Webhook route is registered but refuses with 503 (B1 contract).
     r2 = client.post(WEBHOOK_PATH, content=b"{}")
-    assert r2.status_code == 404, (r2.status_code, r2.text)
+    assert r2.status_code == 503, (r2.status_code, r2.text)
     # No stripe_events row written.
     cnt = repo._conn().execute(
         "SELECT COUNT(*) FROM stripe_events",
