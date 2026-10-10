@@ -183,21 +183,26 @@ def create_app(*, repo: Optional[Repo] = None,
 
         Each check is independent and isolated; a single failure
         flips the response to 503. Reason codes are exception class
-        names or fixed tokens (``unhealthy``, ``dev_key_in_use``) -
+        names or fixed tokens (``dev_key_in_use``,
+        ``db_file_missing``, ``db_file_replaced``, ``db_schema_missing``,
+        ``db_locked``) -
         never exception messages, so no path or key material can
-        leak through an unauthenticated probe. The DB check is a
-        single ``SELECT 1`` so the probe never blocks on a
-        long-running migration.
+        leak through an unauthenticated probe. The DB check
+        (``Repo.readiness_probe``, QA-N2) really touches the file:
+        it must exist, have a schema, and give up its write lock
+        within 100 ms. It runs in the threadpool, so a locked DB
+        answers 503 fast and never blocks the event loop.
         """
         checks: dict[str, bool] = {}
         errors: dict[str, str] = {}
         warnings: dict[str, str] = {}
-        # 1) DB open + responsive.
+        # 1) DB present, readable and writable (not write-locked).
         try:
-            row = repo._conn().execute("SELECT 1").fetchone()  # noqa: SLF001
-            checks["db"] = bool(row) and row[0] == 1
-            if not checks["db"]:
-                errors["db"] = "unhealthy"
+            from starlette.concurrency import run_in_threadpool
+            reason = await run_in_threadpool(repo.readiness_probe)
+            checks["db"] = reason is None
+            if reason is not None:
+                errors["db"] = reason
         except Exception as e:  # noqa: BLE001
             checks["db"] = False
             errors["db"] = type(e).__name__

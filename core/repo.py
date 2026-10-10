@@ -941,6 +941,68 @@ class Repo:
             c.close()
             self._local.conn = None
 
+    def readiness_probe(self, *, busy_timeout_ms: int = 100) -> Optional[str]:
+        """Cheap real-DB check for ``/readyz`` (Wave 8 QA-N2).
+
+        Returns ``None`` when the DB can serve reads and writes, or a
+        fixed reason token:
+
+        * ``db_file_missing``: the file at ``db_path`` is gone. Open
+          connections keep working on the unlinked inode, so every
+          write since is lost at the next restart.
+        * ``db_file_replaced``: a different file now sits at
+          ``db_path`` than the one this thread's connection opened
+          (deleted and recreated underneath the process).
+        * ``db_schema_missing``: the file has no schema (a fresh
+          connection opened a recreated, empty file).
+        * ``db_locked``: another connection holds the write lock for
+          longer than ``busy_timeout_ms``; real writes would block
+          for the full busy timeout and then fail.
+
+        Any other failure raises (``/readyz`` reports the exception
+        class). Uses this thread's cached connection, lowers its busy
+        timeout for the probe only and restores it, and never writes:
+        ``BEGIN IMMEDIATE`` takes the write lock, ``ROLLBACK`` drops it.
+        Call it off the event loop (it can wait ``busy_timeout_ms``).
+        """
+        try:
+            st = os.stat(self.db_path)
+        except FileNotFoundError:
+            return "db_file_missing"
+        ident = (st.st_dev, st.st_ino)
+        c = self._conn()
+        # Remember which file this thread's connection was opened on.
+        # A new connection (first use, Repo.close(), key-rotation
+        # epoch bump) re-arms the check.
+        if getattr(self._local, "probe_conn", None) is not c:
+            self._local.probe_conn = c
+            self._local.probe_ident = ident
+        elif self._local.probe_ident != ident:
+            return "db_file_replaced"
+        if c.in_transaction:
+            # This thread is inside its own transaction; a nested
+            # BEGIN would fail for the wrong reason. Reads still work.
+            c.execute("SELECT 1").fetchone()
+            return None
+        prev = c.execute("PRAGMA busy_timeout").fetchone()[0]
+        c.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        try:
+            row = c.execute(
+                "SELECT count(*) FROM sqlite_master").fetchone()
+            if not row or not row[0]:
+                return "db_schema_missing"
+            try:
+                c.execute("BEGIN IMMEDIATE")
+            except Exception as exc:  # noqa: BLE001 - sqlcipher3 has its own classes
+                msg = str(exc).lower()
+                if "locked" in msg or "busy" in msg:
+                    return "db_locked"
+                raise
+            c.execute("ROLLBACK")
+            return None
+        finally:
+            c.execute(f"PRAGMA busy_timeout={int(prev)}")
+
     @contextmanager
     def tx(self, *, _skip_rotation_check: bool = False
            ) -> Iterator[sqlite3.Connection]:
