@@ -44,18 +44,31 @@ sqlite3 /data/video_factory.db \
 # Expect: key.rotation_completed with both key fingerprints.
 ```
 
-For a live (no-downtime) rotation, run the admin endpoint instead:
+For a live (no-downtime) rotation, run the admin endpoint instead.
+S1b: the endpoint needs an owner/admin session, its CSRF token and
+the caller's CURRENT PASSWORD in the body (re-authentication; 5
+attempts per 15 min per user). The body goes in via stdin from
+exported variables, so neither key nor password lands in `ps`,
+shell history or a proxy access log:
 
 ```bash
-curl -fsS -X POST https://$DOMAIN/api/v1/admin/keys/rotate \
-  -H "Cookie: vf_session=$ADMIN_SESSION_COOKIE" \
-  -H "Content-Type: application/json" \
-  -d '{"new_key": "'"$NEW_KEY"'"}'
+CSRF=$(curl -fsS https://$DOMAIN/auth/csrf \
+  -H "Cookie: vf_session=$ADMIN_SESSION_COOKIE" | jq -r .csrf_token)
+read -rs -p "current password: " VF_PW; echo
+export OLD_KEY NEW_KEY VF_PW
+jq -n '{old_key: env.OLD_KEY, new_key: env.NEW_KEY, current_password: env.VF_PW}' \
+  | curl -fsS -X POST https://$DOMAIN/api/v1/admin/keys/rotate \
+      -H "Cookie: vf_session=$ADMIN_SESSION_COOKIE" \
+      -H "X-CSRF-Token: $CSRF" \
+      -H "Content-Type: application/json" --data-binary @-
+unset VF_PW OLD_KEY NEW_KEY
 ```
 
 The endpoint sets `key.rotation_in_progress=1`, blocks new credential
 writes during the rotation, and writes `key.rotation_completed` on
-success. Audit log carries both key fingerprints.
+success. Audit log, app logs and error bodies carry only the SHA-256
+fingerprints of the keys, never the keys. 403 = missing CSRF, wrong
+password or no owner/admin role; 429 = re-auth budget used up.
 
 ---
 
@@ -113,7 +126,8 @@ systemctl restart video-factory.service
 ```
 
 After a credential leak, ALSO rotate VIDEO_FACTORY_SESSION_SECRET
-(see rotation above) AND any provider credentials that were in scope.
+(see "Session secret rotation" below) AND any provider credentials
+that were in scope.
 
 ---
 
@@ -226,3 +240,74 @@ For anything not listed here: capture the request id from the
 response header `X-Request-Id`, then `journalctl -u video-factory
 --since "5 minutes ago" | grep <request-id>` to find the matching
 log line.
+---
+
+## Session secret rotation (VIDEO_FACTORY_SESSION_SECRET)
+
+Sessions are opaque ids in the `sessions` table; the secret only
+signs CSRF tokens (`HMAC(secret, session_id)`) and the SvelteKit
+server's internal-call token. `VIDEO_FACTORY_SESSION_SECRET_PREVIOUS`
+(one value or a comma-separated list) is accepted for VERIFICATION
+ONLY, so a planned rotation logs nobody out:
+
+```bash
+# 1) Generate the new secret on the host
+NEW=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+
+# 2) Old value -> VIDEO_FACTORY_SESSION_SECRET_PREVIOUS,
+#    new value -> VIDEO_FACTORY_SESSION_SECRET, for BOTH the api and
+#    the web container (the web server derives CSRF + internal tokens
+#    with the same secret). Restart api + web.
+
+# 3) After 7 days (session TTL; open tabs keep their CSRF token in
+#    memory) remove VIDEO_FACTORY_SESSION_SECRET_PREVIOUS and restart.
+```
+
+New tokens are always derived from the current secret. After a LEAK do
+not use the overlap: set only the new secret (no `_PREVIOUS`) and run
+"Logout everyone" above, so every old token and session dies at once.
+
+---
+
+## Pre-session auth hardening (S1b)
+
+Settings that change how `/auth/signup`, `/auth/login`, `/auth/forgot`,
+`/auth/forgot/consume` and `/auth/verify` behave:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `VIDEO_FACTORY_ENV` | unset (dev) | `production` / `staging`: Secure cookies, Origin required |
+| `VIDEO_FACTORY_PUBLIC_BASE_URL` | unset | Its origin is allow-listed for the Origin check |
+| `VIDEO_FACTORY_CORS_ORIGINS` | unset | Extra allowed origins; also the ONLY way to enable CORS (`*` is ignored) |
+| `VIDEO_FACTORY_REQUIRE_ORIGIN` | from `VIDEO_FACTORY_ENV` | `1`/`0` forces strict / lenient mode |
+| `VIDEO_FACTORY_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128,172.16.0.0/12` | Peers whose `X-Forwarded-For` / `X-Forwarded-Proto` are believed |
+| `VF_SIGNUP_IP_LIMIT` / `_WINDOW_SEC` | 10 / 3600 | Signups per client IP |
+| `VF_FORGOT_IP_LIMIT` / `_WINDOW_SEC` | 5 / 900 | Reset requests per IP |
+| `VF_FORGOT_EMAIL_LIMIT` / `_WINDOW_SEC` | 3 / 3600 | Reset requests per address (stored as a hash) |
+| `VF_RESET_CONSUME_IP_LIMIT` / `_WINDOW_SEC` | 10 / 900 | Reset-token submissions per IP |
+| `VF_VERIFY_IP_LIMIT` / `_WINDOW_SEC` | 10 / 900 | Verify-token submissions per IP |
+| `VF_KEYS_REAUTH_LIMIT` / `_WINDOW_SEC` | 5 / 900 | Password re-auth on key rotation, per user |
+
+Origin rule (auth/origin.py): a valid `X-VF-Internal-Token` (sent only
+by the SvelteKit server, derived from the session secret) passes; else
+`Origin` (or `Referer`) must be the request's own host, the public base
+URL or a CORS origin; `Origin: null` never passes. With neither header
+the call is allowed in dev and refused (403 `origin_missing`) in
+production / staging. A curl smoke test against production must send
+`-H "Origin: https://$DOMAIN"`.
+
+Client IP (auth/client_ip.py): `X-Forwarded-For` is read only when the
+socket peer is a trusted proxy, right to left, first untrusted hop
+wins. The SvelteKit server appends `event.getClientAddress()` to the
+chain it got from Caddy, so each browser gets its own bucket. A 429
+carries `Retry-After`; counters live in `rate_limit_hits` (pruned
+after 7 days). Reset one client:
+
+```bash
+sqlite3 /data/video_factory.db "DELETE FROM rate_limit_hits WHERE key = '203.0.113.7'"
+```
+
+HeyGen webhook replays: every accepted signed body is recorded in
+`webhook_receipts` (SHA-256 of the body, kept
+`HEYGEN_WEBHOOK_DEDUP_DAYS`, default 30). A byte-identical resend gets
+`200 {"duplicate": true}` and changes nothing.
