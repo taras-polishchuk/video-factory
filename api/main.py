@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from core.repo import Forbidden, NotFound, Repo
 from core.runners import JobRunner, Singleton
 from auth.dependencies import get_current_user  # noqa: E402  (module-scope)
+from api.admin_keys import require_platform_admin  # noqa: E402  (module-scope)
 
 
 def create_app(*, repo: Optional[Repo] = None,
@@ -825,13 +826,13 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.get("/api/v1/admin/keys/status")
     async def keys_status(request: Request,
-                          ctx: AuthContext = Depends(get_current_user)):
-        # Owner-only check at the workspace level: pick ANY
-        # workspace the caller owns.  In a single-tenant SaaS the
-        # operator's first workspace is canonical; for multi-
-        # workspace accounts the request body would carry wid.
-        # We deliberately fail closed if the caller is not an
-        # owner of any workspace.
+                          ctx: AuthContext = Depends(require_platform_admin)):
+        # Platform-admin allow-list gate (VIDEO_FACTORY_PLATFORM_ADMINS).
+        # require_platform_admin already 403s non-admins and unauthenticated
+        # callers; if we get here the caller is on the platform-admin list.
+        # We still verify the caller owns *some* workspace as a sanity
+        # check (a platform admin should at least be a workspace owner),
+        # but the primary boundary is the allow-list itself.
         from control_plane import key_rotation
         owner_wid = _find_owner_workspace(repo, ctx.user_id)
         if not owner_wid:
@@ -840,9 +841,11 @@ def create_app(*, repo: Optional[Repo] = None,
 
     @app.post("/api/v1/admin/keys/rotate")
     async def keys_rotate(request: Request,
-                          ctx: AuthContext = Depends(get_current_user)):
+                          ctx: AuthContext = Depends(require_platform_admin)):
         # S1b / A1 F11 + F15: CSRF, owner/admin role, current-password
         # re-auth, key material never logged. See api/admin_keys.py.
+        # The platform-admin allow-list is enforced inside handle_rotate
+        # (so we re-use the gate for both endpoints consistently).
         from api.admin_keys import handle_rotate
         return await handle_rotate(request, ctx, repo)
 

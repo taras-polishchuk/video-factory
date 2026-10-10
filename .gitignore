@@ -14,6 +14,7 @@ storage/
 *.db-shm
 venv/
 .venv/
+.venv-test/
 
 # Editor / OS
 .DS_Store

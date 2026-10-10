@@ -19,12 +19,18 @@ The endpoint re-keys the whole SQLCipher DB, so it gets every guard:
 from __future__ import annotations
 
 import logging
+import os
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import HTTPException, Request
+
+if TYPE_CHECKING:
+    from auth.dependencies import AuthContext
 
 _log = logging.getLogger("video_factory.security")
 
 _ADMIN_ROLES = ("owner", "admin")
+_PLATFORM_ADMINS_ENV = "VIDEO_FACTORY_PLATFORM_ADMINS"
 
 
 def _has_admin_role(repo, user_id: str) -> bool:
@@ -34,6 +40,57 @@ def _has_admin_role(repo, user_id: str) -> bool:
     return any(r[0] in _ADMIN_ROLES for r in rows)
 
 
+def platform_admins() -> set[str]:
+    """Return the allow-list of platform-admin user ids.
+
+    Reads ``VIDEO_FACTORY_PLATFORM_ADMINS`` (comma-separated). Unset
+    or whitespace-only entries mean the allow-list is empty —
+    everyone is denied (fail-closed).
+    """
+    raw = os.environ.get(_PLATFORM_ADMINS_ENV, "")
+    return {tok.strip() for tok in raw.split(",") if tok.strip()}
+
+
+def is_platform_admin(user_id: Optional[str]) -> bool:
+    """True iff ``user_id`` is in the platform-admin allow-list."""
+    if not user_id:
+        return False
+    return user_id in platform_admins()
+
+
+def require_platform_admin(request: Request) -> "AuthContext":  # noqa: F821
+    """Depends() that gates a request on the platform-admin allow-list.
+
+    Behaviour:
+    - No cookie / invalid session / expired / missing user → 403
+      ("platform admin required"). Authenticated non-admins also 403.
+    - User present but not in ``VIDEO_FACTORY_PLATFORM_ADMINS`` → 403.
+    - User in the allow-list → returns AuthContext.
+
+    Reuses the same session/user primitives as get_current_user; the
+    failure mode is intentionally a flat 403 because the admin gate
+    runs BEFORE the workspace/role checks.
+    """
+    from auth.dependencies import AuthContext, _load_session, _load_user, _read_cookie
+
+    repo = request.app.state.repo
+    session_id = _read_cookie(request)
+    if not session_id:
+        raise HTTPException(403, "platform admin required")
+    sess = _load_session(repo, session_id)
+    if not sess:
+        raise HTTPException(403, "platform admin required")
+    user = _load_user(repo, sess["user_id"])
+    if not user:
+        raise HTTPException(403, "platform admin required")
+    if user.get("status") == "locked":
+        # Locked accounts are still gated out at the admin layer.
+        raise HTTPException(403, "platform admin required")
+    if not is_platform_admin(user["user_id"]):
+        raise HTTPException(403, "platform admin required")
+    return AuthContext(user_id=user["user_id"], email=user["email"])
+
+
 async def handle_rotate(request: Request, ctx, repo) -> dict:
     from auth.audit_log import append as audit_append
     from auth.dependencies import require_csrf
@@ -41,9 +98,14 @@ async def handle_rotate(request: Request, ctx, repo) -> dict:
     from auth.ratelimit import hit as rl_hit
     from control_plane import key_rotation
 
-    # 1. CSRF + live session.
+    # 1. Admin gate (platform-admin allow-list). Runs before CSRF
+    #    because admin boundary > auth semantics: anyone without admin
+    #    status is rejected with 403, no matter what they send.
+    if not is_platform_admin(ctx.user_id):
+        raise HTTPException(403, "platform admin required")
+    # 2. CSRF + live session.
     require_csrf(request, x_csrf_token=request.headers.get("X-CSRF-Token"))
-    # 2. Role.
+    # 3. Role.
     if not _has_admin_role(repo, ctx.user_id):
         raise HTTPException(403, "owner or admin role required")
     # Body: JSON object only, never echoed.

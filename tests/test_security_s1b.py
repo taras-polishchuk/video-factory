@@ -53,6 +53,7 @@ _ENV_TO_CLEAR = (
     "VIDEO_FACTORY_DB_KEY", "SENTRY_DSN",
     "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET",
     "GITHUB_OIDC_CLIENT_ID", "GITHUB_OIDC_CLIENT_SECRET",
+    "VIDEO_FACTORY_PLATFORM_ADMINS",
 )
 
 
@@ -446,11 +447,181 @@ NEW_KEY = "s1b-new-db-key-" + "Z" * 24
 
 
 def _owner(app, email="owner@example.com"):
+    """Back-compat alias. Returns a plain owner (NO platform-admin).
+
+    Use ``_platform_admin`` for tests that need to actually hit the
+    keys/status or keys/rotate endpoints — the admin gate is enforced
+    in addition to owner role.
+    """
     c = TestClient(app)
     r = _signup(c, email=email)
     assert r.status_code == 200, r.text
     sid = r.cookies.get("vf_session")
     return c, r.json()["user_id"], sid
+
+
+def _platform_admin(app, email="admin@example.com", env_var=None, user_id=None):
+    """Sign up a user and add them to VIDEO_FACTORY_PLATFORM_ADMINS.
+
+    ``env_var`` defaults to os.environ so the test can manipulate the
+    allow-list directly. Returns (client, user_id, sid). Use this for
+    any test that needs to drive /api/v1/admin/keys/* end-to-end.
+    """
+    import os as _os
+    c = TestClient(app)
+    r = _signup(c, email=email)
+    assert r.status_code == 200, r.text
+    uid = r.json()["user_id"]
+    sid = r.cookies.get("vf_session")
+    target = env_var if env_var is not None else _os.environ
+    existing = target.get("VIDEO_FACTORY_PLATFORM_ADMINS", "")
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    if uid not in parts:
+        parts.append(uid)
+    target["VIDEO_FACTORY_PLATFORM_ADMINS"] = ",".join(parts)
+    return c, uid, sid
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin allow-list gate on /api/v1/admin/keys/{status,rotate}
+# ════════════════════════════════════════════════════════════════════
+
+
+def test_admin_gate_unauthenticated_keys_status_refused(make_app):
+    """Unauthenticated GET /api/v1/admin/keys/status → 403.
+
+    The admin gate runs before authentication: the spec requires that
+    anyone who is not on the platform-admin allow-list is 403'd,
+    regardless of whether they sent a session cookie.
+    """
+    import os as _os
+    _os.environ["VIDEO_FACTORY_PLATFORM_ADMINS"] = "fake-admin-uid"
+    app, _ = make_app()
+    # No cookie.
+    r = TestClient(app).get("/api/v1/admin/keys/status")
+    assert r.status_code == 403, r.text
+    assert "platform admin" in r.text
+
+
+def test_admin_gate_unauthenticated_keys_rotate_refused(make_app):
+    """Unauthenticated POST /api/v1/admin/keys/rotate → 403."""
+    import os as _os
+    _os.environ["VIDEO_FACTORY_PLATFORM_ADMINS"] = "fake-admin-uid"
+    app, _ = make_app()
+    r = TestClient(app).post("/api/v1/admin/keys/rotate",
+                             content=json.dumps({"old_key": OLD_KEY,
+                                                 "new_key": NEW_KEY,
+                                                 "current_password": PASSWORD}))
+    assert r.status_code == 403, r.text
+    assert "platform admin" in r.text
+
+
+def test_admin_gate_non_admin_keys_status_refused(make_app):
+    """An authenticated owner who is NOT on the allow-list → 403."""
+    app, _ = make_app()
+    _signup(TestClient(app), email="regular@example.com")
+    # NOTE: no _platform_admin call → env var stays cleared.
+    sid = TestClient(app).post("/auth/login",
+                               json={"email": "regular@example.com",
+                                     "password": PASSWORD}).cookies.get("vf_session")
+    assert isinstance(sid, str) and sid, "login failed to set session cookie"
+    r = TestClient(app).get("/api/v1/admin/keys/status",
+                            headers=_cookie(sid))
+    assert r.status_code == 403, r.text
+    assert "platform admin" in r.text
+
+
+def test_admin_gate_non_admin_keys_rotate_refused(make_app):
+    """An authenticated owner who is NOT on the allow-list → 403.
+
+    Replaces a plain owner with the platform-admin allow-list, but the
+    caller uses someone else's session — so even with valid CSRF and
+    re-auth the admin gate fires first.
+    """
+    app, _ = make_app(db_key=OLD_KEY)
+    # Owner (in workspace sense) but NOT in admin allow-list.
+    _signup(TestClient(app), email="regular@example.com")
+    sid = TestClient(app).post("/auth/login",
+                               json={"email": "regular@example.com",
+                                     "password": PASSWORD}).cookies.get("vf_session")
+    assert isinstance(sid, str) and sid, "login failed to set session cookie"
+    headers = _cookie(sid)
+    headers["X-CSRF-Token"] = _csrf(sid)
+    r = TestClient(app).post("/api/v1/admin/keys/rotate", headers=headers,
+                             content=json.dumps({"old_key": OLD_KEY,
+                                                 "new_key": NEW_KEY,
+                                                 "current_password": PASSWORD}))
+    assert r.status_code == 403, r.text
+    assert "platform admin" in r.text
+
+
+def test_admin_gate_admin_caller_keys_status_proceeds(make_app):
+    """A platform-admin caller can read /api/v1/admin/keys/status."""
+    app, _ = make_app()
+    _, _, sid = _platform_admin(app)
+    r = TestClient(app).get("/api/v1/admin/keys/status",
+                            headers=_cookie(sid))
+    assert r.status_code == 200, r.text
+    # Sanity: shape is the rotation-state dict.
+    assert isinstance(r.json(), dict)
+
+
+def test_admin_gate_empty_env_var_means_403(make_app):
+    """An empty VIDEO_FACTORY_PLATFORM_ADMINS means nobody is admin."""
+    import os as _os
+    _os.environ["VIDEO_FACTORY_PLATFORM_ADMINS"] = ""
+    app, _ = make_app(db_key=OLD_KEY)
+    _, uid, sid = _owner(app)
+    # Even though uid is a valid owner, the empty allow-list denies.
+    r = TestClient(app).get("/api/v1/admin/keys/status",
+                            headers=_cookie(sid))
+    assert r.status_code == 403
+    headers = _cookie(sid)
+    headers["X-CSRF-Token"] = _csrf(sid)
+    r = TestClient(app).post("/api/v1/admin/keys/rotate", headers=headers,
+                             content=json.dumps({"old_key": OLD_KEY,
+                                                 "new_key": NEW_KEY,
+                                                 "current_password": PASSWORD}))
+    assert r.status_code == 403
+
+
+def test_admin_gate_unset_env_var_means_403(make_app):
+    """An unset VIDEO_FACTORY_PLATFORM_ADMINS also denies everyone."""
+    import os as _os
+    _os.environ.pop("VIDEO_FACTORY_PLATFORM_ADMINS", None)
+    app, _ = make_app(db_key=OLD_KEY)
+    _, _, sid = _owner(app)
+    r = TestClient(app).get("/api/v1/admin/keys/status",
+                            headers=_cookie(sid))
+    assert r.status_code == 403
+    headers = _cookie(sid)
+    headers["X-CSRF-Token"] = _csrf(sid)
+    r = TestClient(app).post("/api/v1/admin/keys/rotate", headers=headers,
+                             content=json.dumps({"old_key": OLD_KEY,
+                                                 "new_key": NEW_KEY,
+                                                 "current_password": PASSWORD}))
+    assert r.status_code == 403
+
+
+def test_admin_gate_comma_separated_env_var(make_app):
+    """Multiple comma-separated UIDs are all honoured."""
+    app, _ = make_app()
+    _, uid_a, sid_a = _platform_admin(app, email="alice@example.com")
+    _, uid_b, sid_b = _platform_admin(app, email="bob@example.com")
+    # Anyone on the allow-list can hit status.
+    for sid in (sid_a, sid_b):
+        r = TestClient(app).get("/api/v1/admin/keys/status",
+                                headers=_cookie(sid))
+        assert r.status_code == 200, (sid, r.text)
+    # And someone not on the list still 403's.
+    _signup(TestClient(app), email="carol@example.com")
+    sid_c = TestClient(app).post("/auth/login",
+                                  json={"email": "carol@example.com",
+                                        "password": PASSWORD}).cookies.get("vf_session")
+    assert isinstance(sid_c, str) and sid_c, "login failed to set session cookie"
+    r = TestClient(app).get("/api/v1/admin/keys/status",
+                            headers=_cookie(sid_c))
+    assert r.status_code == 403
 
 
 def _rotate(app, sid, body, csrf=True):
@@ -463,7 +634,7 @@ def _rotate(app, sid, body, csrf=True):
 
 def test_f11_rotate_without_csrf_refused(make_app):
     app, _ = make_app(db_key=OLD_KEY)
-    _, _, sid = _owner(app)
+    _, _, sid = _platform_admin(app)
     r = _rotate(app, sid, {"old_key": OLD_KEY, "new_key": NEW_KEY,
                            "current_password": PASSWORD}, csrf=False)
     assert r.status_code == 403, r.text
@@ -471,7 +642,7 @@ def test_f11_rotate_without_csrf_refused(make_app):
 
 def test_f11_rotate_without_or_with_wrong_password_refused(make_app):
     app, repo = make_app(db_key=OLD_KEY)
-    _, uid, sid = _owner(app)
+    _, uid, sid = _platform_admin(app)
     r = _rotate(app, sid, {"old_key": OLD_KEY, "new_key": NEW_KEY})
     assert r.status_code == 403, r.text
     r = _rotate(app, sid, {"old_key": OLD_KEY, "new_key": NEW_KEY,
@@ -486,11 +657,21 @@ def test_f11_rotate_without_or_with_wrong_password_refused(make_app):
 
 def test_f11_rotate_requires_owner_or_admin_role(make_app):
     app, repo = make_app(db_key=OLD_KEY)
-    _, _, _ = _owner(app, email="boss@example.com")
+    # Boss is the platform admin (admin gate ok), editor is added to the
+    # allow-list too so the admin gate passes; the role check below is
+    # what this test is about.
+    _, boss_uid, _ = _platform_admin(app, email="boss@example.com")
     c = TestClient(app)
     r = _signup(c, email="editor@example.com")
     uid = r.json()["user_id"]
     sid = r.cookies.get("vf_session")
+    # Add editor to the platform-admin allow-list so we exercise the
+    # inner role gate (not the outer admin gate).
+    import os as _os
+    existing_parts = [p.strip() for p in
+                      _os.environ.get("VIDEO_FACTORY_PLATFORM_ADMINS", "").split(",")
+                      if p.strip() and p.strip() != boss_uid]
+    _os.environ["VIDEO_FACTORY_PLATFORM_ADMINS"] = ",".join(existing_parts + [uid])
     # Demote: the only membership left is "editor".
     repo._conn().execute("UPDATE memberships SET role='editor' WHERE user_id=?", (uid,))
     repo._conn().commit()
@@ -503,7 +684,7 @@ def test_f11_rotate_requires_owner_or_admin_role(make_app):
 def test_f11_reauth_attempts_are_budgeted(make_app, monkeypatch):
     monkeypatch.setenv("VF_KEYS_REAUTH_LIMIT", "2")
     app, _ = make_app(db_key=OLD_KEY)
-    _, _, sid = _owner(app)
+    _, _, sid = _platform_admin(app)
     bad = {"old_key": OLD_KEY, "new_key": NEW_KEY, "current_password": "Nope-nope-123"}
     assert _rotate(app, sid, bad).status_code == 403
     assert _rotate(app, sid, bad).status_code == 403
@@ -512,7 +693,7 @@ def test_f11_reauth_attempts_are_budgeted(make_app, monkeypatch):
 
 def test_f15_malformed_body_is_not_echoed(make_app):
     app, _ = make_app(db_key=OLD_KEY)
-    _, _, sid = _owner(app)
+    _, _, sid = _platform_admin(app)
     r = _rotate(app, sid, [OLD_KEY, NEW_KEY])
     assert r.status_code == 400, r.text
     assert OLD_KEY not in r.text and NEW_KEY not in r.text
@@ -532,7 +713,7 @@ def _all_audit_text(repo) -> str:
 def test_f15_successful_rotation_logs_fingerprints_only(make_app, caplog, capsys):
     caplog.set_level(logging.DEBUG)
     app, repo = make_app(db_key=OLD_KEY)
-    _, _, sid = _owner(app)
+    _, _, sid = _platform_admin(app)
     r = _rotate(app, sid, {"old_key": OLD_KEY, "new_key": NEW_KEY,
                            "current_password": PASSWORD})
     assert r.status_code == 200, r.text
@@ -550,7 +731,7 @@ def test_f15_successful_rotation_logs_fingerprints_only(make_app, caplog, capsys
 def test_f15_failed_rotation_leaks_no_key_material(make_app, caplog, capsys):
     caplog.set_level(logging.DEBUG)
     app, repo = make_app(db_key=OLD_KEY)
-    _, _, sid = _owner(app)
+    _, _, sid = _platform_admin(app)
     wrong_old = "s1b-not-the-real-old-key-" + "W" * 20
     r = _rotate(app, sid, {"old_key": wrong_old, "new_key": NEW_KEY,
                            "current_password": PASSWORD})
