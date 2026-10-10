@@ -42,9 +42,6 @@ mkdir -p "$CADDY_DATA/caddy" "$CADDY_DATA/config" "$CADDY_DATA/proxy"
 if command -v docker >/dev/null 2>&1; then
   RUNNER="docker"
   RUNTIME_IMAGE="caddy:2"
-  CACHE_VOLUME="-v $CADDY_DATA:/data"
-  CACHE_VOLUME_CONFIG="-v $CADDY_DATA/config:/config"
-  WORKDIR_FLAG="-w /srv"
 else
   RUNNER="caddy"
   RUNTIME_IMAGE=""
@@ -88,9 +85,10 @@ fi &
 CADDY_PID=$!
 
 # Give it a few seconds to acquire the cert.
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   sleep 1
-  if [ -f "$CADDY_DATA/caddy/certificates/acme-v02.api.letsencrypt.org-directory"/*.crt ] 2>/dev/null; then
+  # compgen -G expands the glob safely ([ -f glob ] errors on 2+ matches).
+  if compgen -G "$CADDY_DATA/caddy/certificates/acme-v02.api.letsencrypt.org-directory/*/*.crt" >/dev/null 2>&1; then
     break
   fi
 done
@@ -98,7 +96,8 @@ done
 kill "$CADDY_PID" 2>/dev/null || true
 wait "$CADDY_PID" 2>/dev/null || true
 
-if ! ls "$CADDY_DATA/caddy/certificates/" 2>/dev/null | grep -q '\.crt$'; then
+# Certs live one level down: certificates/<issuer>/<name>/<name>.crt.
+if [ -z "$(find "$CADDY_DATA/caddy/certificates" -name '*.crt' -print -quit 2>/dev/null)" ]; then
   echo "ERROR: DNS-01 bootstrap did not produce a cert under $CADDY_DATA/caddy/certificates" >&2
   exit 1
 fi

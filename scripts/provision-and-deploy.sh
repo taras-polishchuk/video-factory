@@ -126,6 +126,9 @@ rsync -az --delete "${RSYNC_EXCLUDES[@]}" \
   "$ROOT/" "root@$NEW_IP:/opt/video-factory/"
 
 # ─── 5) render compose env, push systemd credentials, compose up ─
+# Unquoted heredoc on purpose: $DOMAIN and $VIDEO_FACTORY_SERVER_IP expand
+# here (client side); the \${...} secrets are escaped and expand on the server.
+# shellcheck disable=SC2087
 ssh "root@$NEW_IP" bash -s <<REMOTE
 set -euo pipefail
 cd /opt/video-factory

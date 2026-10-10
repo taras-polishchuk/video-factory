@@ -17,7 +17,7 @@ CRED_DIR="${CREDENTIALS_DIRECTORY:-/etc/video-factory/credentials}"
 mkdir -p "$(dirname "$ENV_FILE")"
 
 # Start with a clean file (rotate-friendly).
-> "$ENV_FILE"
+: > "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 
 {

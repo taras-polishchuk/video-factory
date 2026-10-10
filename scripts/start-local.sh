@@ -72,7 +72,7 @@ PYTHONPATH="$ROOT" \
 API_PID=$!
 
 # Wait for the API to bind. Bound check + health check.
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
   sleep 0.5
   if curl -sS -m 2 "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; then
     break

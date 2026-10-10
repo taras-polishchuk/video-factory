@@ -26,12 +26,9 @@ dependencies = [
     # (control_plane/secret_vault.py). Required for any deployment
     # that accepts operator-supplied secrets via the web UI. Lazy
     # import in offline-only mode.
-    "cryptography>=41",
-    # authlib + httpx power the Google / GitHub OIDC sign-in flow
-    # (Wave 4). Authlib provides OAuth2 client + OIDC discovery +
-    # JWT verification helpers; we use them for every cryptographic
-    # step instead of hand-rolling JWT/JWKS verification.
-    "authlib>=1.3",
+    # Floor = first release with no known advisory (CI S4, A1 F21);
+    # 50.0.0 fixes GHSA-g6cj-pr64-35w5 and the bundled-OpenSSL HIGHs.
+    "cryptography>=50.0.0",
     # stripe is the official Python SDK for the Stripe API.
     # Wave 6a uses it for Checkout Session + Customer Portal
     # session creation; Wave 6c will add webhook signature
@@ -43,18 +40,43 @@ dependencies = [
     "prometheus-client>=0.20",
     # Sentry error reporting. Imported lazily, only when SENTRY_DSN
     # is set; declared here so the Docker image and `pip install .`
-    # can actually honour a configured DSN.
-    "sentry-sdk>=2.0",
+    # can actually honour a configured DSN. Floor excludes the LOW
+    # env-var exposure advisory GHSA-g92j-qhmh-64v2 (fixed in 2.8.0).
+    "sentry-sdk>=2.8.0",
+    # The remaining runtime imports (CI S4, A1 F23). Every third-party
+    # module the code imports must be declared here;
+    # tests/test_dependency_declarations.py enforces it.
+    # HTTP layer: api/main.py, api/auth.py, api/oidc.py. uvicorn is the
+    # server (Dockerfile CMD), not imported.
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    # FastAPI needs it for Form(...) / UploadFile parsing (not imported
+    # directly). Floor = first release with no known advisory (A1 F22):
+    # HIGH GHSA-pp6c-gr5w-3c5g / GHSA-wp53-j4wj-2cfg / GHSA-5rvq-cxj2-64vf
+    # are fixed in 0.0.27 / 0.0.22 / 0.0.30.
+    "python-multipart>=0.0.31",
+    # auth/__init__.py: Argon2id hashing, bcrypt fallback + verify of
+    # existing "bcrypt:" hashes.
+    "argon2-cffi>=23.1",
+    "bcrypt>=4.0",
+    # api/oidc.py: ID token / JWKS verification (replaces authlib, which
+    # was declared but never imported). Floor excludes the HS256 empty
+    # key HIGH (GHSA-gg9x-qcx2-xmrh, fixed in 1.6.8).
+    "joserfc>=1.6.8",
+    # core/cipher_db.py: SQLCipher at rest (VIDEO_FACTORY_DB_KEY).
+    "sqlcipher3-binary>=0.5",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7",
+    # CI and the worker protocol run the suite as `pytest -n 2`.
+    "pytest-xdist>=3.5",
 ]
 postprocess = [
     # FFmpeg is the documented postprocessor. The python wrapper is
     # optional; the assembler prefers the system binary when present.
-    "Pillow>=10",
+    "Pillow>=12.3.0",
 ]
 
 [project.scripts]
