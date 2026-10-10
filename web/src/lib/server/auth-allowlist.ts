@@ -8,7 +8,8 @@
 //   - /api/v1/auth/*  → always allowed (signup, login, csrf, etc.)
 //   - /api/v1/webhooks/* → always allowed (Stripe, etc. sign with HMAC)
 //   - /healthz / /readyz / /metrics → always allowed
-//   - /login / /signup / /forgot / /verify/* → always allowed
+//   - /login / /signup / /forgot / /reset / /verify/* → always allowed
+//     (/reset is the emailed password-reset page, EMAIL E1)
 //   - everything else requires a session cookie (handled by the hook)
 //
 // `pathname` is the URL pathname only (no query, no hash).
@@ -19,6 +20,7 @@ const EXACT_PUBLIC: ReadonlyArray<string> = [
 	"/login",
 	"/signup",
 	"/forgot",
+	"/reset",
 	"/healthz",
 	"/readyz",
 	"/metrics",

@@ -2,7 +2,12 @@
 	let { data } = $props<{ data: { ok: boolean; email_verified: boolean } }>();
 </script>
 
-<svelte:head><title>Email verified · Video Factory</title></svelte:head>
+<svelte:head>
+	<title>Email verified · Video Factory</title>
+	<!-- The verification token is in this page's URL: never send it as
+	     Referer to another origin (same policy as /reset). -->
+	<meta name="referrer" content="same-origin" />
+</svelte:head>
 
 <div class="auth-page">
 	<div class="auth-card">

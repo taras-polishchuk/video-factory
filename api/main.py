@@ -34,7 +34,8 @@ def create_app(*, repo: Optional[Repo] = None,
                storage_root: Optional[str] = None,
                schema: Optional[dict] = None,
                cors_origins: Optional[list[str]] = None,
-               public_base_url: Optional[str] = None) -> FastAPI:
+               public_base_url: Optional[str] = None,
+               mailer=None) -> FastAPI:
     if storage_root is None:
         storage_root = os.environ.get(
             "VIDEO_FACTORY_STORAGE",
@@ -58,6 +59,10 @@ def create_app(*, repo: Optional[Repo] = None,
             budget_per_batch_usd=float(os.environ.get("MAX_COST_PER_BATCH_USD", "0") or 0),
         )
     Singleton.set(runner)
+    # EMAIL E1: verification / reset mail transport (core/mailer.py).
+    if mailer is None:
+        from core.mailer import Mailer
+        mailer = Mailer.from_env()
 
     # JOBS S3: process start-up/shutdown hooks (uvicorn runs the
     # lifespan; TestClient only when used as a context manager).
@@ -239,7 +244,13 @@ def create_app(*, repo: Optional[Repo] = None,
             {"status": "ready" | "unready",
              "checks": {"db": bool, "vault_key": bool, "master_key": bool},
              "errors": {<check>: <reason code>},
-             "warnings": {<check>: <reason code>}}
+             "warnings": {<check>: <reason code>},
+             "info": {"email": "configured" | "not_configured",
+                      "email_transport": "smtp" | "console" | "null",
+                      ["email_error": <reason code>]}}
+
+        ``info`` never affects readiness (EMAIL E1): an app without
+        SMTP still serves traffic, it just cannot mail links.
 
         Each check is independent and isolated; a single failure
         flips the response to 503. Reason codes are exception class
@@ -302,6 +313,7 @@ def create_app(*, repo: Optional[Repo] = None,
                 "checks": checks,
                 "errors": errors,
                 "warnings": warnings,
+                "info": mailer.status(),
             },
             status_code=200 if ready else 503,
         )
@@ -1701,7 +1713,7 @@ def create_app(*, repo: Optional[Repo] = None,
     # ── auth (Wave 1) ────────────────────────────────────────
 
     from api.auth import build_router as _build_auth_router
-    _auth_router = _build_auth_router(repo)
+    _auth_router = _build_auth_router(repo, mailer=mailer)
     app.include_router(_auth_router)
 
     # ── Wave 4 OIDC router (Google + GitHub) ────────────────
@@ -1772,6 +1784,7 @@ def create_app(*, repo: Optional[Repo] = None,
     # Expose repo + runner on app.state for auth.dependencies to read.
     app.state.repo = repo
     app.state.runner = runner
+    app.state.mailer = mailer
 
     return app
 

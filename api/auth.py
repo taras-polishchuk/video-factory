@@ -25,10 +25,20 @@ Design notes:
   attacker cannot use timing to enumerate valid emails.
 - /auth/forgot is a no-op-by-design: we always return 200 even if
   the email is unknown, so the endpoint cannot be used to enumerate
-  accounts. The "magic link" is appended to the audit log + printed
-  in dev mode (no real SMTP integration yet — that's Wave 3).
-- Cookies are HttpOnly + SameSite=Strict. Secure is added in
-  production (`VF_HTTPS=1` or `VIDEO_FACTORY_ENV=production`).
+  accounts.
+- EMAIL E1: signup mails the verification link and /auth/forgot
+  mails the reset link through core/mailer.py (SMTP when configured,
+  a redacted console notice in dev/test, "email not configured" log
+  otherwise). Delivery runs off the request path, so neither the
+  response nor its timing depends on SMTP, and the token never
+  appears in a response, a log line or an audit row.
+- Cookies are HttpOnly + SameSite=Strict. Secure is added whenever
+  the request is HTTPS, `VF_HTTPS=1`, or `VIDEO_FACTORY_ENV` is
+  production / staging (S1b, A2 F-05).
+- S1b: the pre-session routes (signup, login, forgot, forgot/consume,
+  verify) require a trusted Origin (auth/origin.py) and are rate
+  limited per client IP (auth/ratelimit.py, auth/client_ip.py).
+  Login and signup rotate the session id (fixation guard).
 - The legacy `/api/v1/companies/{cid}` alias is preserved so the
   existing 94 tests + UI work unchanged. We resolve
   `cid → workspace_id` via a dedicated helper that returns the
@@ -63,6 +73,7 @@ from auth.session import (
     new_session_id,
     should_use_secure_cookies,
 )
+from core.mailer import Mailer
 from core.repo import Repo
 
 
@@ -86,13 +97,24 @@ def _dev_expose_tokens() -> bool:
     return env not in ("production", "prod", "staging")
 
 
-def build_router(repo: Repo) -> APIRouter:
+def build_router(repo: Repo, mailer: Optional[Mailer] = None) -> APIRouter:
     """Build the /auth/* router bound to the given repo.
 
     The repo is captured in the closure so endpoints do not have to
-    thread it through every signature.
+    thread it through every signature. ``mailer`` delivers the
+    verification / reset links (EMAIL E1); default: from env.
     """
     router = APIRouter(prefix="/auth", tags=["auth"])
+    if mailer is None:
+        mailer = Mailer.from_env()
+
+    def _email_audit(*, user_id: str, workspace_id: Optional[str] = None):
+        """audit(event, context) callback for core/mailer.py. Context
+        is kind / transport / attempts / error class only."""
+        def _append(event: str, context: dict) -> None:
+            audit_append(repo, event=event, context=context,
+                         user_id=user_id, workspace_id=workspace_id)
+        return _append
 
     def _client_ip(request: Request) -> str:
         return (request.client.host if request.client else "") or "unknown"
@@ -192,11 +214,17 @@ def build_router(repo: Repo) -> APIRouter:
             expires_at=expires_at_iso(),
             session_id=session_id,
         )
+        signup_wid = _latest_workspace_id(repo._conn(), user_id)
         audit_append(
             repo, event="auth.signup",
             context={"email": email, "workspace_slug": slug},
             user_id=user_id,
-            workspace_id=_latest_workspace_id(repo._conn(), user_id),
+            workspace_id=signup_wid,
+        )
+        # EMAIL E1: verification link by mail (background, never raises).
+        mailer.send_verification(
+            to=email.lower(), token=token,
+            audit=_email_audit(user_id=user_id, workspace_id=signup_wid),
         )
         return _set_session_cookie(
             request, session_id=session_id,
@@ -320,6 +348,12 @@ def build_router(repo: Repo) -> APIRouter:
                     repo, event="auth.password_reset_requested",
                     context={"email": email, "ip": ip},
                     user_id=user["user_id"],
+                )
+                # EMAIL E1: reset link by mail. Queued, not sent inline,
+                # so known and unknown addresses answer in the same time.
+                mailer.send_password_reset(
+                    to=user["email"], token=token,
+                    audit=_email_audit(user_id=user["user_id"]),
                 )
             else:
                 audit_append(
