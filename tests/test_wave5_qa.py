@@ -234,7 +234,7 @@ def test_rotation_audit_records_user_id(tmp_path: Path, monkeypatch):
 # ── 5. per-workspace HMAC prevents cross-workspace decrypt ───────
 
 
-def test_per_workspace_hmac_prevents_cross_workspace_decrypt(tmp_path: Path, monkeypatch):
+def test_per_workspace_hmac_prevents_cross_workspace_decrypt(tmp_path: Path):
     """A blob tagged for workspace A must NOT verify under workspace B.
 
     Covers the cross-tenant threat: a malicious operator with
@@ -242,8 +242,7 @@ def test_per_workspace_hmac_prevents_cross_workspace_decrypt(tmp_path: Path, mon
     `workspaces/A/assets/foo` as workspace B.
     """
     monkeypatch_root = str(tmp_path)
-    # monkeypatch, not os.environ: the key must not leak into later tests.
-    monkeypatch.setenv("VIDEO_FACTORY_DB_KEY", "hmac-key-12345678")
+    os.environ["VIDEO_FACTORY_DB_KEY"] = "hmac-key-12345678"
 
     storage_key = "workspaces/alice/assets/test_foo.png"
 

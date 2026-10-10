@@ -60,7 +60,7 @@ def _seed(repo: Repo) -> str:
     return user["user_id"]
 
 
-def test_cross_thread_writer_persists_after_rotation(tmp_path, monkeypatch):
+def test_cross_thread_writer_persists_after_rotation(tmp_path):
     """A writer thread that warms up its Repo._local.conn before
     rotation MUST be able to write AFTER rotation, and those
     writes MUST be visible to a fresh NEW-key connection.
@@ -72,9 +72,7 @@ def test_cross_thread_writer_persists_after_rotation(tmp_path, monkeypatch):
     post-rotation state of the API process is broken.
     """
     db = str(tmp_path / "xthread.db")
-    # monkeypatch: a bare os.environ write leaked the key into later
-    # tests on the same xdist worker (plaintext-DB tests then refused).
-    monkeypatch.setenv("VIDEO_FACTORY_DB_KEY", OLD_KEY)
+    os.environ["VIDEO_FACTORY_DB_KEY"] = OLD_KEY
     repo = Repo(db, db_key=OLD_KEY)
     key_rotation.ensure_table(repo)
     user_id = _seed(repo)
@@ -161,7 +159,7 @@ def test_cross_thread_writer_persists_after_rotation(tmp_path, monkeypatch):
     )
 
 
-def test_cross_thread_bypass_does_not_corrupt(tmp_path, monkeypatch):
+def test_cross_thread_bypass_does_not_corrupt(tmp_path):
     """If a writer thread bypasses tx() (using repo._conn() directly)
     and writes post-rotation, those writes MUST NOT corrupt the
     NEW-cipher file.  Acceptable outcomes:
@@ -173,9 +171,7 @@ def test_cross_thread_bypass_does_not_corrupt(tmp_path, monkeypatch):
     appear in the NEW-cipher file (encrypted with OLD key).
     """
     db = str(tmp_path / "xthread_bypass.db")
-    # monkeypatch: a bare os.environ write leaked the key into later
-    # tests on the same xdist worker (plaintext-DB tests then refused).
-    monkeypatch.setenv("VIDEO_FACTORY_DB_KEY", OLD_KEY)
+    os.environ["VIDEO_FACTORY_DB_KEY"] = OLD_KEY
     repo = Repo(db, db_key=OLD_KEY)
     key_rotation.ensure_table(repo)
     user_id = _seed(repo)
