@@ -1,106 +1,90 @@
 #!/usr/bin/env bash
-# dns-01-tls-bootstrap.sh — issue a wildcard TLS cert via DNS-01
+# dns-01-tls-bootstrap.sh: optional preflight that proves Cloudflare
+# DNS-01 issuance works for <domain> before the first real deploy.
 #
-# This is a thin wrapper around `caddy` running in DNS-challenge mode.
-# We need DNS-01 when port 80 is unreachable (firewall, NAT, etc.)
-# which is the common case for fresh Hetzner boxes behind Caddy.
+# Not part of the normal deploy: the production Caddy container gets and
+# renews its certificates itself (rendered Caddyfile, `dns cloudflare`).
+# Use this to check the token scope / zone first.
 #
 # Usage:
-#   ./scripts/dns-01-tls-bootstrap.sh <domain>
+#   CLOUDFLARE_API_TOKEN=... ./scripts/dns-01-tls-bootstrap.sh <domain> [data-dir]
 #
-# Required env:
-#   CLOUDFLARE_API_TOKEN  — DNS edit on the zone
-#
-# Optional env:
-#   CLOUDFLARE_ZONE_ID    — if not set, the script discovers it via the API
-#   Caddy image           — default `caddy:2`
-#
-# After running, the cert + chain are written to ./caddy-data/caddy/
-# inside the repo. The deploy.sh script mounts that path into the
-# running Caddy container.
+# - Builds the Caddy image from infra/caddy/Dockerfile (the stock caddy:2
+#   image has no Cloudflare DNS module, A2 F-27) unless VF_CADDY_IMAGE
+#   names an existing image.
+# - Runs it with a throwaway Caddyfile (DNS-01, no ports published) and
+#   a data dir (default: a new temp dir, printed at the end). Point
+#   data-dir at the caddy_data volume path to pre-seed it.
+# - Waits up to VF_TLS_WAIT seconds (default 120) for <domain>.crt;
+#   exit 0 if it appears, 1 otherwise.
+# The token is passed by name (-e CLOUDFLARE_API_TOKEN), never in argv.
 
 set -euo pipefail
 
 DOMAIN="${1:-}"
 if [ -z "$DOMAIN" ]; then
-  cat <<USAGE
-Usage: $0 <domain>
-Issues a Let's Encrypt wildcard cert for <domain> via Cloudflare DNS-01.
-USAGE
+  echo "Usage: $0 <domain> [data-dir]" >&2
   exit 2
 fi
-
+if ! printf '%s' "$DOMAIN" | grep -Eq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+  echo "ERROR: invalid domain '$DOMAIN'" >&2
+  exit 2
+fi
 : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN must be set}"
+export CLOUDFLARE_API_TOKEN
+command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not on PATH" >&2; exit 1; }
 
-CADDY_DATA="$PWD/caddy-data"
-mkdir -p "$CADDY_DATA/caddy" "$CADDY_DATA/config" "$CADDY_DATA/proxy"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DATA_DIR="${2:-$(mktemp -d "${TMPDIR:-/tmp}/vf-caddy-data.XXXXXX")}"
+mkdir -p "$DATA_DIR"
+WAIT="${VF_TLS_WAIT:-120}"
 
-# Caddy uses the cloudflare DNS plugin via a runtime container. We
-# pin the official image (`caddy:2-builder` includes the plugin).
-# If docker is missing, we fall back to a local caddy binary if one
-# is on PATH.
-if command -v docker >/dev/null 2>&1; then
-  RUNNER="docker"
-  RUNTIME_IMAGE="caddy:2"
-else
-  RUNNER="caddy"
-  RUNTIME_IMAGE=""
-  if ! command -v caddy >/dev/null 2>&1; then
-    echo "ERROR: neither docker nor caddy is available" >&2
-    exit 1
-  fi
+IMAGE="${VF_CADDY_IMAGE:-video-factory-caddy:tls-bootstrap}"
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "bootstrap: building $IMAGE from infra/caddy/Dockerfile"
+  docker build -q -t "$IMAGE" "$ROOT/infra/caddy" >/dev/null
 fi
 
-BOOTSTRAP_CADDYFILE="$(mktemp)"
-trap 'rm -f "$BOOTSTRAP_CADDYFILE"' EXIT
-
-cat > "$BOOTSTRAP_CADDYFILE" <<EOF
-{
-    email admin@${DOMAIN#*.}
-    on_demand_tls {
-        ask https://example.com/no-ask-endpoint  # disabled by default
-    }
+CADDYFILE="$(mktemp "${TMPDIR:-/tmp}/vf-bootstrap-caddyfile.XXXXXX")"
+NAME="vf-tls-bootstrap-$$"
+cleanup() {
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  rm -f "$CADDYFILE"
 }
+trap cleanup EXIT
 
-*.${DOMAIN}, ${DOMAIN} {
-    tls {
-        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
-    }
-    respond "bootstrap OK" 200
+cat > "$CADDYFILE" <<EOF
+{
+	admin off
+}
+${DOMAIN} {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	respond "bootstrap OK" 200
 }
 EOF
+chmod 0644 "$CADDYFILE"
 
-echo "bootstrap: requesting cert for *.$DOMAIN via DNS-01"
+echo "bootstrap: requesting a certificate for $DOMAIN via DNS-01"
+docker run -d --name "$NAME" \
+  -e CLOUDFLARE_API_TOKEN \
+  -v "$CADDYFILE:/etc/caddy/Caddyfile:ro" \
+  -v "$DATA_DIR:/data" \
+  "$IMAGE" caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 
-if [ "$RUNNER" = "docker" ]; then
-  docker run --rm \
-    -e CLOUDFLARE_API_TOKEN \
-    -v "$BOOTSTRAP_CADDYFILE:/etc/caddy/Caddyfile:ro" \
-    -v "$CADDY_DATA:/data" \
-    "$RUNTIME_IMAGE" caddy run --config /etc/caddy/Caddyfile --adapter ""
-else
-  CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
-    caddy run --config "$BOOTSTRAP_CADDYFILE" --adapter ""
-fi &
-CADDY_PID=$!
-
-# Give it a few seconds to acquire the cert.
-for _ in $(seq 1 30); do
+found=""
+for _ in $(seq 1 "$WAIT"); do
+  found="$(find "$DATA_DIR/caddy/certificates" -type f -name "${DOMAIN}.crt" 2>/dev/null | head -n 1 || true)"
+  [ -n "$found" ] && break
+  docker ps -q --filter "name=^${NAME}$" | grep -q . || break
   sleep 1
-  # compgen -G expands the glob safely ([ -f glob ] errors on 2+ matches).
-  if compgen -G "$CADDY_DATA/caddy/certificates/acme-v02.api.letsencrypt.org-directory/*/*.crt" >/dev/null 2>&1; then
-    break
-  fi
 done
 
-kill "$CADDY_PID" 2>/dev/null || true
-wait "$CADDY_PID" 2>/dev/null || true
-
-# Certs live one level down: certificates/<issuer>/<name>/<name>.crt.
-if [ -z "$(find "$CADDY_DATA/caddy/certificates" -name '*.crt' -print -quit 2>/dev/null)" ]; then
-  echo "ERROR: DNS-01 bootstrap did not produce a cert under $CADDY_DATA/caddy/certificates" >&2
+if [ -z "$found" ]; then
+  echo "ERROR: no certificate for $DOMAIN after ${WAIT}s. Caddy log tail:" >&2
+  docker logs --tail 30 "$NAME" >&2 2>&1 || true
   exit 1
 fi
-
-echo "bootstrap: cert acquired under $CADDY_DATA/caddy"
-echo "bootstrap: done — proceed with ./scripts/deploy.sh $DOMAIN"
+echo "bootstrap: certificate OK: ${found#"$DATA_DIR"/}"
+echo "bootstrap: data dir $DATA_DIR"

@@ -84,7 +84,7 @@ log() {
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RETENTION_DAYS="${RESTIC_RETENTION_DAYS:-30}"
 STAGING_ROOT="${VF_BACKUP_STAGING:-/var/backups/video-factory}"
-MODE=file
+MODE="file"
 if [ -n "${VF_COMPOSE_FILE:-}" ]; then MODE=container; fi
 PROJECT="${VF_COMPOSE_PROJECT:-video-factory}"
 
