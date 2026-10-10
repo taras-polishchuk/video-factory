@@ -86,6 +86,14 @@ services:
       # origin is the allow-listed one.
       VIDEO_FACTORY_ENV: production
       VIDEO_FACTORY_PUBLIC_BASE_URL: https://${VIDEO_FACTORY_DOMAIN:?VIDEO_FACTORY_DOMAIN must be set}
+      # EMAIL E1: verification + reset mail. Empty SMTP_HOST = email not
+      # configured (safe: nothing is mailed, /readyz info says so).
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_TLS: ${SMTP_TLS:-starttls}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
     volumes:
       - vf_data:/data
     tmpfs:
