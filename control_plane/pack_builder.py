@@ -257,6 +257,7 @@ class PackBuilder:
         "comfy_gpu_worker": None,
         "comfy_heygen_partner": None,
         "heygen_direct": None,  # no workflow JSON needed; whole-video
+        "hyperframes_local": None,  # HTML composition, not a workflow JSON
     }
 
     OUTPUT_KIND_BY_PROFILE = {
@@ -265,6 +266,7 @@ class PackBuilder:
         "comfy_cloud": "scene_clips",
         "comfy_gpu_worker": "scene_clips",
         "comfy_heygen_partner": "avatar_video",
+        "hyperframes_local": "whole_video",
     }
 
     def __init__(self, schema: dict) -> None:

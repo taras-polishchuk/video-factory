@@ -157,7 +157,8 @@
         "heygen_direct",
         "comfy_cloud",
         "comfy_gpu_worker",
-        "comfy_heygen_partner"
+        "comfy_heygen_partner",
+        "hyperframes_local"
       ]
     },
     "render_capabilities": {

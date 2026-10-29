@@ -41,6 +41,7 @@ def default_registry() -> RendererRegistry:
     from render_plane.comfy_cloud import ComfyCloudAdapter
     from render_plane.comfy_gpu_worker import ComfyGPUWorkerAdapter
     from render_plane.comfy_heygen_partner import ComfyHeyGenPartnerAdapter
+    from render_plane.hyperframes_local import HyperFramesLocalAdapter
 
     reg = RendererRegistry()
     reg.register(MockRenderer())
@@ -48,4 +49,5 @@ def default_registry() -> RendererRegistry:
     reg.register(ComfyCloudAdapter())
     reg.register(ComfyGPUWorkerAdapter())
     reg.register(ComfyHeyGenPartnerAdapter())
+    reg.register(HyperFramesLocalAdapter())
     return reg

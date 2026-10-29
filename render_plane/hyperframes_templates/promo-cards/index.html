@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en" data-composition-variables='[{"id":"kicker","type":"string","label":"Kicker","default":"Hermes Studio"},{"id":"title","type":"string","label":"Title","default":"Video from HTML. Locally."},{"id":"stat","type":"string","label":"Stat","default":"0 USD"},{"id":"statlabel","type":"string","label":"Stat label","default":"render cost per clip"},{"id":"cta","type":"string","label":"CTA","default":"Deterministic. 9:16."},{"id":"caption","type":"string","label":"Caption","default":"HyperFrames + FFmpeg on our own host"}]'>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=__W__, height=__H__" />
+    <!-- GSAP vendored locally: no render-time network fetch (deterministic fixture). -->
+    <script src="assets/gsap.min.js"></script>
+    <style>
+      :root { --ground:#0b1020; --accent:#f5a524; --ink:#ffffff; --muted:#9aa4c7; --font-display: "DejaVu Sans", sans-serif; }
+      * { margin:0; padding:0; box-sizing:border-box; }
+      html, body { width:__W__px; height:__H__px; overflow:hidden; background:var(--ground); }
+      #root { position:relative; width:100%; height:100%; font-family:var(--font-display); color:var(--ink); }
+      .scene { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:96px; text-align:center; }
+      #s1 { background:radial-gradient(circle at 50% 35%, #1d2a5c 0%, var(--ground) 70%); }
+      #s2 { background:linear-gradient(160deg, #141b38 0%, #0b1020 100%); }
+      .kicker { font-size:44px; letter-spacing:0.2em; text-transform:uppercase; color:var(--accent); font-weight:700; }
+      .title { font-size:120px; line-height:1.02; font-weight:800; letter-spacing:-0.03em; margin-top:36px; }
+      .bar { width:220px; height:14px; background:var(--accent); border-radius:7px; margin-top:56px; }
+      .stat { font-size:200px; font-weight:800; color:var(--accent); }
+      .statlabel { font-size:56px; color:var(--muted); margin-top:16px; }
+      .cta { margin-top:96px; font-size:52px; font-weight:700; padding:32px 64px; border:6px solid var(--accent); border-radius:999px; }
+      #wipe { position:absolute; left:0; top:0; width:100%; height:100%; background:var(--accent); }
+      #caption { position:absolute; left:80px; right:80px; bottom:220px; text-align:center; font-size:54px; font-weight:700; background:rgba(0,0,0,0.55); padding:20px 28px; border-radius:20px; }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="6" data-width="__W__" data-height="__H__">
+      <section id="s1" class="scene clip" data-start="0" data-duration="3.2" data-track-index="0">
+        <div class="kicker" data-var="kicker"></div>
+        <div class="title" data-var="title"></div>
+        <div class="bar"></div>
+      </section>
+      <section id="s2" class="scene clip" data-start="2.8" data-duration="3.2" data-track-index="1">
+        <div class="stat" data-var="stat"></div>
+        <div class="statlabel" data-var="statlabel"></div>
+        <div class="cta" data-var="cta"></div>
+      </section>
+      <div id="wipe" class="clip" data-start="2.6" data-duration="0.8" data-track-index="2"></div>
+      <div id="caption" class="clip" data-start="0.4" data-duration="5.4" data-track-index="3" data-var="caption"></div>
+    </div>
+    <script>
+      // Fill text from composition variables (textContent only: no HTML injection).
+      const v = (window.__hyperframes && window.__hyperframes.getVariables) ? window.__hyperframes.getVariables() : {};
+      document.querySelectorAll("[data-var]").forEach((el) => { const k = el.getAttribute("data-var"); if (v[k] !== undefined) el.textContent = String(v[k]); });
+      const tl = gsap.timeline({ paused: true });
+      tl.fromTo("#s1 .kicker", { opacity:0, y:40 }, { opacity:1, y:0, duration:0.5, ease:"power3.out" }, 0.1);
+      tl.fromTo("#s1 .title", { opacity:0, y:80, filter:"blur(10px)" }, { opacity:1, y:0, filter:"blur(0px)", duration:0.8, ease:"power4.out" }, 0.3);
+      tl.fromTo("#s1 .bar", { scaleX:0 }, { scaleX:1, transformOrigin:"left center", duration:0.6, ease:"power2.out" }, 0.9);
+      tl.fromTo("#caption", { opacity:0 }, { opacity:1, duration:0.3 }, 0.4);
+      tl.fromTo("#wipe", { yPercent:100 }, { yPercent:0, duration:0.4, ease:"power2.in" }, 2.6);
+      tl.to("#wipe", { yPercent:-100, duration:0.4, ease:"power2.out" }, 3.0);
+      tl.fromTo("#s2 .stat", { opacity:0, scale:0.7 }, { opacity:1, scale:1, duration:0.6, ease:"back.out(1.6)" }, 3.2);
+      tl.fromTo("#s2 .statlabel", { opacity:0, y:30 }, { opacity:1, y:0, duration:0.5 }, 3.5);
+      tl.fromTo("#s2 .cta", { opacity:0, y:40 }, { opacity:1, y:0, duration:0.5 }, 3.6);
+      tl.to("#caption", { opacity:0, duration:0.3 }, 5.5);
+      window.__timelines["main"] = tl;
+      tl.seek(0);
+    </script>
+  </body>
+</html>

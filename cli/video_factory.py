@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--language", default="en-US")
     parser.add_argument("--platforms", default="tiktok,reels")
     parser.add_argument("--render-profile", default="mock",
-                        choices=["mock", "heygen_direct", "comfy_cloud", "comfy_gpu_worker", "comfy_heygen_partner"])
+                        choices=["mock", "heygen_direct", "comfy_cloud", "comfy_gpu_worker", "comfy_heygen_partner", "hyperframes_local"])
     parser.add_argument("--max-cost-per-video", type=float, default=0.0)
     parser.add_argument("--max-cost-per-batch", type=float, default=0.0)
     parser.add_argument("--output-dir", default="artifacts/demo")

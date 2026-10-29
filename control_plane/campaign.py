@@ -121,6 +121,7 @@ class IntakeValidator:
 
     VALID_RENDER_PROFILES = {
         "mock", "heygen_direct", "comfy_cloud", "comfy_gpu_worker", "comfy_heygen_partner",
+        "hyperframes_local",
     }
     VALID_QUALITY_PRESETS = {"draft", "balanced", "high"}
     VALID_APPROVAL_POLICIES = {"auto", "needs_review", "always"}
@@ -163,6 +164,7 @@ class IntakeValidator:
             "comfy_cloud": "scene_clips",
             "comfy_gpu_worker": "scene_clips",
             "comfy_heygen_partner": "avatar_video",
+            "hyperframes_local": "whole_video",
         }
         if req.render_profile == "heygen_direct" and req.takes_per_scene > 1:
             warnings.append(
